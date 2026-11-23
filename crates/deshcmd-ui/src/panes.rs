@@ -639,6 +639,7 @@ impl PanelUi {
             egui::TextEdit::singleline(&mut self.filter)
                 .id(filter_id(side))
                 .hint_text("Filter by name or mask")
+                .align(Align2::LEFT_CENTER)
                 .frame(egui::Frame::NONE),
         );
         if edit.changed() {
