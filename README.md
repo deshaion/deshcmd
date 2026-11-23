@@ -1,6 +1,6 @@
-# deshcmd
+# DeshCmd
 
-deshcmd is a native dual-pane file manager for local files and mounted volumes. The desktop uses Rust, egui 0.37, and wgpu. The headless engine owns workspace state and runs file operations on a background queue.
+DeshCmd is a native dual-pane file manager for local files and mounted volumes. The desktop uses Rust, egui 0.37, and wgpu. The headless engine owns workspace state and runs file operations on a background queue.
 
 ## Build and run
 
@@ -23,7 +23,7 @@ An ordinary launch restores the saved workspace. Passing directories opens a fre
 
 Press **F1** for shortcuts. In the default keymap, **Tab** switches panels, **Ctrl+L** edits the location, and **F5** and **F6** copy and move to the opposite panel.
 
-This version supports local files, mounted locations, and virtual path lists. Archive and plugin-backed volumes in [Features.md](Features.md) describe Double Commander. The deshcmd workspace and bookmark interchange format is JSON. The integrity tools support 22 checksum options, including SFV. HAVAL and native ACL editing remain outside this version. Trash, volume discovery, and system clipboard behavior depend on the desktop. Linux/X11 is the verified desktop target.
+This version supports local files, mounted locations, and virtual path lists. Archive and plugin-backed volumes in [Features.md](Features.md). The deshcmd workspace and bookmark interchange format is JSON. The integrity tools support 22 checksum options, including SFV. HAVAL and native ACL editing remain outside this version. Trash, volume discovery, and system clipboard behavior depend on the desktop. Linux/X11 is the verified desktop target.
 
 ## Workspace
 
