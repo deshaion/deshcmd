@@ -1,8 +1,6 @@
-# Double Commander features
+# File manager features
 
-Double Commander is a free, open-source desktop file manager inspired by Total Commander. Its two independent file panels let you browse a source and destination together and work with local files, archives, network locations, and other virtual file systems.
-
-This inventory uses [Double Commander 1.2.11 gamma](https://github.com/doublecmd/doublecmd/releases/tag/v1.2.11) as its release baseline. It also covers additions found on the [1.3 development branch snapshot](https://github.com/doublecmd/doublecmd/tree/a75d1ca09289ccb0c88ecd59d4cd58c1fa0661bd) reviewed on 2026-11-21. Platform integrations, archive operations, and plugin availability vary by build and installed libraries. The review draws on the [tagged source](https://github.com/doublecmd/doublecmd/tree/v1.2.11) and the [official help](https://doublecmd.github.io/doc/en/).
+This inventory covers dual-panel file management for local files, archives, network locations, and other virtual file systems. Platform integrations, archive operations, and plugin availability vary by build and installed libraries.
 
 ## Workspace and navigation
 
@@ -16,16 +14,12 @@ This inventory uses [Double Commander 1.2.11 gamma](https://github.com/doublecmd
 - **Sorting and columns.** Sort by name, extension, size, date, attributes, or other displayed fields, with reverse and multi-column sorting plus configurable directory ordering, case handling, and natural sorting. Set the date/time and size formats and decide where new or changed entries appear. Use different named column sets to display paths, dates, permissions, comments, or metadata from content plugins.
 - **Thumbnail and tooltip previews.** Browse image and text previews, with support for embedded MP3 cover art and OpenDocument thumbnails. Video previews require a supported thumbnailer or platform service. Thumbnail sizes and caching are configurable. Tooltips can show built-in properties and plugin metadata. The opposite panel can serve as a live Quick View for the focused item.
 
-[Basic help](https://doublecmd.github.io/doc/en/help.html) · [Directory Hotlist](https://doublecmd.github.io/doc/en/directoryhotlist.html) · [Configuration](https://doublecmd.github.io/doc/en/configuration.html) · [Panel, navigation, and tab commands](https://doublecmd.github.io/doc/en/cmds.html)
-
 ## Selection, filtering, and file lists
 
 - **Marking items.** Select individual items, ranges, or all entries by keyboard or mouse. Invert the selection or mark and unmark groups by masks, attributes, saved criteria, or the focused item's name, extension, or path. Selection rules can account for case and accents.
 - **Quick Search and Quick Filter.** Type to jump to matching items or narrow the visible list in the current panel. Configure activation keys, matching rules, and whether the match applies to the name or extension.
 - **Reusable selections.** Save and restore marks in memory, write them to a text file, or rebuild them from a file or clipboard list. Load a text file of full paths directly into a panel as a virtual file list.
 - **Clipboard and export.** Copy names, directory paths, full paths, or tab-separated values from the displayed columns. Export file details to a file. Windows also supports copying network names as UNC paths.
-
-[Selection and clipboard commands](https://doublecmd.github.io/doc/en/cmds.html) · [Quick Search and Quick Filter settings](https://doublecmd.github.io/doc/en/configuration.html)
 
 ## File operations and integrity
 
@@ -34,12 +28,10 @@ This inventory uses [Double Commander 1.2.11 gamma](https://github.com/doublecmd
 - **Conflict handling.** Decide how to handle files or folders with the same name. Options can include merge, skip, overwrite, conditional overwrite by age or size, manual or automatic renaming, append, resume of a partial file, and opening a content comparison. Apply a choice to a single collision or subsequent collisions where offered.
 - **Background operations.** Start work immediately or queue tasks, monitor per-file and overall progress, speed, and estimated time, and pause, resume, cancel, or reorder operations. View ongoing jobs in the Operations Viewer and configure which events and operation types appear in the log window or log file.
 - **Deletion and links.** Send files to the operating system trash where available, delete permanently, or use the Wipe command to overwrite file data before deleting. Wipe effectiveness depends on the storage device and file system. Create symbolic links with relative or absolute targets, hard links on supported file systems, and Windows shortcuts on Windows.
-- **Properties and comments.** Inspect file type, size, allocated space, timestamps, link information, permissions, ownership, and fields from installed content plugins. Edit timestamps or attributes in bulk, including recursively. Double Commander can display and edit local `descript.ion` comments and carry them along in supported file operations.
+- **Properties and comments.** Inspect file type, size, allocated space, timestamps, link information, permissions, ownership, and fields from installed content plugins. Edit timestamps or attributes in bulk, including recursively. Display and edit local `descript.ion` comments and carry them along in supported file operations.
 - **Space and counts.** Calculate the total size and counts of selected items, display folder sizes directly in the file list, and see drive capacity and free space.
 - **Split and combine.** Split a file into numbered parts using a chosen size or part count. Reassemble the parts in order or combine a selected sequence of files.
 - **Checksums and benchmarking.** Generate checksum manifests for a selection, per file, or per directory. Verify a manifest or compare a single file with a digest supplied manually or from the clipboard. Supported choices include CRC32/SFV, MD4, MD5, SHA-1, SHA-2, SHA-3, BLAKE2 variants, BLAKE3, HAVAL, RIPEMD128/160, Tiger/192, and XXH128. A benchmark reports the timing and throughput of supported hashes.
-
-[File operations and checksum tools](https://doublecmd.github.io/doc/en/help.html) · [Copying and moving](https://doublecmd.github.io/doc/en/copymove.html) · [Logging and operation settings](https://doublecmd.github.io/doc/en/configuration.html) · [1.2 release changes](https://github.com/doublecmd/doublecmd/wiki/Changes-in-version-1.2.0)
 
 ## Search, duplicates, and batch renaming
 
@@ -50,15 +42,11 @@ This inventory uses [Double Commander 1.2.11 gamma](https://github.com/doublecmd
 - **Search result actions.** Run and switch among multiple searches, inspect or edit a result, reveal it in its original directory, open results in background tabs, or send the result list to a panel for ordinary file operations. Remove entries from the displayed results without deleting the underlying files.
 - **Multi-Rename Tool.** Preview old and proposed names side by side before applying a batch. Generate names and extensions from masks, original-name slices, parent paths, dates, counters, and WDX metadata. Change case, use literal or regex replacements with capture-group substitutions, or apply an explicit list of names. Reorder the input, resolve duplicate target names by adding numbers, save presets, and log changes.
 
-[Find Files](https://doublecmd.github.io/doc/en/findfiles.html) · [Multi-Rename Tool](https://doublecmd.github.io/doc/en/multirename.html) · [Regular expressions](https://doublecmd.github.io/doc/en/regexp.html)
-
 ## Comparison and synchronization
 
 - **Compare directories.** Mark entries missing from the opposite panel and identify newer files in same-name pairs for a quick comparison of the displayed directories.
 - **Synchronize directories.** Compare two roots with optional recursion, filename masks, date rules, and byte comparison where supported. Review identical, different, unreadable, or one-sided entries before choosing copy or delete actions. Change direction or omit actions per item. An asymmetric mode can mirror the left side to the right and mark right-only items for deletion. Open files or compare a pair from the results, then confirm the selected operations. Archive and virtual locations depend on their file source capabilities.
 - **Compare by Contents.** Compare two files side by side in text or binary mode. Navigate highlighted differences, show differences within lines, ignore case or whitespace, and scroll both sides together. Edit text, copy difference blocks in either direction, undo or redo edits, and save either side. A configured external differ can take over the command.
-
-[Directory synchronization](https://doublecmd.github.io/doc/en/syncdirs.html) · [File and directory comparison](https://doublecmd.github.io/doc/en/help.html)
 
 ## Built-in viewer and editor
 
@@ -67,8 +55,6 @@ This inventory uses [Double Commander 1.2.11 gamma](https://github.com/doublecmd
 - **Rich previews and printing.** WLX lister plugins add previews for media, documents, and other formats. Preview availability depends on registered plugins and OS services. Print from viewer plugins that expose printing.
 - **Text editor (F4).** Open and edit multiple files in tabs, or create a new text file. The editor includes configurable syntax highlighting, UTF and legacy encodings, conversion among LF, CRLF, and CR line endings, search and replace, line navigation, undo and redo, auto-indent, block indentation, and options for showing whitespace and removing trailing spaces. Viewer and editor commands can use external programs.
 
-[Built-in viewer](https://doublecmd.github.io/doc/en/viewer.html) · [Editor and external tool settings](https://doublecmd.github.io/doc/en/configuration.html) · [Editor source](https://github.com/doublecmd/doublecmd/blob/v1.2.11/src/feditor.lfm)
-
 ## Archives and packages
 
 - **Browse archives as directories.** Open supported archives in either panel, navigate folders inside them, preview or extract individual members, and copy files between archives and regular folders. Add or delete members where supported and test archive integrity.
@@ -76,8 +62,6 @@ This inventory uses [Double Commander 1.2.11 gamma](https://github.com/doublecmd
 - **ZIP and compressed streams.** The Zip plugin handles ZIP/ZIPX and ZIP-based formats such as JAR, EPUB, Office Open XML, and OpenDocument. It also handles TAR and compressed streams or tarballs using gzip, bzip2, LZMA/XZ, Zstandard, and Brotli, subject to available libraries. Brotli support is for decompression.
 - **Other formats.** SevenZip on Windows and Linux covers 7z and numerous archives and images, including ARJ, CAB, ISO, DMG, VHD, WIM, and SquashFS. Some formats support only reading, extraction, or testing. CPIO, DEB, and RPM can be unpacked via format-specific handlers where shipped. The UnRAR plugin reads RAR with the UnRAR library and can delegate RAR creation to a configured `rar` or WinRAR executable. The Base64 plugin encodes and decodes files.
 - **External archivers.** Configure command-line tools in the MultiArc system, defining how to identify formats, parse member lists, and run pack, extract, delete, and test commands. Supported actions depend on the command-line tool and its configuration.
-
-[Archive handling and MultiArc](https://doublecmd.github.io/doc/en/multiarc.html) · [Packer plugins](https://doublecmd.github.io/doc/en/plugins.html) · [Plugin source](https://github.com/doublecmd/doublecmd/tree/v1.2.11/plugins/wcx)
 
 ## Network, virtual file systems, and desktop integration
 
@@ -89,24 +73,22 @@ This inventory uses [Double Commander 1.2.11 gamma](https://github.com/doublecmd
 | macOS | Browse iCloud Drive, including selected app folders, and Finder Smart Folders. Use Finder tags, Quick Look, sharing, and other Finder actions. APFS supports file cloning. The MacCloud WFX plugin adds Dropbox, Yandex, OneDrive, Box, Amazon S3, Backblaze B2, Alibaba OSS, Tencent COS, Huawei OBS, Qiniu KODO, Upyun USS, and S3-compatible providers. |
 | Platform availability | Builds or ports exist for Windows, Linux, macOS, and FreeBSD, with experimental Haiku support. Toolkit and package choices affect integration and plugins. Linux builds use GTK or Qt, and macOS uses Cocoa on Apple Silicon and Intel. |
 
-The Virtual File System list provides access to applicable providers, and command shortcuts can open or close network connections. Double Commander's master-password store can protect saved plugin credentials when supported by the plugin. [Virtual folders and network commands](https://doublecmd.github.io/doc/en/help.html) · [Connections and cloud providers](https://doublecmd.github.io/doc/en/plugins.html) · [Supported platforms](https://github.com/doublecmd/doublecmd/wiki/Supported-platforms) · [Linux installer source](https://github.com/doublecmd/doublecmd/blob/v1.2.11/install/linux/install.sh) · [Desktop file-source registration](https://github.com/doublecmd/doublecmd/blob/v1.2.11/src/platform/uosforms.pas) · [Linux context menu](https://github.com/doublecmd/doublecmd/blob/v1.2.11/src/platform/unix/ushellcontextmenu.pas) · [Windows deletion and unlock](https://github.com/doublecmd/doublecmd/blob/v1.2.11/src/filesources/filesystem/ufilesystemdeleteoperation.pas) · [macOS release changes](https://github.com/doublecmd/doublecmd/wiki/Changes-in-version-1.2.0)
+The Virtual File System list provides access to applicable providers, and command shortcuts can open or close network connections. The master-password store can protect saved plugin credentials when supported by the plugin.
 
 ## Customization and automation
 
 - **Toolbars and command menus.** Customize the main, middle, and extra toolbars. Buttons can run internal commands, external programs, scripts, or command sequences, open paths, and display nested menus. Configure icons and hints, and import or export compatible toolbar definitions. A searchable internal command dialog runs commands and exposes their names for hotkeys and scripting.
 - **Keyboard and mouse.** Assign shortcuts by context, including the file panels, viewer, editor, and synchronization window. Configure selection with the left or right mouse button, drag-and-drop behavior, and shortcut or mouse actions on panel controls. The function-key button bar exposes common file actions.
 - **Appearance and layout.** Set fonts, icons and icon sizes, row and selection styles, file-type colors, tooltip fields, toolbar positions, and visibility of panels, menus, drives, tabs, command line, log, and job controls. Light and dark profiles can follow the current theme. Configure status and free-space displays, single-instance behavior, minimize options, and language.
-- **File associations and external tools.** Configure Double Commander actions by file mask, extension, or other supported detection rules. Choose an action from the context menu, use its output as viewer text, launch a configured terminal, or delegate viewing, editing, and comparison to external applications.
+- **File associations and external tools.** Configure actions by file mask, extension, or other supported detection rules. Choose an action from the context menu, use its output as viewer text, launch a configured terminal, or delegate viewing, editing, and comparison to external applications.
 - **Command line and terminal.** Run commands in the current directory, recall command history, and insert the selected file's name or path. Use `cd` to navigate the active panel and expand environment variables in paths. Launch an external terminal at the current folder, run a program through it with optional keep-open behavior, or use the integrated terminal window on supported builds.
 - **Variables and Lua.** Use parameter expansion to pass the active or opposite path, focused file, selected names, file lists, and prompted values to commands. Execute Lua scripts from commands, buttons, or associations. The Lua API can inspect panels and selections, work with files, show dialogs, and invoke internal commands. Lua scripts can also implement WDX content plugins.
-- **Launch and session options.** Start with given left and right paths or focus on a named file. Choose the active side, open paths in new tabs, target a running instance, use named instances or a custom configuration directory, and control the splash screen and debug log. Installations can use user-profile or portable configuration. Save window geometry, tabs, and individual histories selectively, and tune advanced options in `doublecmd.xml`.
+- **Launch and session options.** Start with given left and right paths or focus on a named file. Choose the active side, open paths in new tabs, target a running instance, use named instances or a custom configuration directory, and control the splash screen and debug log. Installations can use user-profile or portable configuration. Save window geometry, tabs, and individual histories selectively, and tune advanced options in the XML configuration file.
 - **Help and localization.** Choose among translated interfaces. The Help menu provides the user manual, a keyboard layout reference, internal command information, and the About dialog.
-
-[Configuration](https://doublecmd.github.io/doc/en/configuration.html) · [Toolbars](https://doublecmd.github.io/doc/en/toolbar.html) · [Parameters and variables](https://doublecmd.github.io/doc/en/variables.html) · [Lua scripting](https://doublecmd.github.io/doc/en/lua.html) · [Launch arguments](https://doublecmd.github.io/doc/en/commandline.html) · [Advanced settings](https://doublecmd.github.io/doc/en/configxml.html) · [Command reference](https://doublecmd.github.io/doc/en/cmds.html)
 
 ## Plugin system
 
-Plugins can be registered from a plugin binary or a package with a `pluginst.inf` installer definition. Configure plugins by type, including file detection or extension rules where applicable. Double Commander implements Total Commander-compatible plugin interfaces and adds its own search integration. A compatible platform, architecture, and runtime are required for native plugins.
+Plugins can be registered from a plugin binary or a package with a `pluginst.inf` installer definition. Configure plugins by type, including file detection or extension rules where applicable. The plugin system implements Total Commander-compatible plugin interfaces and adds its own search integration. A compatible platform, architecture, and runtime are required for native plugins.
 
 | Type | What it adds | Examples in official packages or integrations |
 | --- | --- | --- |
@@ -116,12 +98,12 @@ Plugins can be registered from a plugin binary or a package with a `pluginst.inf
 | WLX, lister | Adds rich preview handlers to the viewer and Quick View. | MacPreview via Quick Look, Explorer Preview, RTF and Windows Media Player plugins for Windows, and WlxMplayer for Linux. |
 | DSX, search | Lets a plugin supply results through Find Files. | DSXLocate queries the Unix `locate` database. |
 
-The repository also contains source for Everything search, a Torrent packer plugin, a native TextLine content plugin, and example file-system and viewer plugins. Availability depends on the build or separate installation. [Official plugin list](https://doublecmd.github.io/doc/en/plugins.html) · [Plugin registration commands](https://doublecmd.github.io/doc/en/cmds.html) · [Plugin source tree](https://github.com/doublecmd/doublecmd/tree/v1.2.11/plugins) · [Build targets](https://github.com/doublecmd/doublecmd/blob/v1.2.11/fpmake.pp)
+Additional plugins include Everything search, a Torrent packer plugin, a native TextLine content plugin, and example file-system and viewer plugins. Availability depends on the build or separate installation.
 
-## Additions in the reviewed 1.3 development snapshot
+## Additional features
 
-- **Stash.** Collect references to local files and folders from different paths or from search results in a virtual panel. Open the Stash, use it as a batch source, remove individual references, or clear the list. Removing a reference leaves the original item on disk. Lua scripts can read, append, or replace the Stash as text or a table. [Lua implementation](https://github.com/doublecmd/doublecmd/blob/a75d1ca09289ccb0c88ecd59d4cd58c1fa0661bd/src/uluapas.pas) · [Stash source](https://github.com/doublecmd/doublecmd/tree/a75d1ca09289ccb0c88ecd59d4cd58c1fa0661bd/src/filesources/stash) · [Main commands](https://github.com/doublecmd/doublecmd/blob/a75d1ca09289ccb0c88ecd59d4cd58c1fa0661bd/src/umaincommands.pas)
-- **Directory synchronization and metadata.** Compare empty directories as well as files. Choose file properties to copy from left to right or right to left. In Change Attributes, load attributes from the focused file, the target-panel file, or the first file on the clipboard. [Synchronization dialog](https://github.com/doublecmd/doublecmd/blob/a75d1ca09289ccb0c88ecd59d4cd58c1fa0661bd/src/fsyncdirsdlg.lfm) · [Attribute source dialog](https://github.com/doublecmd/doublecmd/blob/a75d1ca09289ccb0c88ecd59d4cd58c1fa0661bd/src/fsetfilepropertiesadvload.lfm)
-- **Integrated terminals.** On builds with the integrated terminal, choose a shared terminal, one terminal per panel, or one per folder tab. Link the terminal and file panel so a directory change in one can update the other. [Main window source](https://github.com/doublecmd/doublecmd/blob/a75d1ca09289ccb0c88ecd59d4cd58c1fa0661bd/src/fmain.pas)
-- **Sorting, editor, and file-operation controls.** Set a panel sort mode through an internal command, toggle word wrapping in the editor, choose decimal or binary size units, and configure prompts when deleting read-only or hidden/system files. [Main commands](https://github.com/doublecmd/doublecmd/blob/a75d1ca09289ccb0c88ecd59d4cd58c1fa0661bd/src/umaincommands.pas) · [Editor dialog](https://github.com/doublecmd/doublecmd/blob/a75d1ca09289ccb0c88ecd59d4cd58c1fa0661bd/src/feditor.lfm) · [File-operation options](https://github.com/doublecmd/doublecmd/blob/a75d1ca09289ccb0c88ecd59d4cd58c1fa0661bd/src/frames/foptionsfileoperations.lfm)
-- **macOS shortcuts and native actions.** Bind an internal command to Share, AirDrop, Reveal in Finder, Finder Get Info, Quick Look, or Edit Finder Tags. A keyboard preference can treat the top row as standard function keys independently of the macOS setting, with Accessibility permission. [Platform command](https://github.com/doublecmd/doublecmd/blob/a75d1ca09289ccb0c88ecd59d4cd58c1fa0661bd/src/umaincommands.pas) · [Keyboard options](https://github.com/doublecmd/doublecmd/blob/a75d1ca09289ccb0c88ecd59d4cd58c1fa0661bd/src/frames/foptionskeyboard.lfm)
+- **Stash.** Collect references to local files and folders from different paths or from search results in a virtual panel. Open the Stash, use it as a batch source, remove individual references, or clear the list. Removing a reference leaves the original item on disk. Lua scripts can read, append, or replace the Stash as text or a table.
+- **Directory synchronization and metadata.** Compare empty directories as well as files. Choose file properties to copy from left to right or right to left. In Change Attributes, load attributes from the focused file, the target-panel file, or the first file on the clipboard.
+- **Integrated terminals.** On builds with the integrated terminal, choose a shared terminal, one terminal per panel, or one per folder tab. Link the terminal and file panel so a directory change in one can update the other.
+- **Sorting, editor, and file-operation controls.** Set a panel sort mode through an internal command, toggle word wrapping in the editor, choose decimal or binary size units, and configure prompts when deleting read-only or hidden/system files.
+- **macOS shortcuts and native actions.** Bind an internal command to Share, AirDrop, Reveal in Finder, Finder Get Info, Quick Look, or Edit Finder Tags. A keyboard preference can treat the top row as standard function keys independently of the macOS setting, with Accessibility permission.
