@@ -334,6 +334,35 @@ pub(crate) fn tools_menu(ui: &mut Ui, side: Side, actions: &mut Vec<Action>) {
     }
 }
 
+fn details_text(tab: &engine::Tab, columns: &[Column], export: bool) -> String {
+    fn format_rows<'a>(rows: impl Iterator<Item = &'a Entry>, columns: &[Column]) -> String {
+        let mut text = String::new();
+        for (row, entry) in rows.enumerate() {
+            if row != 0 {
+                text.push('\n');
+            }
+            for (i, &column) in columns.iter().enumerate() {
+                if i != 0 {
+                    text.push('\t');
+                }
+                let value = crate::panes::value(entry, column);
+                text.extend(value.chars().map(|c| match c {
+                    '\n' | '\r' | '\t' => ' ',
+                    _ => c,
+                }));
+            }
+        }
+        text
+    }
+    if tab.marked_count() != 0 {
+        format_rows(tab.marked_entries(), columns)
+    } else if export {
+        format_rows(tab.visible_entries(), columns)
+    } else {
+        format_rows(tab.current().into_iter(), columns)
+    }
+}
+
 impl App {
     pub(crate) fn invoke(&mut self, side: Side, tool: Tool, ctx: &egui::Context) {
         if matches!(tool, Tool::Settings) {
@@ -341,31 +370,15 @@ impl App {
             return;
         }
         let tab = self.engine.tab(side);
-        let selected = tab.operands();
-        let marked: Vec<_> = tab
-            .visible_entries()
-            .filter(|entry| tab.selected.contains(&entry.path))
-            .map(|entry| entry.path.clone())
-            .collect();
         let base = tab.base().to_owned();
         let other = self.engine.tab(side.other()).base().to_owned();
-        let focused = tab.current().cloned();
-        let has_single = selected.len() == 1;
-        let candidate = if has_single {
-            selected
-                .first()
-                .and_then(|path| tab.entries.iter().find(|entry| entry.path == *path))
-                .cloned()
-        } else {
-            None
-        };
         let missing = || "Select one file or folder to use this command";
         let empty = || "Select a file or folder first";
         let mut result = match tool {
-            Tool::Copy | Tool::CopyHere | Tool::Move if !selected.is_empty() => {
+            Tool::Copy | Tool::CopyHere | Tool::Move if tab.has_operands() => {
                 Some(Dialog::transfer(
                     side,
-                    selected,
+                    tab.operands(),
                     if matches!(tool, Tool::CopyHere) {
                         base
                     } else {
@@ -399,15 +412,23 @@ impl App {
                     Tool::Comment => "Edit file comment",
                     _ => unreachable!(),
                 };
-                if matches!(
+                let candidate = if matches!(
                     tool,
                     Tool::Rename | Tool::Symlink | Tool::Hardlink | Tool::Shortcut | Tool::Comment
-                ) && !has_single
-                {
-                    self.notice(missing());
-                    return;
-                }
-                let mut dialog = Dialog::new(Kind::Text, tool, side, title, selected);
+                ) {
+                    let Some(entry) = tab.single_operand() else {
+                        self.notice(missing());
+                        return;
+                    };
+                    Some(entry)
+                } else {
+                    None
+                };
+                let paths = candidate
+                    .into_iter()
+                    .map(|entry| entry.path.clone())
+                    .collect();
+                let mut dialog = Dialog::new(Kind::Text, tool, side, title, paths);
                 match tool {
                     Tool::NewFolder => dialog.description = base.display().to_string(),
                     Tool::NewFile => {
@@ -451,7 +472,7 @@ impl App {
                 }
                 Some(dialog)
             }
-            Tool::Trash | Tool::Delete | Tool::Wipe if !selected.is_empty() => {
+            Tool::Trash | Tool::Delete | Tool::Wipe if tab.has_operands() => {
                 let title = match tool {
                     Tool::Trash => "Move to Trash",
                     Tool::Delete => "Delete permanently",
@@ -466,7 +487,7 @@ impl App {
                     tool,
                     side,
                     title,
-                    selected,
+                    tab.operands(),
                 );
                 dialog.description = summarize(&dialog.paths);
                 dialog.numeric = "3".into();
@@ -477,7 +498,7 @@ impl App {
                 None
             }
             Tool::Inspect => {
-                if let Some(entry) = candidate.or(focused) {
+                if let Some(entry) = tab.single_operand().or_else(|| tab.current()) {
                     let mut dialog = Dialog::new(
                         Kind::Inspect,
                         tool,
@@ -485,16 +506,21 @@ impl App {
                         "File properties",
                         vec![entry.path.clone()],
                     );
-                    dialog.description = describe(&entry);
+                    dialog.description = describe(entry);
                     Some(dialog)
                 } else {
                     self.notice(empty());
                     None
                 }
             }
-            Tool::ChangeAttributes if !selected.is_empty() => {
-                let mut dialog =
-                    Dialog::new(Kind::Attributes, tool, side, "Change attributes", selected);
+            Tool::ChangeAttributes if tab.has_operands() => {
+                let mut dialog = Dialog::new(
+                    Kind::Attributes,
+                    tool,
+                    side,
+                    "Change attributes",
+                    tab.operands(),
+                );
                 dialog.description = summarize(&dialog.paths);
                 dialog.primary = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
                 Some(dialog)
@@ -503,9 +529,9 @@ impl App {
                 self.notice(empty());
                 None
             }
-            Tool::Statistics if !selected.is_empty() => {
+            Tool::Statistics if tab.has_operands() => {
                 self.apply(
-                    Action::Command(Command::Queue(Operation::Statistics(selected), false)),
+                    Action::Command(Command::Queue(Operation::Statistics(tab.operands()), false)),
                     ctx,
                 );
                 None
@@ -514,8 +540,8 @@ impl App {
                 self.notice(empty());
                 None
             }
-            Tool::Split if candidate.as_ref().is_some_and(|entry| !entry.is_dir()) => {
-                let mut dialog = Dialog::new(Kind::Split, tool, side, "Split file", selected);
+            Tool::Split if tab.single_operand().is_some_and(|entry| !entry.is_dir()) => {
+                let mut dialog = Dialog::new(Kind::Split, tool, side, "Split file", tab.operands());
                 dialog.primary = other.display().to_string();
                 dialog.numeric = "64".into();
                 dialog.description = summarize(&dialog.paths);
@@ -525,11 +551,10 @@ impl App {
                 self.notice("Select one regular file to split");
                 None
             }
-            Tool::Combine if !selected.is_empty() => {
-                let parts = if selected.len() == 1 {
-                    engine::numbered_parts(&selected[0])
-                } else {
-                    selected
+            Tool::Combine if tab.has_operands() => {
+                let parts = match tab.single_operand() {
+                    Some(entry) => engine::numbered_parts(&entry.path),
+                    None => tab.operands(),
                 };
                 let filename = parts[0].file_stem().unwrap_or_default().to_string_lossy();
                 let mut dialog =
@@ -544,9 +569,14 @@ impl App {
                 self.notice("Select the numbered parts or their first file");
                 None
             }
-            Tool::Hash if !selected.is_empty() => {
-                let mut dialog =
-                    Dialog::new(Kind::Hash, tool, side, "Calculate checksums", selected);
+            Tool::Hash if tab.has_operands() => {
+                let mut dialog = Dialog::new(
+                    Kind::Hash,
+                    tool,
+                    side,
+                    "Calculate checksums",
+                    tab.operands(),
+                );
                 dialog.primary = base.join("checksums.blake3").display().to_string();
                 dialog.description = summarize(&dialog.paths);
                 Some(dialog)
@@ -555,9 +585,9 @@ impl App {
                 self.notice(empty());
                 None
             }
-            Tool::Verify if candidate.as_ref().is_some_and(|entry| !entry.is_dir()) => {
+            Tool::Verify if tab.single_operand().is_some_and(|entry| !entry.is_dir()) => {
                 let mut dialog =
-                    Dialog::new(Kind::Verify, tool, side, "Verify checksums", selected);
+                    Dialog::new(Kind::Verify, tool, side, "Verify checksums", tab.operands());
                 let algorithm = Algorithm::from_path(&dialog.paths[0]).or_else(|| {
                     dialog.paths[0]
                         .extension()
@@ -581,6 +611,7 @@ impl App {
                 None
             }
             Tool::CopyClipboard | Tool::CutClipboard => {
+                let selected = tab.operands();
                 if selected.is_empty() {
                     self.notice(empty());
                     return;
@@ -636,9 +667,8 @@ impl App {
             | Tool::ExportDetails
             | Tool::ExportMarks => {
                 let text = if matches!(tool, Tool::ExportMarks) {
-                    marked
-                        .iter()
-                        .map(|path| path.display().to_string())
+                    tab.marked_entries()
+                        .map(|entry| entry.path.display().to_string())
                         .collect::<Vec<_>>()
                         .join("\n")
                 } else if matches!(tool, Tool::CopyDetails | Tool::ExportDetails) {
@@ -647,30 +677,9 @@ impl App {
                     } else {
                         &self.engine.settings.columns
                     };
-                    let operands = if matches!(tool, Tool::ExportDetails) && tab.selected.is_empty()
-                    {
-                        tab.visible_entries()
-                            .map(|entry| entry.path.clone())
-                            .collect()
-                    } else {
-                        selected
-                    };
-                    tab.visible_entries()
-                        .filter(|entry| operands.contains(&entry.path))
-                        .map(|entry| {
-                            columns
-                                .iter()
-                                .map(|&column| {
-                                    crate::panes::value(entry, column)
-                                        .replace(['\n', '\r', '\t'], " ")
-                                })
-                                .collect::<Vec<_>>()
-                                .join("\t")
-                        })
-                        .collect::<Vec<_>>()
-                        .join("\n")
+                    details_text(tab, columns, matches!(tool, Tool::ExportDetails))
                 } else {
-                    selected
+                    tab.operands()
                         .iter()
                         .map(|path| match tool {
                             Tool::CopyNames => engine::display_name(path),
@@ -741,9 +750,9 @@ impl App {
                     Tool::UnmarkMask => "Unmark by mask",
                     _ => "Quick Filter",
                 };
-                let mut dialog = Dialog::new(Kind::Criteria, tool, side, title, selected);
+                let mut dialog = Dialog::new(Kind::Criteria, tool, side, title, Vec::new());
                 if matches!(tool, Tool::FilterOptions) {
-                    dialog.criteria = tab.filter.clone();
+                    dialog.criteria = tab.filter().clone();
                     dialog.flags[0] = matches!(tab.location(), engine::Location::Directory(_));
                 }
                 Some(dialog)
@@ -773,10 +782,10 @@ impl App {
                 Some(dialog)
             }
             Tool::FolderInOtherPane => {
-                if let Some(entry) = focused.filter(Entry::is_dir) {
+                if let Some(entry) = tab.current().filter(|entry| entry.is_dir()) {
                     self.engine.dispatch(Command::Navigate {
                         side: side.other(),
-                        path: entry.path,
+                        path: entry.path.clone(),
                         new_tab: false,
                         background: false,
                     });
@@ -1740,4 +1749,69 @@ fn describe(entry: &Entry) -> String {
         let _ = write!(output, "\nComment  {}", entry.comment);
     }
     output
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn details_export_uses_visible_order_and_marked_subset() {
+        let root = tempfile::tempdir().unwrap();
+        for name in ["file10.txt", "file2.txt", ".hidden"] {
+            std::fs::write(root.path().join(name), "").unwrap();
+        }
+        std::fs::write(root.path().join("descript.ion"), "file2.txt one\ttwo\n").unwrap();
+        let (send, wake) = std::sync::mpsc::channel();
+        let mut engine = engine::Engine::new(
+            root.path().into(),
+            [root.path().into(), root.path().into()],
+            engine::Settings {
+                auto_refresh: false,
+                ..Default::default()
+            },
+            move || {
+                let _ = send.send(());
+            },
+        );
+        while engine.tab(Side::Left).loading {
+            wake.recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+            engine.poll();
+        }
+        let side = Side::Left;
+        engine.dispatch(Command::Filter(side, MatchOptions::filename("file")));
+        let columns = &[Column::Name, Column::Comment];
+        assert_eq!(
+            details_text(engine.tab(side), columns, true),
+            "file2.txt\tone two\nfile10.txt\t"
+        );
+        assert_eq!(
+            details_text(engine.tab(side), columns, false),
+            "file2.txt\tone two"
+        );
+        engine.dispatch(Command::Select(
+            side,
+            root.path().join("file10.txt"),
+            engine::Select::Replace,
+        ));
+        assert_eq!(
+            details_text(engine.tab(side), columns, true),
+            "file10.txt\t"
+        );
+        engine.dispatch(Command::Select(
+            side,
+            root.path().join("file2.txt"),
+            engine::Select::Toggle,
+        ));
+        assert_eq!(
+            details_text(engine.tab(side), columns, true),
+            "file2.txt\tone two\nfile10.txt\t"
+        );
+        engine.dispatch(Command::Sort(side, Column::Name, false));
+        assert_eq!(
+            details_text(engine.tab(side), columns, true),
+            "file10.txt\t\nfile2.txt\tone two"
+        );
+    }
 }

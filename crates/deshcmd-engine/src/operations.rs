@@ -1058,10 +1058,9 @@ impl Transfer<'_, '_> {
             link_meta
         };
         if !meta.is_dir()
-            && self
-                .mask
-                .as_ref()
-                .is_some_and(|mask| !mask.is_match(crate::listing::fold(&name(source), false)))
+            && self.mask.as_ref().is_some_and(|mask| {
+                !mask.is_match(crate::listing::fold(&name(source), false).as_ref())
+            })
         {
             return Ok(false);
         }

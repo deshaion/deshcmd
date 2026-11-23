@@ -69,10 +69,10 @@ fn pane_navigation_filters_and_restores_marks() {
         engine.tab(side).visible_entries().next().unwrap().name,
         "report3.txt"
     );
-    assert!(engine.tab(side).selected.is_empty());
+    assert!(engine.tab(side).marked_count() == 0);
     engine.dispatch(Command::Filter(side, MatchOptions::filename("")));
     engine.dispatch(Command::RestoreMarks(side));
-    assert!(engine.tab(side).selected.contains(&root.join("café.txt")));
+    assert!(engine.tab(side).is_marked(&root.join("café.txt")));
 
     engine.dispatch(Command::Navigate {
         side,
@@ -351,4 +351,210 @@ fn resume_requires_the_destination_to_match_the_source_prefix() {
     run(&mut engine, transfer());
     assert_eq!(engine.jobs.last().unwrap().state, JobState::Done);
     assert_eq!(fs::read(&target).unwrap(), b"complete content");
+}
+
+#[test]
+fn cursor_and_mark_totals_follow_the_visible_view() {
+    use deshcmd_engine::{Column, Step, Tab};
+
+    fn check(tab: &Tab, current: Option<&str>, bytes: u64, marks: usize) {
+        assert_eq!(tab.current().map(|entry| entry.name.as_str()), current);
+        assert_eq!(
+            tab.cursor_position(),
+            tab.visible_entries()
+                .position(|entry| Some(entry.name.as_str()) == current)
+        );
+        assert_eq!(tab.marked_count(), marks);
+        let marked: Vec<_> = tab
+            .visible_entries()
+            .filter(|entry| tab.is_marked(&entry.path))
+            .collect();
+        assert_eq!(marked.len(), marks);
+        assert_eq!(tab.selected_bytes(), bytes);
+        assert_eq!(
+            marked
+                .iter()
+                .filter(|entry| !entry.is_dir())
+                .map(|entry| entry.size)
+                .sum::<u64>(),
+            bytes
+        );
+        assert_eq!(tab.has_operands(), current.is_some() || marks != 0);
+        let expected = if marked.is_empty() {
+            tab.current()
+                .into_iter()
+                .map(|entry| entry.path.clone())
+                .collect::<Vec<_>>()
+        } else {
+            marked.into_iter().map(|entry| entry.path.clone()).collect()
+        };
+        assert_eq!(tab.operands(), expected);
+    }
+
+    let fixture = tempfile::tempdir().unwrap();
+    let folder = fixture.path().join("files");
+    fs::create_dir_all(folder.join("sub")).unwrap();
+    for (name, size) in [("file2.txt", 2), ("file10.txt", 5), ("report.csv", 7)] {
+        fs::write(folder.join(name), vec![0; size]).unwrap();
+    }
+    let mut engine = open(&folder, fixture.path());
+    engine.settings.auto_refresh = false;
+    let side = Side::Left;
+    let file = |name: &str| folder.join(name);
+    engine.dispatch(Command::Select(side, file("file2.txt"), Select::Replace));
+    check(engine.tab(side), Some("file2.txt"), 2, 1);
+    engine.dispatch(Command::Step(side, Step::Next, true));
+    check(engine.tab(side), Some("file10.txt"), 7, 2);
+    engine.dispatch(Command::Sort(side, Column::Size, false));
+    check(engine.tab(side), Some("file10.txt"), 7, 2);
+    engine.dispatch(Command::Step(side, Step::Next, true));
+    check(engine.tab(side), Some("report.csv"), 14, 3);
+    engine.dispatch(Command::Select(side, file("file2.txt"), Select::Toggle));
+    check(engine.tab(side), Some("file2.txt"), 12, 2);
+    engine.dispatch(Command::Invert(side));
+    check(engine.tab(side), Some("file2.txt"), 2, 2);
+    engine.dispatch(Command::MarkMask(
+        side,
+        MatchOptions::filename("file*.txt"),
+        true,
+    ));
+    check(engine.tab(side), Some("file2.txt"), 7, 3);
+    engine.dispatch(Command::MarkLike(side, Column::Extension, false));
+    check(engine.tab(side), Some("file2.txt"), 0, 1);
+    engine.dispatch(Command::MarkAll(side));
+    check(engine.tab(side), Some("file2.txt"), 14, 4);
+    engine.dispatch(Command::RememberMarks(side));
+    engine.dispatch(Command::Filter(side, MatchOptions::filename("file10")));
+    check(engine.tab(side), Some("file10.txt"), 5, 1);
+    engine.dispatch(Command::Filter(side, MatchOptions::filename("")));
+    engine.dispatch(Command::RestoreMarks(side));
+    check(engine.tab(side), Some("file10.txt"), 14, 4);
+    engine.dispatch(Command::LoadMarks(side, "file2.txt\nfile10.txt".into()));
+    check(engine.tab(side), Some("file10.txt"), 7, 2);
+    fs::write(file("file2.txt"), [0; 11]).unwrap();
+    fs::remove_file(file("file10.txt")).unwrap();
+    engine.dispatch(Command::Refresh);
+    pump(&mut engine, |engine| !engine.tab(side).loading);
+    check(engine.tab(side), Some("sub"), 11, 1);
+    engine.dispatch(Command::Step(side, Step::Last, false));
+    check(engine.tab(side), Some("file2.txt"), 11, 1);
+    engine.dispatch(Command::UnmarkAll(side));
+    check(engine.tab(side), Some("file2.txt"), 0, 0);
+    fs::remove_dir_all(&folder).unwrap();
+    engine.dispatch(Command::Refresh);
+    pump(&mut engine, |engine| !engine.tab(side).loading);
+    assert!(engine.tab(side).error.is_some());
+    check(engine.tab(side), None, 0, 0);
+}
+
+#[test]
+fn recursive_projection_excludes_hidden_and_ignored_ancestors() {
+    let root = tempfile::tempdir().unwrap();
+    for name in ["keep", ".private", "keep/IgnoreME"] {
+        fs::create_dir(root.path().join(name)).unwrap();
+        fs::write(root.path().join(name).join("item.txt"), name).unwrap();
+    }
+    let side = Side::Left;
+    let mut engine = open(root.path(), root.path());
+    engine.dispatch(Command::Ignore("ignore*".to_owned()));
+    engine.dispatch(Command::Filter(
+        side,
+        MatchOptions {
+            recursive: true,
+            directories: false,
+            ..MatchOptions::filename("*.*")
+        },
+    ));
+    pump(&mut engine, |engine| !engine.tab(side).loading);
+    let file_paths = |engine: &Engine| {
+        engine
+            .tab(side)
+            .visible_entries()
+            .map(|entry| entry.path.strip_prefix(root.path()).unwrap().to_path_buf())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(file_paths(&engine), [Path::new("keep/item.txt")]);
+    engine.dispatch(Command::ToggleHidden);
+    assert_eq!(
+        file_paths(&engine),
+        [Path::new(".private/item.txt"), Path::new("keep/item.txt")]
+    );
+    engine.dispatch(Command::Filter(side, MatchOptions::filename("[")));
+    assert!(engine.notice.is_some());
+    assert_eq!(file_paths(&engine).len(), 2);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn delayed_directory_result_cannot_replace_newer_navigation() {
+    use std::os::unix::{ffi::OsStrExt, fs::OpenOptionsExt};
+    use std::sync::mpsc;
+
+    let root = tempfile::tempdir().unwrap();
+    let empty = root.path().join("empty");
+    let blocked = root.path().join("blocked");
+    let fast = root.path().join("fast");
+    for path in [&empty, &blocked, &fast] {
+        fs::create_dir(path).unwrap();
+    }
+    fs::write(fast.join("fast.txt"), "ready").unwrap();
+    let fifo = blocked.join("descript.ion");
+    let name = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+
+    let (send, wake) = mpsc::channel();
+    let mut engine = Engine::new(
+        root.path().into(),
+        [empty.clone(), empty],
+        Settings {
+            auto_refresh: false,
+            ..Default::default()
+        },
+        move || {
+            let _ = send.send(());
+        },
+    );
+    let timeout = Duration::from_secs(5);
+    for _ in Side::ALL {
+        wake.recv_timeout(timeout).unwrap();
+    }
+    engine.poll();
+    let side = Side::Left;
+    let navigate = |path| Command::Navigate {
+        side,
+        path,
+        new_tab: false,
+        background: false,
+    };
+    engine.dispatch(navigate(blocked));
+
+    // The writer can open only when the scanner reaches the FIFO. Keeping it open
+    // with no data blocks the comment read until the fast navigation has installed.
+    let deadline = Instant::now() + timeout;
+    let writer = loop {
+        match fs::OpenOptions::new()
+            .write(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(&fifo)
+        {
+            Ok(writer) => break writer,
+            Err(error)
+                if error.raw_os_error() == Some(libc::ENXIO) && Instant::now() < deadline =>
+            {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            Err(error) => panic!("Failed to synchronize with the blocked scanner: {error}"),
+        }
+    };
+    engine.dispatch(navigate(fast.clone()));
+    wake.recv_timeout(timeout).unwrap();
+    engine.poll();
+    assert_eq!(engine.tab(side).current().unwrap().name, "fast.txt");
+
+    drop(writer);
+    wake.recv_timeout(timeout).unwrap();
+    engine.poll();
+    assert_eq!(engine.tab(side).base(), fast);
+    assert_eq!(engine.tab(side).current().unwrap().name, "fast.txt");
+    assert!(!engine.tab(side).loading);
 }

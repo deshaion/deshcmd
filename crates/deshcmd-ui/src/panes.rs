@@ -98,7 +98,7 @@ impl PanelUi {
             self.tab_id = tab.id;
             self.base = tab.base().to_path_buf();
             self.path_draft = tab.base().display().to_string();
-            self.filter.clone_from(&tab.filter.text);
+            self.filter.clone_from(&tab.filter().text);
         }
         let short = rect.height() < 225.;
         let tabs = Rect::from_min_max(
@@ -623,7 +623,7 @@ impl PanelUi {
             13.,
             MUTED,
         );
-        let has_clear = !self.filter.is_empty() || tab.filter.is_active();
+        let has_clear = !self.filter.is_empty() || tab.filter().is_active();
         let field = Rect::from_min_max(
             filter_rect.min + vec2(22., 1.),
             filter_rect.max - vec2(if has_clear { 23. } else { 5. }, 1.),
@@ -643,7 +643,7 @@ impl PanelUi {
                 .frame(egui::Frame::NONE),
         );
         if edit.changed() {
-            let mut criteria = tab.filter.clone();
+            let mut criteria = tab.filter().clone();
             criteria.text.clone_from(&self.filter);
             actions.push(Action::Command(Command::Filter(side, criteria)));
         }
@@ -779,18 +779,12 @@ fn rows(
             x += width;
         }
     }
-    if tab.visible.is_empty() {
+    if tab.visible_count() == 0 {
         empty(ui, tab, side, actions);
         return;
     }
     let h = if details { 36. } else { 29. };
-    let target = if reveal {
-        tab.cursor
-            .as_ref()
-            .and_then(|cursor| tab.visible_entries().position(|row| row.path == *cursor))
-    } else {
-        None
-    };
+    let target = if reveal { tab.cursor_position() } else { None };
     let mut area = egui::ScrollArea::vertical()
         .id_salt("rows")
         .auto_shrink([false, false]);
@@ -808,13 +802,13 @@ fn rows(
             area = area.vertical_scroll_offset((y + h - height).max(0.));
         }
     }
-    area.show_rows(ui, h, tab.visible.len(), |ui, range| {
+    area.show_rows(ui, h, tab.visible_count(), |ui, range| {
         for index in range {
-            let entry = &tab.entries[tab.visible[index]];
+            let entry = tab.visible_entry(index).unwrap();
             let (rect, response) = ui.allocate_exact_size(vec2(width, h), Sense::click_and_drag());
             row_interaction(ui, &response, entry, tab, side, actions);
-            let marked = tab.selected.contains(&entry.path);
-            let focused = tab.cursor.as_ref() == Some(&entry.path);
+            let marked = tab.is_marked(&entry.path);
+            let focused = tab.cursor_position() == Some(index);
             let background = if marked {
                 ACCENT_DARK
             } else if response.hovered() {
@@ -899,7 +893,7 @@ fn row_interaction(
     side: Side,
     actions: &mut Vec<Action>,
 ) {
-    let marked = tab.selected.contains(&entry.path);
+    let marked = tab.is_marked(&entry.path);
     response.widget_info(|| {
         egui::WidgetInfo::selected(egui::Role::ListItem, true, marked, &entry.name)
     });
@@ -979,7 +973,7 @@ fn folder_drop(ui: &Ui, response: &Response, entry: &Entry, side: Side, actions:
 }
 
 fn gallery(ui: &mut Ui, tab: &Tab, side: Side, previews: &mut Previews, actions: &mut Vec<Action>) {
-    if tab.visible.is_empty() {
+    if tab.visible_count() == 0 {
         empty(ui, tab, side, actions);
         return;
     }
@@ -993,19 +987,20 @@ fn gallery(ui: &mut Ui, tab: &Tab, side: Side, previews: &mut Previews, actions:
         .show_rows(
             ui,
             height,
-            tab.visible.len().div_ceil(columns),
+            tab.visible_count().div_ceil(columns),
             |ui, range| {
                 for row in range {
                     ui.horizontal(|ui| {
                         ui.add_space(5.);
-                        for index in row * columns..(row * columns + columns).min(tab.visible.len())
+                        for index in
+                            row * columns..(row * columns + columns).min(tab.visible_count())
                         {
-                            let entry = &tab.entries[tab.visible[index]];
+                            let entry = tab.visible_entry(index).unwrap();
                             let (outer, response) = ui
                                 .allocate_exact_size(vec2(width, height), Sense::click_and_drag());
                             row_interaction(ui, &response, entry, tab, side, actions);
                             let rect = outer.shrink(4.);
-                            let marked = tab.selected.contains(&entry.path);
+                            let marked = tab.is_marked(&entry.path);
                             let (icon, ink) = icon_for(entry.kind);
                             card(
                                 ui,
@@ -1058,7 +1053,7 @@ fn gallery(ui: &mut Ui, tab: &Tab, side: Side, previews: &mut Previews, actions:
 }
 
 fn empty(ui: &mut Ui, tab: &Tab, side: Side, actions: &mut Vec<Action>) {
-    let filtering = tab.filter.is_active();
+    let filtering = tab.filter().is_active();
     let empty_message = if filtering {
         "No matching items"
     } else {
@@ -1069,7 +1064,7 @@ fn empty(ui: &mut Ui, tab: &Tab, side: Side, actions: &mut Vec<Action>) {
             if let Some(message) = tab.error.as_deref() {
                 ui.label(label("Folder unavailable", 13., TEXT))
                     .on_hover_text(message);
-            } else if tab.loading && tab.entries.is_empty() {
+            } else if tab.loading && tab.entry_count() == 0 {
                 ui.label(label("Loading files…", 13., SUB));
             } else {
                 ui.label(label(empty_message, 13., TEXT));
@@ -1086,7 +1081,7 @@ fn empty(ui: &mut Ui, tab: &Tab, side: Side, actions: &mut Vec<Action>) {
             if ui.small_button("Retry").clicked() {
                 actions.push(Action::Command(Command::Refresh));
             }
-        } else if tab.loading && tab.entries.is_empty() {
+        } else if tab.loading && tab.entry_count() == 0 {
             ui.spinner();
             ui.label(label("Loading files…", 13., SUB));
         } else {
@@ -1183,22 +1178,22 @@ fn panel_status(root: &mut Ui, rect: Rect, side: Side, tab: &Tab, space: Option<
         rect.shrink2(vec2(12., 2.)),
         Layout::left_to_right(Align::Center),
     );
-    let shown = tab.visible.len();
-    let title = if tab.selected.is_empty() {
+    let shown = tab.visible_count();
+    let title = if tab.marked_count() == 0 {
         format!("{shown} items")
     } else {
         format!(
             "{} selected · {}",
-            tab.selected.len(),
+            tab.marked_count(),
             metric(tab.selected_bytes())
         )
     };
     ui.label(mono(
         title,
         11.,
-        if tab.selected.is_empty() { SUB } else { ACCENT },
+        if tab.marked_count() == 0 { SUB } else { ACCENT },
     ));
-    if tab.filter.is_active() {
+    if tab.filter().is_active() {
         ui.label(label("Filtered", 11., ACCENT))
             .on_hover_text("Ctrl+F to open filter options");
     }

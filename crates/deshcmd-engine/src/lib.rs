@@ -1,5 +1,7 @@
 mod listing;
 mod operations;
+#[cfg(feature = "perf")]
+mod perf;
 
 use std::collections::{HashMap, HashSet};
 use std::io;
@@ -120,13 +122,17 @@ impl Default for Settings {
 pub struct Tab {
     pub saved: SavedTab,
     pub id: u64,
-    pub entries: Vec<Entry>,
-    pub visible: Vec<usize>,
-    pub selected: HashSet<PathBuf>,
-    pub cursor: Option<PathBuf>,
+    entries: Vec<Entry>,
+    visible: Vec<usize>,
+    selected: HashSet<PathBuf>,
+    selected_bytes: u128,
+    cursor: Option<PathBuf>,
+    cursor_position: Option<usize>,
     anchor: Option<PathBuf>,
+    anchor_position: Option<usize>,
     saved_marks: HashSet<PathBuf>,
-    pub filter: MatchOptions,
+    filter: MatchOptions,
+    filter_query: listing::MatchQuery,
     pub history: Vec<Location>,
     history_index: usize,
     pub loading: bool,
@@ -145,10 +151,14 @@ impl Tab {
             entries: Vec::new(),
             visible: Vec::new(),
             selected: Default::default(),
+            selected_bytes: 0,
             cursor: None,
+            cursor_position: None,
             anchor: None,
+            anchor_position: None,
             saved_marks: Default::default(),
             filter: MatchOptions::filename(""),
+            filter_query: Default::default(),
             history_index: 0,
             loading: false,
             error: None,
@@ -179,33 +189,118 @@ impl Tab {
     pub fn can_forward(&self) -> bool {
         self.history_index + 1 < self.history.len()
     }
-    pub fn visible_entries(&self) -> impl Iterator<Item = &Entry> {
+    pub fn filter(&self) -> &MatchOptions {
+        &self.filter
+    }
+    pub fn entry_count(&self) -> usize {
+        self.entries.len()
+    }
+    pub fn visible_count(&self) -> usize {
+        self.visible.len()
+    }
+    pub fn visible_entry(&self, position: usize) -> Option<&Entry> {
+        self.visible
+            .get(position)
+            .map(|&index| &self.entries[index])
+    }
+    pub fn visible_entries(&self) -> impl ExactSizeIterator<Item = &Entry> {
         self.visible.iter().map(|&i| &self.entries[i])
     }
+    pub fn cursor_position(&self) -> Option<usize> {
+        self.cursor_position
+    }
     pub fn current(&self) -> Option<&Entry> {
-        self.cursor
-            .as_ref()
-            .and_then(|path| self.entries.iter().find(|entry| &entry.path == path))
+        self.cursor_position
+            .and_then(|position| self.visible_entry(position))
+    }
+    pub fn is_marked(&self, path: &Path) -> bool {
+        self.selected.contains(path)
+    }
+    pub fn marked_count(&self) -> usize {
+        if self.visible.is_empty() {
+            0
+        } else {
+            self.selected.len()
+        }
+    }
+    pub fn marked_entries(&self) -> impl Iterator<Item = &Entry> {
+        (self.marked_count() != 0)
+            .then(|| {
+                self.visible_entries()
+                    .filter(|entry| self.is_marked(&entry.path))
+            })
+            .into_iter()
+            .flatten()
+    }
+    pub fn has_operands(&self) -> bool {
+        self.marked_count() != 0 || self.current().is_some()
+    }
+    pub fn single_operand(&self) -> Option<&Entry> {
+        match self.marked_count() {
+            0 => self.current(),
+            1 => self
+                .current()
+                .filter(|entry| self.is_marked(&entry.path))
+                .or_else(|| self.marked_entries().next()),
+            _ => None,
+        }
     }
     pub fn operands(&self) -> Vec<PathBuf> {
-        if self.selected.is_empty() {
+        if self.marked_count() == 0 {
             return self
                 .current()
-                .map(|entry| vec![entry.path.clone()])
-                .unwrap_or_default();
+                .into_iter()
+                .map(|entry| entry.path.clone())
+                .collect();
         }
-        self.entries
-            .iter()
-            .filter(|entry| self.selected.contains(&entry.path))
+        self.marked_entries()
             .map(|entry| entry.path.clone())
             .collect()
     }
     pub fn selected_bytes(&self) -> u64 {
-        self.entries
-            .iter()
-            .filter(|entry| !entry.is_dir() && self.selected.contains(&entry.path))
-            .map(|entry| entry.size)
-            .fold(0, u64::saturating_add)
+        self.selected_bytes.min(u128::from(u64::MAX)) as u64
+    }
+    fn clear_view(&mut self) {
+        self.entries.clear();
+        self.visible.clear();
+        self.selected_bytes = 0;
+        self.cursor_position = None;
+        self.anchor_position = None;
+    }
+    fn clear_marks(&mut self) {
+        self.selected.clear();
+        self.selected_bytes = 0;
+    }
+    fn collect_marks<'a>(entries: impl Iterator<Item = &'a Entry>) -> (HashSet<PathBuf>, u128) {
+        let mut bytes = 0;
+        let paths = entries
+            .map(|entry| {
+                bytes += Self::mark_size(entry);
+                entry.path.clone()
+            })
+            .collect();
+        (paths, bytes)
+    }
+    fn mark_size(entry: &Entry) -> u128 {
+        if entry.is_dir() { 0 } else { entry.size.into() }
+    }
+    fn set_mark(selected: &mut HashSet<PathBuf>, bytes: &mut u128, entry: &Entry, mark: bool) {
+        if mark {
+            if !selected.contains(&entry.path) {
+                selected.insert(entry.path.clone());
+                *bytes += Self::mark_size(entry);
+            }
+        } else if selected.remove(&entry.path) {
+            *bytes -= Self::mark_size(entry);
+        }
+    }
+    fn mark_entries(&mut self, mark: bool, matches: impl Fn(&Entry) -> bool) {
+        for &index in &self.visible {
+            let entry = &self.entries[index];
+            if matches(entry) {
+                Self::set_mark(&mut self.selected, &mut self.selected_bytes, entry, mark);
+            }
+        }
     }
     fn set_location(&mut self, location: Location, record: bool) {
         if record && self.history[self.history_index] != location {
@@ -217,12 +312,12 @@ impl Tab {
             self.history_index = self.history.len() - 1;
         }
         self.saved.location = location;
-        self.entries.clear();
-        self.visible.clear();
-        self.selected.clear();
+        self.clear_view();
+        self.clear_marks();
         self.cursor = None;
         self.anchor = None;
         self.filter.text.clear();
+        self.filter_query = Default::default();
         self.filter.recursive = false;
         self.invalidate_scan();
     }
@@ -232,14 +327,14 @@ impl Tab {
         self.loading = false;
         self.dirty = true;
     }
-    fn filter_entries(
-        &mut self,
-        hidden: bool,
-        ignore: Option<&globset::GlobSet>,
-    ) -> io::Result<()> {
+    fn filter_entries(&mut self, hidden: bool, ignore: Option<&globset::GlobSet>) {
+        #[cfg(feature = "perf")]
+        let started = perf::timestamp();
         let shown = |entry: &Entry| {
             (hidden || !entry.hidden)
-                && !ignore.is_some_and(|ignore| ignore.is_match(listing::fold(&entry.name, false)))
+                && !ignore.is_some_and(|ignore| {
+                    ignore.is_match(listing::fold(&entry.name, false).as_ref())
+                })
         };
         let mut excluded_dirs = HashSet::new();
         if self.filter.recursive {
@@ -250,83 +345,105 @@ impl Tab {
                     .map(|entry| entry.path.as_path()),
             );
         }
-        let eligible = self.entries.iter().filter(|entry| {
-            shown(entry)
-                && (excluded_dirs.is_empty()
-                    || !entry
-                        .path
+
+        self.visible.clear();
+        self.cursor_position = None;
+        self.anchor_position = None;
+        self.selected_bytes = 0;
+        let mut surviving_marks = Vec::new();
+        for (index, entry) in self.entries.iter().enumerate() {
+            let path = entry.path.as_path();
+            let shown = if self.filter.recursive && entry.is_dir() {
+                !excluded_dirs.contains(path)
+            } else {
+                shown(entry)
+            };
+            if !shown
+                || (!excluded_dirs.is_empty()
+                    && path
                         .ancestors()
                         .skip(1)
-                        .any(|path| excluded_dirs.contains(path)))
-        });
-        let matching: HashSet<&Path> = self
-            .filter
-            .matching(eligible)?
-            .iter()
-            .map(|entry| entry.path.as_path())
-            .collect();
-        self.visible = self
-            .entries
-            .iter()
-            .enumerate()
-            .filter(|(_, entry)| matching.contains(entry.path.as_path()))
-            .map(|(index, _)| index)
-            .collect();
-        self.selected
-            .retain(|path| matching.contains(path.as_path()));
-        if self
-            .cursor
-            .as_ref()
-            .is_none_or(|path| !matching.contains(path.as_path()))
-        {
-            self.cursor = self
-                .visible
-                .first()
-                .map(|&index| self.entries[index].path.clone());
+                        .any(|ancestor| excluded_dirs.contains(ancestor)))
+                || !self.filter_query.matches(&self.filter, entry)
+            {
+                continue;
+            }
+            let position = self.visible.len();
+            self.visible.push(index);
+            if self.cursor_position.is_none() && self.cursor.as_deref() == Some(path) {
+                self.cursor_position = Some(position);
+            }
+            if self.anchor_position.is_none() && self.anchor.as_deref() == Some(path) {
+                self.anchor_position = Some(position);
+            }
+            if !self.selected.is_empty() && self.selected.contains(path) {
+                surviving_marks.push(path);
+                self.selected_bytes += Self::mark_size(entry);
+            }
         }
-        Ok(())
+        if surviving_marks.is_empty() {
+            self.selected.clear();
+        } else if surviving_marks.len() != self.selected.len() {
+            let surviving: HashSet<_> = surviving_marks.into_iter().collect();
+            self.selected
+                .retain(|path| surviving.contains(path.as_path()));
+        }
+        self.finish_view();
+        #[cfg(feature = "perf")]
+        perf::elapsed("projection", started);
     }
-    fn select(&mut self, path: PathBuf, mode: Select, mark: bool) {
-        if !self.visible_entries().any(|entry| entry.path == path) {
-            return;
+    fn finish_view(&mut self) {
+        if self.cursor_position.is_none() {
+            self.cursor = self.visible_entry(0).map(|entry| entry.path.clone());
+            self.cursor_position = self.cursor.as_ref().map(|_| 0);
         }
+    }
+    fn select(&mut self, path: &Path, mode: Select, mark: bool) {
+        let position = self.visible_entries().position(|entry| entry.path == path);
+        if let Some(position) = position {
+            self.select_position(position, mode, mark);
+        }
+    }
+    fn select_position(&mut self, position: usize, mode: Select, mark: bool) {
+        let index = self.visible[position];
+        let path = self.entries[index].path.clone();
         match mode {
             Select::Replace | Select::Focus => {
-                self.selected.clear();
+                self.clear_marks();
                 if mark {
+                    let entry = &self.entries[index];
                     self.selected.insert(path.clone());
+                    self.selected_bytes = Self::mark_size(entry);
                 }
                 self.anchor = Some(path.clone());
+                self.anchor_position = Some(position);
             }
             Select::Toggle => {
-                if !self.selected.remove(&path) {
-                    self.selected.insert(path.clone());
-                }
+                let entry = &self.entries[index];
+                let mark = !self.selected.contains(&entry.path);
+                Self::set_mark(&mut self.selected, &mut self.selected_bytes, entry, mark);
                 self.anchor = Some(path.clone());
+                self.anchor_position = Some(position);
             }
             Select::Extend => {
-                let indices = |needle: &Path| {
-                    self.visible_entries()
-                        .position(|entry| entry.path == needle)
-                };
-                let end = indices(&path).unwrap_or_default();
                 let start = self
-                    .anchor
-                    .as_deref()
-                    .and_then(indices)
-                    .or_else(|| self.cursor.as_deref().and_then(indices))
-                    .unwrap_or(end);
-                self.anchor
-                    .get_or_insert_with(|| self.entries[self.visible[start]].path.clone());
-                self.selected = self
-                    .visible_entries()
-                    .skip(start.min(end))
-                    .take(start.abs_diff(end) + 1)
-                    .map(|entry| entry.path.clone())
-                    .collect();
+                    .anchor_position
+                    .or(self.cursor_position)
+                    .unwrap_or(position);
+                if self.anchor.is_none() {
+                    self.anchor = self.visible_entry(start).map(|entry| entry.path.clone());
+                    self.anchor_position = Some(start);
+                }
+                let range = start.min(position)..=start.max(position);
+                (self.selected, self.selected_bytes) = Self::collect_marks(
+                    self.visible[range]
+                        .iter()
+                        .map(|&index| &self.entries[index]),
+                );
             }
         }
         self.cursor = Some(path);
+        self.cursor_position = Some(position);
     }
 }
 
@@ -555,7 +672,7 @@ impl Engine {
         self.ignore = listing::compile_mask(&mask, false)?;
         self.settings.ignore = mask;
         for side in Side::ALL {
-            self.refilter(side)?;
+            self.refilter(side);
         }
         Ok(())
     }
@@ -691,20 +808,20 @@ impl Engine {
                         descending: false,
                     }];
                 }
-                self.resort(side)?;
+                self.resort(side);
             }
             Command::Filter(side, mut criteria) => {
-                criteria.matching(std::iter::empty())?;
+                let query = criteria.compile()?;
                 let tab = self.tab_mut(side);
                 criteria.recursive &= matches!(tab.location(), Location::Directory(_));
                 let scope_changed = tab.filter.recursive != criteria.recursive;
                 tab.filter = criteria;
+                tab.filter_query = query;
                 if scope_changed {
-                    tab.entries.clear();
-                    tab.visible.clear();
+                    tab.clear_view();
                     tab.invalidate_scan();
                 } else {
-                    self.refilter(side)?;
+                    self.refilter(side);
                 }
             }
             Command::Find(side, criteria) => {
@@ -720,31 +837,25 @@ impl Engine {
                 let next = matches[current.map_or(0, |index| (index + 1) % matches.len())]
                     .path
                     .clone();
-                self.tab_mut(side).select(next, Select::Focus, false);
+                self.tab_mut(side).select(&next, Select::Focus, false);
             }
             Command::Ignore(mask) => self.set_ignore(mask)?,
             Command::ToggleHidden => {
                 self.settings.show_hidden = !self.settings.show_hidden;
                 for side in Side::ALL {
-                    self.refilter(side)?;
+                    self.refilter(side);
                 }
             }
             Command::Select(side, path, mode) => {
                 self.settings.active = side;
                 self.tab_mut(side)
-                    .select(path, mode, !matches!(mode, Select::Focus));
+                    .select(&path, mode, !matches!(mode, Select::Focus));
             }
             Command::Step(side, step, extend) => {
                 let tab = self.tab_mut(side);
                 if !tab.visible.is_empty() {
                     let last = tab.visible.len() - 1;
-                    let index = tab
-                        .cursor
-                        .as_ref()
-                        .and_then(|path| {
-                            tab.visible_entries().position(|entry| &entry.path == path)
-                        })
-                        .unwrap_or(0);
+                    let index = tab.cursor_position().unwrap_or(0);
                     let next = match step {
                         Step::Previous => index.saturating_sub(1),
                         Step::Next => (index + 1).min(last),
@@ -753,65 +864,46 @@ impl Engine {
                         Step::PageUp => index.saturating_sub(12),
                         Step::PageDown => (index + 12).min(last),
                     };
-                    let path = tab.entries[tab.visible[next]].path.clone();
                     if extend {
-                        tab.select(path, Select::Extend, false);
+                        tab.select_position(next, Select::Extend, false);
                     } else {
+                        let path = tab.entries[tab.visible[next]].path.clone();
                         tab.cursor = Some(path.clone());
+                        tab.cursor_position = Some(next);
                         tab.anchor = Some(path);
+                        tab.anchor_position = Some(next);
                     }
                 }
             }
             Command::MarkAll(side) => {
                 let tab = self.tab_mut(side);
-                tab.selected = tab
-                    .visible_entries()
-                    .map(|entry| entry.path.clone())
-                    .collect();
+                (tab.selected, tab.selected_bytes) = Tab::collect_marks(tab.visible_entries());
             }
-            Command::UnmarkAll(side) => self.tab_mut(side).selected.clear(),
+            Command::UnmarkAll(side) => self.tab_mut(side).clear_marks(),
             Command::Invert(side) => {
                 let tab = self.tab_mut(side);
-                tab.selected = tab
-                    .visible_entries()
-                    .filter(|entry| !tab.selected.contains(&entry.path))
-                    .map(|entry| entry.path.clone())
-                    .collect();
+                (tab.selected, tab.selected_bytes) = Tab::collect_marks(
+                    tab.visible_entries()
+                        .filter(|entry| !tab.is_marked(&entry.path)),
+                );
             }
             Command::MarkMask(side, criteria, mark) => {
                 let tab = self.tab_mut(side);
-                let paths: Vec<_> = criteria
-                    .matching(tab.visible_entries())?
-                    .iter()
-                    .map(|entry| entry.path.clone())
-                    .collect();
-                for path in paths {
-                    if mark {
-                        tab.selected.insert(path);
-                    } else {
-                        tab.selected.remove(&path);
-                    }
+                let matches = criteria.matching(tab.visible.iter().map(|&i| &tab.entries[i]))?;
+                for entry in matches {
+                    Tab::set_mark(&mut tab.selected, &mut tab.selected_bytes, entry, mark);
                 }
             }
             Command::MarkLike(side, column, mark) => {
                 let tab = self.tab_mut(side);
                 if let Some(current) = tab.current() {
-                    let paths = tab
-                        .visible_entries()
-                        .filter(|entry| match column {
-                            Column::Extension => entry.extension == current.extension,
-                            Column::Path => entry.path.parent() == current.path.parent(),
-                            _ => entry.path.file_stem() == current.path.file_stem(),
-                        })
-                        .map(|entry| entry.path.clone())
-                        .collect::<Vec<_>>();
-                    for path in paths {
-                        if mark {
-                            tab.selected.insert(path);
-                        } else {
-                            tab.selected.remove(&path);
-                        }
-                    }
+                    let extension = current.extension.clone();
+                    let path = current.path.clone();
+                    tab.mark_entries(mark, |entry| match column {
+                        Column::Extension => entry.extension == extension,
+                        Column::Path => entry.path.parent() == path.parent(),
+                        _ => entry.path.file_stem() == path.file_stem(),
+                    });
                 }
             }
             Command::RememberMarks(side) => {
@@ -821,23 +913,19 @@ impl Engine {
             }
             Command::RestoreMarks(side) => {
                 let tab = self.tab_mut(side);
-                tab.selected = tab
-                    .visible_entries()
-                    .filter(|entry| tab.saved_marks.contains(&entry.path))
-                    .map(|entry| entry.path.clone())
-                    .collect();
+                (tab.selected, tab.selected_bytes) = Tab::collect_marks(
+                    tab.visible_entries()
+                        .filter(|entry| tab.saved_marks.contains(&entry.path)),
+                );
             }
             Command::LoadMarks(side, text) => {
                 let tab = self.tab_mut(side);
                 let input: HashSet<_> = lines(&text).collect();
-                tab.selected = tab
-                    .visible_entries()
-                    .filter(|entry| {
+                (tab.selected, tab.selected_bytes) =
+                    Tab::collect_marks(tab.visible_entries().filter(|entry| {
                         input.contains(entry.name.as_str())
                             || entry.path.to_str().is_some_and(|path| input.contains(path))
-                    })
-                    .map(|entry| entry.path.clone())
-                    .collect();
+                    }));
             }
             Command::LoadList(side, text) => {
                 let base = self.tab(side).base().to_path_buf();
@@ -1125,18 +1213,18 @@ impl Engine {
         }
         pane.active = pane.active.min(pane.tabs.len() - 1);
     }
-    fn resort(&mut self, side: Side) -> io::Result<()> {
+    fn resort(&mut self, side: Side) {
         let hidden = self.settings.show_hidden;
         let first = self.settings.directories_first;
         let natural = self.settings.natural_sort;
         let tab = self.panes[side.index()].tab_mut();
         listing::sort(&mut tab.entries, &tab.saved.sort, first, natural);
-        tab.filter_entries(hidden, self.ignore.as_ref())
+        tab.filter_entries(hidden, self.ignore.as_ref());
     }
-    fn refilter(&mut self, side: Side) -> io::Result<()> {
+    fn refilter(&mut self, side: Side) {
         self.panes[side.index()]
             .tab_mut()
-            .filter_entries(self.settings.show_hidden, self.ignore.as_ref())
+            .filter_entries(self.settings.show_hidden, self.ignore.as_ref());
     }
     fn mark_dirty(&mut self) {
         for pane in &mut self.panes {
@@ -1156,12 +1244,15 @@ impl Engine {
             let (id, generation, location) = (tab.id, tab.generation, tab.saved.location.clone());
             let recursive = tab.filter.recursive;
             let (sender, wake) = (self.sender.clone(), self.wake.clone());
+            #[cfg(feature = "perf")]
+            let scheduled = perf::timestamp();
             std::thread::spawn(move || {
-                let _ = sender.send(Event::Listed(
-                    id,
-                    generation,
-                    listing::scan(&location, recursive),
-                ));
+                #[cfg(feature = "perf")]
+                perf::elapsed("worker_start", scheduled);
+                let result = listing::scan(&location, recursive);
+                let _ = sender.send(Event::Listed(id, generation, result));
+                #[cfg(feature = "perf")]
+                perf::elapsed("publication", scheduled);
                 wake();
             });
         }
@@ -1219,6 +1310,8 @@ impl Engine {
                         tab.loading = false;
                         match result {
                             Ok(listing) => {
+                                #[cfg(feature = "perf")]
+                                let install = perf::timestamp();
                                 tab.entries = listing.entries;
                                 tab.skipped = listing.skipped;
                                 tab.error = None;
@@ -1228,16 +1321,14 @@ impl Engine {
                                     self.settings.directories_first,
                                     self.settings.natural_sort,
                                 );
-                                let _ = tab.filter_entries(
-                                    self.settings.show_hidden,
-                                    self.ignore.as_ref(),
-                                );
+                                tab.filter_entries(self.settings.show_hidden, self.ignore.as_ref());
+                                #[cfg(feature = "perf")]
+                                perf::elapsed("install", install);
                             }
                             Err(error) => {
                                 tab.error = Some(error.to_string());
-                                tab.entries.clear();
-                                tab.visible.clear();
-                                tab.selected.clear();
+                                tab.clear_view();
+                                tab.clear_marks();
                                 tab.cursor = None;
                             }
                         }

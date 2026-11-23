@@ -571,7 +571,7 @@ impl App {
         );
         footer.spacing_mut().item_spacing.x = 6.;
         let side = self.engine.settings.active;
-        let has_items = !self.engine.tab(side).operands().is_empty();
+        let has_items = self.engine.tab(side).has_operands();
         for (key, title, icon, command, enabled) in [
             (
                 "F3",
@@ -1374,3 +1374,6 @@ impl Previews {
         }
     }
 }
+
+#[cfg(all(test, feature = "perf"))]
+mod performance;

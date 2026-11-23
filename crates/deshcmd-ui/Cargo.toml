@@ -10,3 +10,9 @@ eframe.workspace = true
 egui_extras.workspace = true
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 serde_json = "1"
+
+[features]
+perf = ["deshcmd-engine/perf"]
+
+[dev-dependencies]
+tempfile = "3"
