@@ -1,0 +1,14 @@
+[package]
+name = "deshcmd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+deshcmd-ui.workspace = true
+deshcmd-engine.workspace = true
+eframe.workspace = true
+rfd = "0.17"
+open = "5"
+dirs = "6"
+arboard = { version = "3.7", default-features = false, features = ["wayland-data-control"] }
