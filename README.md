@@ -13,6 +13,19 @@ cargo run -p deshcmd -- /path/to/source /path/to/destination
 
 An ordinary launch restores the saved workspace. Passing directories opens a fresh workspace with those panel paths.
 
+## Download builds
+
+The **Build desktop packages** workflow runs when a GitHub release is published. Download the packages from the run's **Artifacts** section. Filenames use the Cargo workspace version.
+
+| Platform | Package for version 0.1.0 |
+| --- | --- |
+| Linux x86-64 | `deshcmd-0.1.0-x86_64.AppImage` |
+| Windows x86-64 | `deshcmd-0.1.0-x86_64.exe` |
+| macOS Apple Silicon | `deshcmd-0.1.0-aarch64.dmg` |
+| macOS Intel | `deshcmd-0.1.0-x86_64.dmg` |
+
+On Linux, mark the downloaded AppImage executable with `chmod +x deshcmd-0.1.0-x86_64.AppImage`, then run it. On Windows, launch the `.exe` directly. On macOS, open the disk image and drag `DeshCmd.app` into Applications. The macOS app is ad hoc signed. Gatekeeper may block downloaded copies until a build is signed with a Developer ID and notarized.
+
 ## What is available
 
 - Independent panels with tabs, tab locks, named workspaces, bookmarks, breadcrumbs, history, a folder tree, and mounted volumes. The panel divider is draggable. Layout can be side by side or stacked.

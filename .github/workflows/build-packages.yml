@@ -1,0 +1,141 @@
+name: Build desktop packages
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    name: ${{ matrix.platform }} (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: Linux
+            runner: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            arch: x86_64
+            extension: AppImage
+          - platform: Windows
+            runner: windows-2022
+            target: x86_64-pc-windows-msvc
+            arch: x86_64
+            extension: exe
+          - platform: macOS
+            runner: macos-15
+            target: aarch64-apple-darwin
+            arch: aarch64
+            extension: dmg
+          - platform: macOS
+            runner: macos-15-intel
+            target: x86_64-apple-darwin
+            arch: x86_64
+            extension: dmg
+
+    defaults:
+      run:
+        shell: bash
+    env:
+      TARGET: ${{ matrix.target }}
+      ARCH: ${{ matrix.arch }}
+      EXTENSION: ${{ matrix.extension }}
+      CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS: '-C target-feature=+crt-static'
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Set up Rust
+        run: rustup toolchain install stable --profile minimal --no-self-update --target "$TARGET"
+
+      - name: Install Linux build and packaging dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential pkg-config desktop-file-utils
+
+      - name: Read package version
+        run: |
+          version=$(cargo +stable metadata --locked --no-deps --format-version 1 |
+            jq -er '.packages[] | select(.name == "deshcmd") | .version')
+          mkdir -p dist
+          printf 'VERSION=%s\nPACKAGE=dist/deshcmd-%s-%s.%s\n' \
+            "$version" "$version" "$ARCH" "$EXTENSION" >> "$GITHUB_ENV"
+
+      - name: Build desktop executable
+        run: cargo +stable build --locked --release --package deshcmd --target "$TARGET"
+
+      - name: Package Linux AppImage
+        if: runner.os == 'Linux'
+        run: |
+          tool="$RUNNER_TEMP/appimagetool"
+          runtime="$RUNNER_TEMP/runtime-x86_64"
+          curl --fail --silent --show-error --location --retry 3 \
+            https://github.com/AppImage/appimagetool/releases/download/1.9.1/appimagetool-x86_64.AppImage \
+            --output "$tool"
+          curl --fail --silent --show-error --location --retry 3 \
+            https://github.com/AppImage/type2-runtime/releases/download/20251108/runtime-x86_64 \
+            --output "$runtime"
+          printf '%s  %s\n' \
+            ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb384eb0 "$tool" \
+            2fca8b443c92510f1483a883f60061ad09b46b978b2631c807cd873a47ec260d "$runtime" |
+            sha256sum --check
+          chmod +x "$tool"
+
+          appdir="$RUNNER_TEMP/DeshCmd.AppDir"
+          install -Dm755 "target/$TARGET/release/deshcmd" "$appdir/usr/bin/deshcmd"
+          install -Dm644 packaging/linux/deshcmd.desktop "$appdir/deshcmd.desktop"
+          install -Dm644 packaging/linux/deshcmd.svg "$appdir/deshcmd.svg"
+          install -Dm644 LICENSE "$appdir/usr/share/licenses/deshcmd/LICENSE"
+          ln -s usr/bin/deshcmd "$appdir/AppRun"
+          desktop-file-validate "$appdir/deshcmd.desktop"
+          APPIMAGE_EXTRACT_AND_RUN=1 "$tool" --runtime-file "$runtime" "$appdir" "$PACKAGE"
+
+      - name: Package Windows executable
+        if: runner.os == 'Windows'
+        run: cp "target/$TARGET/release/deshcmd.exe" "$PACKAGE"
+
+      - name: Package macOS disk image
+        if: runner.os == 'macOS'
+        run: |
+          staging="$RUNNER_TEMP/deshcmd-dmg"
+          app="$staging/DeshCmd.app"
+          mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
+          install -m 755 "target/$TARGET/release/deshcmd" "$app/Contents/MacOS/deshcmd"
+          install -m 644 LICENSE "$app/Contents/Resources/LICENSE"
+          ln -s /Applications "$staging/Applications"
+
+          # Apple bundle versions use the numeric part of the Cargo version.
+          bundle_version="${VERSION%%[-+]*}"
+          cat > "$app/Contents/Info.plist" <<EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>CFBundleIdentifier</key><string>com.github.deshaion.deshcmd</string>
+            <key>CFBundleName</key><string>DeshCmd</string>
+            <key>CFBundleExecutable</key><string>deshcmd</string>
+            <key>CFBundlePackageType</key><string>APPL</string>
+            <key>CFBundleShortVersionString</key><string>$bundle_version</string>
+            <key>CFBundleVersion</key><string>$bundle_version</string>
+            <key>NSHighResolutionCapable</key><true/>
+          </dict>
+          </plist>
+          EOF
+          plutil -lint "$app/Contents/Info.plist"
+          codesign --force --sign - "$app"
+          codesign --verify --strict "$app"
+          hdiutil create -volname DeshCmd -srcfolder "$staging" -fs HFS+ -format UDZO "$PACKAGE"
+          hdiutil verify "$PACKAGE"
+
+      - name: Upload package
+        uses: actions/upload-artifact@v7
+        with:
+          path: ${{ env.PACKAGE }}
+          archive: false
+          if-no-files-found: error
