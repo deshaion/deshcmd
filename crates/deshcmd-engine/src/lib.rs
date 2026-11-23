@@ -529,6 +529,15 @@ impl Engine {
         self.start_job();
     }
 
+    pub fn set_ignore(&mut self, mask: String) -> io::Result<()> {
+        self.ignore = listing::compile_mask(&mask, false)?;
+        self.settings.ignore = mask;
+        for side in Side::ALL {
+            self.refilter(side)?;
+        }
+        Ok(())
+    }
+
     fn execute(&mut self, command: Command) -> io::Result<()> {
         match command {
             Command::Focus(side) => self.settings.active = side,
@@ -682,13 +691,7 @@ impl Engine {
                     .clone();
                 self.tab_mut(side).select(next, Select::Focus, false);
             }
-            Command::Ignore(mask) => {
-                self.ignore = listing::compile_mask(&mask, false)?;
-                self.settings.ignore = mask;
-                for side in Side::ALL {
-                    self.refilter(side)?;
-                }
-            }
+            Command::Ignore(mask) => self.set_ignore(mask)?,
             Command::ToggleHidden => {
                 self.settings.show_hidden = !self.settings.show_hidden;
                 for side in Side::ALL {

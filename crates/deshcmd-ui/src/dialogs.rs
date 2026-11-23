@@ -79,7 +79,6 @@ enum Kind {
     Criteria,
     Bookmark,
     Favorites,
-    Settings,
     HelpDetail,
     Eject,
 }
@@ -100,7 +99,6 @@ pub(crate) struct Dialog {
     numeric: String,
     flags: [bool; 4],
     criteria: MatchOptions,
-    selected_columns: [Vec<Column>; 2],
     focus: bool,
     error: Option<String>,
 }
@@ -123,7 +121,6 @@ impl Dialog {
             numeric: String::new(),
             flags: [false; 4],
             criteria: MatchOptions::filename(""),
-            selected_columns: Default::default(),
             focus: true,
             error: None,
         }
@@ -279,6 +276,8 @@ pub(crate) fn selection_menu(ui: &mut Ui, side: Side, actions: &mut Vec<Action>)
     );
 }
 pub(crate) fn tools_menu(ui: &mut Ui, side: Side, actions: &mut Vec<Action>) {
+    menu_item(ui, side, "Settings…", Tool::Settings, actions);
+    ui.separator();
     ui.menu_button("Workspace", |ui| {
         cmd(
             ui,
@@ -343,6 +342,10 @@ pub(crate) fn tools_menu(ui: &mut Ui, side: Side, actions: &mut Vec<Action>) {
 
 impl App {
     pub(crate) fn invoke(&mut self, side: Side, tool: Tool, ctx: &egui::Context) {
+        if matches!(tool, Tool::Settings) {
+            self.open_settings(ctx);
+            return;
+        }
         let tab = self.engine.tab(side);
         let selected = tab.operands();
         let marked: Vec<_> = tab
@@ -845,20 +848,7 @@ impl App {
                 }
                 None
             }
-            Tool::Settings => {
-                let state = &self.engine.settings;
-                let mut dialog =
-                    Dialog::new(Kind::Settings, tool, side, "Workspace settings", Vec::new());
-                dialog.primary.clone_from(&state.ignore);
-                dialog.flags = [
-                    state.linked,
-                    state.auto_refresh,
-                    state.natural_sort,
-                    state.directories_first,
-                ];
-                dialog.selected_columns = [state.columns.clone(), state.alternate_columns.clone()];
-                Some(dialog)
-            }
+            Tool::Settings => unreachable!(),
             Tool::JobDetails(id) => {
                 let Some(job) = self.engine.jobs.iter().find(|job| job.id == id) else {
                     return;
@@ -931,7 +921,7 @@ impl App {
                         Kind::Transfer if matches!(dialog.tool, Tool::Move) => "Move",
                         Kind::Transfer => "Copy",
                         Kind::Eject => "Unmount",
-                        Kind::Settings | Kind::Bookmark => "Save",
+                        Kind::Bookmark => "Save",
                         _ if only_close => "Close",
                         _ => "Apply",
                     };
@@ -1090,7 +1080,6 @@ impl App {
             numeric,
             flags,
             criteria,
-            selected_columns,
             ..
         } = dialog;
         let side = *side;
@@ -1289,20 +1278,6 @@ impl App {
                     Command::AddBookmark(bookmark)
                 })
             }
-            Kind::Settings => {
-                self.engine.dispatch(Command::Ignore(primary.clone()));
-                if let Some(error) = self.engine.notice.take() {
-                    return Err(error);
-                }
-                let state = &mut self.engine.settings;
-                state.linked = flags[0];
-                state.auto_refresh = flags[1];
-                state.natural_sort = flags[2];
-                state.directories_first = flags[3];
-                state.columns.clone_from(&selected_columns[0]);
-                state.alternate_columns.clone_from(&selected_columns[1]);
-                Action::Command(Command::Refresh)
-            }
             Kind::Eject => {
                 self.desktop.eject(&item()?)?;
                 self.places = self.desktop.places();
@@ -1368,7 +1343,6 @@ fn draw_fields(ui: &mut Ui, dialog: &mut Dialog, outcome: &mut Outcome) {
         numeric,
         flags,
         criteria,
-        selected_columns,
         focus,
         ..
     } = dialog;
@@ -1620,35 +1594,6 @@ fn draw_fields(ui: &mut Ui, dialog: &mut Dialog, outcome: &mut Outcome) {
             ui.checkbox(&mut flags[0], "Open a paired folder in the opposite panel");
             if flags[0] {
                 field(ui, "Opposite panel folder", description, focus);
-            }
-        }
-        Kind::Settings => {
-            field(ui, "Ignore masks", &mut *primary, focus);
-            ui.checkbox(
-                &mut flags[0],
-                "Synchronize navigation through matching subfolders",
-            );
-            ui.checkbox(&mut flags[1], "Refresh active folders automatically");
-            ui.checkbox(&mut flags[2], "Sort numbers in filenames naturally");
-            ui.checkbox(&mut flags[3], "List folders before files");
-            ui.separator();
-            for (title, columns) in ["Default columns", "Alternate columns"]
-                .into_iter()
-                .zip(selected_columns)
-            {
-                ui.label(label(title, 12., SUB).strong());
-                ui.horizontal_wrapped(|ui| {
-                    for column in Column::ALL.into_iter().skip(1) {
-                        let mut enabled = columns.contains(&column);
-                        if ui.checkbox(&mut enabled, column.label()).changed() {
-                            if enabled {
-                                columns.push(column);
-                            } else {
-                                columns.retain(|value| *value != column);
-                            }
-                        }
-                    }
-                });
             }
         }
         Kind::Eject => {

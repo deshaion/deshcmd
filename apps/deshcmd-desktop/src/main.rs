@@ -325,8 +325,7 @@ fn main() -> eframe::Result {
         viewport: egui::ViewportBuilder::default()
             .with_title("deshcmd")
             .with_app_id("deshcmd")
-            .with_inner_size([1220., 740.])
-            .with_min_inner_size([900., 640.])
+            .with_inner_size([1220., 540.])
             .with_icon(icon()),
         renderer: eframe::Renderer::Wgpu,
         clipboard_shortcuts: false,
@@ -336,13 +335,19 @@ fn main() -> eframe::Result {
         "deshcmd",
         options,
         Box::new(move |context| {
-            Ok(Box::new(App::new(
+            let app = App::new(
                 context,
                 Box::new(NativeDesktop { clipboard: None }),
                 home,
                 initial,
                 fresh,
-            )))
+            );
+            // Keep the native window's minimum independent of interface zoom.
+            let ctx = &context.egui_ctx;
+            ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(
+                egui::vec2(900., 480.) / ctx.zoom_factor(),
+            ));
+            Ok(Box::new(app))
         }),
     )
 }

@@ -11,6 +11,9 @@ use egui::{
 use crate::dialogs::{self, Tool};
 use crate::{Action, CachedPreview, Previews, child, theme::*};
 
+// Tabs, navigation, and room for the details header and one row.
+pub(crate) const MIN_HEIGHT: f32 = 142.;
+
 #[derive(Default)]
 pub(crate) struct PanelUi {
     tab_id: u64,
@@ -19,6 +22,7 @@ pub(crate) struct PanelUi {
     filter: String,
     editing_path: bool,
     request_path: bool,
+    active_tab_in_strip: Option<(usize, u64, String, f32)>,
 }
 pub(crate) struct PaneScreen<'a> {
     pub pane: &'a Pane,
@@ -27,7 +31,6 @@ pub(crate) struct PaneScreen<'a> {
     pub home: &'a Path,
     pub space: Option<(u64, u64)>,
     pub columns: &'a [Column],
-    pub stacked: bool,
     pub reveal_cursor: bool,
     pub preview: Option<(Side, Option<&'a Entry>)>,
 }
@@ -67,7 +70,6 @@ impl PanelUi {
             home,
             space,
             columns,
-            stacked,
             reveal_cursor,
             preview,
         } = screen;
@@ -96,7 +98,7 @@ impl PanelUi {
             self.path_draft = tab.base().display().to_string();
             self.filter.clone_from(&tab.filter.text);
         }
-        let short = stacked && rect.height() < 225.;
+        let short = rect.height() < 225.;
         let tabs = Rect::from_min_max(
             rect.min + vec2(9., 5.),
             pos2(rect.right() - 8., rect.top() + 38.),
@@ -117,14 +119,16 @@ impl PanelUi {
             self.tools(root, tools, tab, side, actions);
             body_top = tools.bottom() + 4.;
         }
-        let footer_h = 31.;
-        let footer = Rect::from_min_max(
-            pos2(rect.left() + 1., rect.bottom() - footer_h),
-            rect.right_bottom() - vec2(1., 1.),
-        );
+        let footer_height = 31.;
+        let show_status = rect.height() >= MIN_HEIGHT + footer_height;
+        let body_bottom = if show_status {
+            rect.bottom() - footer_height
+        } else {
+            rect.bottom() - 1.
+        };
         let body = Rect::from_min_max(
-            pos2(rect.left() + 2., body_top.min(footer.top())),
-            pos2(rect.right() - 2., footer.top()),
+            pos2(rect.left() + 2., body_top.min(body_bottom)),
+            pos2(rect.right() - 2., body_bottom),
         );
         let drop_area = root.interact(
             rect,
@@ -196,7 +200,13 @@ impl PanelUi {
         {
             actions.insert(0, Action::Command(Command::Focus(side)));
         }
-        panel_status(root, footer, side, tab, space);
+        if show_status {
+            let footer = Rect::from_min_max(
+                pos2(rect.left() + 1., body_bottom),
+                rect.right_bottom() - vec2(1., 1.),
+            );
+            panel_status(root, footer, side, tab, space);
+        }
     }
 
     fn tabs(
@@ -232,24 +242,20 @@ impl PanelUi {
             area,
             Layout::left_to_right(Align::Center),
         );
+        let active_tab = pane.tab();
+        let active_label = (pane.active, active_tab.id, active_tab.title(), area.width());
+        let reveal_active = self.active_tab_in_strip.as_ref() != Some(&active_label);
+        self.active_tab_in_strip = Some(active_label);
         egui::ScrollArea::horizontal()
             .max_width(area.width())
-            .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
             .show(&mut list, |ui| {
                 ui.horizontal_centered(|ui| {
                     ui.spacing_mut().item_spacing.x = 3.;
+                    let mut centers = Vec::with_capacity(pane.tabs.len());
+                    let mut reorder = None;
                     for (index, tab) in pane.tabs.iter().enumerate() {
                         let current = index == pane.active;
                         let title = tab.title();
-                        let width = ui
-                            .painter()
-                            .layout_no_wrap(title.clone(), FontId::proportional(13.), TEXT)
-                            .size()
-                            .x
-                            .clamp(41., 138.)
-                            + 43.;
-                        let (rect, response) =
-                            ui.allocate_exact_size(vec2(width, 29.), Sense::click_and_drag());
                         let ink = if current && active {
                             ACCENT
                         } else if current {
@@ -257,6 +263,31 @@ impl PanelUi {
                         } else {
                             SUB
                         };
+                        let label_left = 27.;
+                        let label_right =
+                            if pane.tabs.len() > 1 || tab.saved.lock != TabLock::Normal {
+                                22.
+                            } else {
+                                10.
+                            };
+                        let padding = label_left + label_right;
+                        let mut job = egui::text::LayoutJob::simple_singleline(
+                            title.clone(),
+                            FontId::proportional(13.),
+                            ink,
+                        );
+                        job.wrap.max_width = (area.width().floor() - padding).max(0.);
+                        job.wrap.max_rows = 1;
+                        job.wrap.break_anywhere = true;
+                        let galley = ui.painter().layout_job(job);
+                        let elided = galley.elided;
+                        let width = galley.size().x.ceil() + padding;
+                        let (rect, response) =
+                            ui.allocate_exact_size(vec2(width, 29.), Sense::click_and_drag());
+                        centers.push(rect.center().x);
+                        if current && reveal_active {
+                            response.scroll_to_me(None);
+                        }
                         if current || response.hovered() {
                             ui.painter().rect_filled(
                                 rect,
@@ -269,21 +300,14 @@ impl PanelUi {
                             );
                         }
                         Icon::Folder.draw(ui, pos2(rect.left() + 14., rect.center().y), 14., ink);
-                        ui.painter()
-                            .with_clip_rect(
-                                Rect::from_min_max(
-                                    rect.min,
-                                    pos2(rect.right() - 19., rect.bottom()),
-                                )
-                                .intersect(ui.clip_rect()),
-                            )
-                            .text(
-                                pos2(rect.left() + 27., rect.center().y),
-                                Align2::LEFT_CENTER,
-                                &title,
-                                FontId::proportional(13.),
-                                ink,
-                            );
+                        ui.painter().galley(
+                            pos2(
+                                rect.left() + label_left,
+                                rect.center().y - galley.size().y / 2.,
+                            ),
+                            galley,
+                            ink,
+                        );
                         response.widget_info(|| {
                             egui::WidgetInfo::labeled(
                                 egui::Role::Button,
@@ -328,19 +352,11 @@ impl PanelUi {
                         } else if response.clicked() {
                             actions.push(Action::Command(Command::Tab(side, index)));
                         }
-                        if response.drag_stopped() {
-                            let delta = response.drag_delta().x;
-                            if delta.abs() > width * 0.35 {
-                                let offset = (delta / width).round() as isize;
-                                let to = index
-                                    .saturating_add_signed(if offset == 0 {
-                                        delta.signum() as isize
-                                    } else {
-                                        offset
-                                    })
-                                    .min(pane.tabs.len() - 1);
-                                actions.push(Action::Command(Command::ReorderTab(side, index, to)));
-                            }
+                        if response.drag_stopped()
+                            && let Some(pos) = ui.input(|input| input.pointer.latest_pos())
+                            && area.contains(pos)
+                        {
+                            reorder = Some((index, pos.x));
                         }
                         if let Some(payload) = response.dnd_release_payload::<Drag>() {
                             let moving = ui.input(|input| input.modifiers.shift);
@@ -352,7 +368,12 @@ impl PanelUi {
                             });
                         }
                         response
-                            .on_hover_text(tab.base().display().to_string())
+                            .on_hover_ui(|ui| {
+                                if elided {
+                                    ui.label(&title);
+                                }
+                                ui.label(tab.base().display().to_string());
+                            })
                             .context_menu(|ui| {
                                 if ui.button("Rename tab").clicked() {
                                     actions.push(Action::Tool(side, Tool::RenameTab(index)));
@@ -402,6 +423,16 @@ impl PanelUi {
                                     ui.close();
                                 }
                             });
+                    }
+                    if let Some((from, x)) = reorder {
+                        let to = centers
+                            .iter()
+                            .enumerate()
+                            .filter(|&(index, center)| index != from && *center < x)
+                            .count();
+                        if to != from {
+                            actions.push(Action::Command(Command::ReorderTab(side, from, to)));
+                        }
                     }
                 });
             });
@@ -1025,7 +1056,23 @@ fn gallery(ui: &mut Ui, tab: &Tab, side: Side, previews: &mut Previews, actions:
 }
 
 fn empty(ui: &mut Ui, tab: &Tab, side: Side, actions: &mut Vec<Action>) {
+    let filtering = !tab.filter.text.is_empty();
+    let empty_message = if filtering {
+        "No matching files"
+    } else {
+        "This location is empty"
+    };
     if ui.available_height() < 45. {
+        ui.vertical_centered(|ui| {
+            if let Some(message) = tab.error.as_deref() {
+                ui.label(label("Folder unavailable", 13., TEXT))
+                    .on_hover_text(message);
+            } else if tab.loading && tab.entries.is_empty() {
+                ui.label(label("Loading files…", 13., SUB));
+            } else {
+                ui.label(label(empty_message, 13., TEXT));
+            }
+        });
         return;
     }
     let offset = (ui.available_height() * 0.28).min(86.);
@@ -1043,7 +1090,6 @@ fn empty(ui: &mut Ui, tab: &Tab, side: Side, actions: &mut Vec<Action>) {
         } else {
             let (rect, _) = ui.allocate_exact_size(vec2(40., 38.), Sense::hover());
             ui.painter().rect_filled(rect, 9., RAISED);
-            let filtering = !tab.filter.text.is_empty();
             if filtering {
                 Icon::Search
             } else {
@@ -1051,18 +1097,7 @@ fn empty(ui: &mut Ui, tab: &Tab, side: Side, actions: &mut Vec<Action>) {
             }
             .draw(ui, rect.center(), 21., if filtering { BLUE } else { AMBER });
             ui.add_space(7.);
-            ui.label(
-                label(
-                    if filtering {
-                        "No matching files"
-                    } else {
-                        "This location is empty"
-                    },
-                    15.,
-                    TEXT,
-                )
-                .strong(),
-            );
+            ui.label(label(empty_message, 15., TEXT).strong());
             ui.add_space(4.);
             if !filtering
                 && matches!(tab.location(), Location::Directory(_))

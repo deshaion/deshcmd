@@ -1,5 +1,6 @@
 mod dialogs;
 mod panes;
+mod settings;
 mod theme;
 
 use std::collections::{HashMap, HashSet};
@@ -83,6 +84,7 @@ pub struct App {
     desktop: Box<dyn Desktop>,
     interface: Interface,
     dialog: Option<Dialog>,
+    preferences: Option<settings::Preferences>,
     places: Vec<Place>,
     spaces: HashMap<PathBuf, (u64, u64)>,
     last_places: Instant,
@@ -98,6 +100,11 @@ impl App {
         fresh: bool,
     ) -> Self {
         theme::install(&context.egui_ctx);
+        settings::install_zoom(&context.egui_ctx);
+        let (tree, alternate_columns) = context
+            .storage
+            .and_then(|storage| eframe::get_value(storage, "panel_display"))
+            .unwrap_or_default();
         let settings = if fresh {
             Settings::default()
         } else {
@@ -112,8 +119,13 @@ impl App {
             engine,
             places: desktop.places(),
             desktop,
-            interface: Interface::default(),
+            interface: Interface {
+                tree,
+                alternate_columns,
+                ..Default::default()
+            },
             dialog: None,
+            preferences: None,
             spaces: HashMap::new(),
             last_places: Instant::now(),
             previews: Previews::new(context.egui_ctx.clone()),
@@ -272,7 +284,7 @@ impl App {
             {
                 self.interface.queue = !self.interface.queue;
             }
-            if icon_button(ui, Icon::Settings, "Workspace settings", true).clicked() {
+            if icon_button(ui, Icon::Settings, "Settings", true).clicked() {
                 actions.push(Action::Tool(side, Tool::Settings));
             }
             if icon_button(
@@ -587,12 +599,16 @@ impl App {
 
     fn queue(&mut self, ui: &mut Ui, rect: Rect, actions: &mut Vec<Action>) {
         card(ui, rect, SURFACE);
+        let compact = rect.height() < 80.;
         let mut frame = child(
             ui,
             Id::unique("queue-drawer"),
-            rect.shrink2(vec2(13., 8.)),
+            rect.shrink2(vec2(13., if compact { 4. } else { 8. })),
             Layout::top_down(Align::Min),
         );
+        if compact {
+            frame.spacing_mut().item_spacing.y = 2.;
+        }
         frame.horizontal(|ui| {
             ui.label(label("Operations", 15., TEXT).strong());
             ui.label(mono(
@@ -725,6 +741,7 @@ impl App {
         }
         let text_context = self.text_field_focused(ctx)
             || self.dialog.is_some()
+            || self.preferences.is_some()
             || self.interface.show_help
             || self.engine.jobs.iter().any(|job| job.conflict.is_some());
         if text_context {
@@ -774,6 +791,7 @@ impl App {
 
     fn keyboard(&mut self, ctx: &egui::Context, actions: &mut Vec<Action>) {
         if self.dialog.is_some()
+            || self.preferences.is_some()
             || self.interface.show_help
             || self.engine.jobs.iter().any(|job| job.conflict.is_some())
         {
@@ -965,27 +983,48 @@ impl App {
             pos2(root.left() + rail_w, bottom.top()),
         );
         self.rail(ui, rail, actions);
+        let gap = 12.;
+        let vertical_margin = if root.height() < 560. { 6. } else { 14. };
         let workspace = Rect::from_min_max(
-            pos2(rail.right() + 14., top.bottom() + 14.),
-            bottom.left_top() + vec2(root.width() - 14., -14.),
+            pos2(rail.right() + 14., top.bottom() + vertical_margin),
+            bottom.left_top() + vec2(root.width() - 14., -vertical_margin),
         );
-        let job_height = if self.interface.queue {
-            workspace.height().mul_add(0.35, 0.).clamp(108., 180.) + 11.
+        let queue_gap = 11.;
+        let min_queue_height = 61. + queue_gap;
+        let min_stacked_height = 2. * panes::MIN_HEIGHT + gap;
+        let queue_space = if self.interface.queue {
+            min_queue_height
         } else {
             0.
         };
-        let body = Rect::from_min_max(workspace.min, workspace.max - vec2(0., job_height));
-        if self.interface.queue {
-            let queue =
-                Rect::from_min_max(pos2(workspace.left(), body.bottom() + 11.), workspace.max);
+        let stacked =
+            self.engine.settings.stacked && workspace.height() >= min_stacked_height + queue_space;
+        let queue_height = if self.interface.queue {
+            let preferred = (workspace.height() * 0.35).clamp(108., 180.) + queue_gap;
+            let pane_space = if stacked {
+                min_stacked_height
+            } else {
+                panes::MIN_HEIGHT
+            };
+            preferred.min((workspace.height() - pane_space).max(0.))
+        } else {
+            0.
+        };
+        let body = Rect::from_min_max(workspace.min, workspace.max - vec2(0., queue_height));
+        if queue_height > queue_gap {
+            let queue = Rect::from_min_max(
+                pos2(workspace.left(), body.bottom() + queue_gap),
+                workspace.max,
+            );
             self.queue(ui, queue, actions);
         }
 
-        let stacked = self.engine.settings.stacked;
         let ratio = self.engine.settings.split.clamp(0.25, 0.75);
-        let gap = 12.;
         let (panel1, divider, panel2) = if stacked {
-            let split = body.top() + (body.height() - gap) * ratio;
+            let pane_height = (body.height() - gap).max(0.);
+            let min_height = panes::MIN_HEIGHT.min(pane_height / 2.);
+            let split =
+                body.top() + (pane_height * ratio).clamp(min_height, pane_height - min_height);
             (
                 Rect::from_min_max(body.min, pos2(body.right(), split)),
                 Rect::from_min_max(pos2(body.left(), split), pos2(body.right(), split + gap)),
@@ -1066,7 +1105,6 @@ impl App {
                 home: &self.engine.home,
                 space,
                 columns: column_set,
-                stacked,
                 reveal_cursor: self.interface.focus_scroll == Some(side),
                 preview: quick.map(|source| (source, self.engine.tab(source).current())),
             };
@@ -1138,13 +1176,20 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         let mut actions = Vec::new();
+        if self.preferences.is_none() {
+            settings::zoom_shortcuts(&ctx);
+        }
         self.clipboard_shortcuts(&ctx, &mut actions);
         self.keyboard(&ctx, &mut actions);
         self.content(ui, &mut actions);
         for action in actions {
             self.apply(action, &ctx);
         }
-        self.dialogs(&ctx);
+        if self.preferences.is_some() {
+            self.show_settings(&ctx);
+        } else {
+            self.dialogs(&ctx);
+        }
         if self.interface.show_help {
             self.shortcuts(&ctx);
         }
@@ -1154,6 +1199,11 @@ impl eframe::App for App {
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
         eframe::set_value(storage, "workspace", &self.engine.snapshot());
+        eframe::set_value(
+            storage,
+            "panel_display",
+            &(self.interface.tree, self.interface.alternate_columns),
+        );
     }
 }
 
