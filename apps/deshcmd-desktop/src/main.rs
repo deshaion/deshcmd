@@ -301,6 +301,13 @@ fn icon() -> egui::IconData {
 }
 
 fn main() -> eframe::Result {
+    #[cfg(target_os = "linux")]
+    if std::env::var_os("WINIT_X11_SCALE_FACTOR").is_none() {
+        // Use a consistent pixel scale across X11 monitors. Interface zoom still applies.
+        // SAFETY: This runs at process startup, before any threads are started.
+        unsafe { std::env::set_var("WINIT_X11_SCALE_FACTOR", "1") };
+    }
+
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let home = dirs::home_dir()
         .and_then(|home| home.canonicalize().ok())
