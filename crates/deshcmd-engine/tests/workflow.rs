@@ -103,6 +103,44 @@ fn pane_navigation_filters_and_restores_marks() {
 }
 
 #[test]
+fn recursive_filter_applies_to_nested_items_and_can_be_cleared() {
+    let fixture = tempfile::tempdir().unwrap();
+    let root = fixture.path();
+    fs::create_dir_all(root.join("sub/Match folder")).unwrap();
+    fs::create_dir(root.join(".private")).unwrap();
+    for path in ["sub/Match.txt", "sub/lower match.txt", ".private/Match.txt"] {
+        fs::write(root.join(path), "").unwrap();
+    }
+    let mut engine = open(root, root);
+    let side = Side::Left;
+    let mut criteria = MatchOptions::filename("Match");
+    criteria.case_sensitive = true;
+    criteria.recursive = true;
+    criteria.directories = false;
+    engine.dispatch(Command::Filter(side, criteria.clone()));
+    pump(&mut engine, |engine| !engine.tab(side).loading);
+    let visible_paths = |engine: &Engine| {
+        engine
+            .tab(side)
+            .visible_entries()
+            .map(|entry| entry.path.clone())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(visible_paths(&engine), [root.join("sub/Match.txt")]);
+    assert_eq!(engine.tab(side).base(), root);
+    assert!(!engine.tab(side).can_back());
+
+    criteria.files = false;
+    criteria.directories = true;
+    engine.dispatch(Command::Filter(side, criteria));
+    assert_eq!(visible_paths(&engine), [root.join("sub/Match folder")]);
+
+    engine.dispatch(Command::Filter(side, MatchOptions::filename("")));
+    pump(&mut engine, |engine| !engine.tab(side).loading);
+    assert_eq!(visible_paths(&engine), [root.join("sub")]);
+}
+
+#[test]
 fn move_conflicts_keep_skipped_files_and_never_clobber_on_rename() {
     let fixture = tempfile::tempdir().unwrap();
     let left = fixture.path().join("source");

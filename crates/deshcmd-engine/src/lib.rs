@@ -223,6 +223,10 @@ impl Tab {
         self.cursor = None;
         self.anchor = None;
         self.filter.text.clear();
+        self.filter.recursive = false;
+        self.invalidate_scan();
+    }
+    fn invalidate_scan(&mut self) {
         self.error = None;
         self.generation += 1;
         self.loading = false;
@@ -233,9 +237,27 @@ impl Tab {
         hidden: bool,
         ignore: Option<&globset::GlobSet>,
     ) -> io::Result<()> {
-        let eligible = self.entries.iter().filter(|entry| {
+        let shown = |entry: &Entry| {
             (hidden || !entry.hidden)
                 && !ignore.is_some_and(|ignore| ignore.is_match(listing::fold(&entry.name, false)))
+        };
+        let mut excluded_dirs = HashSet::new();
+        if self.filter.recursive {
+            excluded_dirs.extend(
+                self.entries
+                    .iter()
+                    .filter(|entry| entry.is_dir() && !shown(entry))
+                    .map(|entry| entry.path.as_path()),
+            );
+        }
+        let eligible = self.entries.iter().filter(|entry| {
+            shown(entry)
+                && (excluded_dirs.is_empty()
+                    || !entry
+                        .path
+                        .ancestors()
+                        .skip(1)
+                        .any(|path| excluded_dirs.contains(path)))
         });
         let matching: HashSet<&Path> = self
             .filter
@@ -671,10 +693,19 @@ impl Engine {
                 }
                 self.resort(side)?;
             }
-            Command::Filter(side, criteria) => {
+            Command::Filter(side, mut criteria) => {
                 criteria.matching(std::iter::empty())?;
-                self.tab_mut(side).filter = criteria;
-                self.refilter(side)?;
+                let tab = self.tab_mut(side);
+                criteria.recursive &= matches!(tab.location(), Location::Directory(_));
+                let scope_changed = tab.filter.recursive != criteria.recursive;
+                tab.filter = criteria;
+                if scope_changed {
+                    tab.entries.clear();
+                    tab.visible.clear();
+                    tab.invalidate_scan();
+                } else {
+                    self.refilter(side)?;
+                }
             }
             Command::Find(side, criteria) => {
                 let tab = self.tab(side);
@@ -1123,9 +1154,14 @@ impl Engine {
             tab.loading = true;
             tab.dirty = false;
             let (id, generation, location) = (tab.id, tab.generation, tab.saved.location.clone());
+            let recursive = tab.filter.recursive;
             let (sender, wake) = (self.sender.clone(), self.wake.clone());
             std::thread::spawn(move || {
-                let _ = sender.send(Event::Listed(id, generation, listing::scan(&location)));
+                let _ = sender.send(Event::Listed(
+                    id,
+                    generation,
+                    listing::scan(&location, recursive),
+                ));
                 wake();
             });
         }
@@ -1273,7 +1309,7 @@ impl Engine {
             self.last_refresh = Instant::now();
             for pane in &mut self.panes {
                 let tab = pane.tab_mut();
-                if !matches!(tab.location(), Location::Flat { .. }) {
+                if !tab.filter.recursive && !matches!(tab.location(), Location::Flat { .. }) {
                     tab.dirty = true;
                 }
             }

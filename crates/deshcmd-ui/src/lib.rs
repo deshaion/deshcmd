@@ -2,6 +2,7 @@ mod dialogs;
 mod panes;
 mod settings;
 mod theme;
+mod window;
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -11,8 +12,7 @@ use std::time::{Duration, Instant, SystemTime};
 use deshcmd_engine::{self as engine, Command, Engine, Entry, JobState, Settings, Side, Step};
 use eframe::egui;
 use egui::{
-    Align, ColorImage, FontId, Id, Key, Layout, Rect, Sense, TextureHandle, Ui, UiBuilder, pos2,
-    vec2,
+    Align, ColorImage, Id, Key, Layout, Rect, Sense, TextureHandle, Ui, UiBuilder, pos2, vec2,
 };
 
 use dialogs::{Dialog, Tool};
@@ -53,7 +53,6 @@ enum Action {
     },
     Path(Side, PathBuf),
     ToggleQuick(Side),
-    FocusFilter(Side),
     ClipboardText(String),
     Eject(PathBuf),
     Close,
@@ -70,6 +69,9 @@ struct Interface {
     panes: [PanelUi; 2],
     queue: bool,
     tree: bool,
+    show_inline_filter: bool,
+    show_places: bool,
+    show_bottom_bar: bool,
     alternate_columns: [bool; 2],
     quick: Option<Side>,
     clipboard: Option<FileClipboard>,
@@ -122,6 +124,18 @@ impl App {
             interface: Interface {
                 tree,
                 alternate_columns,
+                show_inline_filter: context
+                    .storage
+                    .and_then(|storage| eframe::get_value(storage, "show_inline_filter"))
+                    .unwrap_or(true),
+                show_places: context
+                    .storage
+                    .and_then(|storage| eframe::get_value(storage, "show_places"))
+                    .unwrap_or(true),
+                show_bottom_bar: context
+                    .storage
+                    .and_then(|storage| eframe::get_value(storage, "show_bottom_bar"))
+                    .unwrap_or(true),
                 ..Default::default()
             },
             dialog: None,
@@ -177,9 +191,6 @@ impl App {
                     Some(side)
                 }
             }
-            Action::FocusFilter(side) => {
-                ctx.memory_mut(|memory| memory.request_focus(panes::filter_id(side)))
-            }
             Action::ClipboardText(text) => {
                 if text.is_empty() {
                     self.notice("There are no items to copy");
@@ -214,28 +225,24 @@ impl App {
         }
     }
 
-    fn header(&mut self, ui: &mut Ui, actions: &mut Vec<Action>) {
+    fn header(&mut self, ui: &mut Ui, rect: Rect, actions: &mut Vec<Action>) {
         let side = self.engine.settings.active;
-        let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 59.), Sense::hover());
         ui.painter().rect_filled(rect, 0., RAIL);
         ui.painter().hline(
             rect.x_range(),
             rect.bottom() - 0.5,
             egui::Stroke::new(1., LINE),
         );
-        let brand = Rect::from_min_size(rect.min + vec2(17., 12.), vec2(35., 35.));
-        ui.painter().rect_filled(brand, 9., ACCENT);
-        Icon::Brand.draw(ui, brand.center(), 20., BASE);
-        ui.painter().text(
-            pos2(brand.right() + 10., rect.center().y - 1.),
-            egui::Align2::LEFT_CENTER,
-            "deshcmd",
-            FontId::proportional(21.),
-            TEXT,
-        );
+        let brand_x = rect.left() + 25.;
+        #[cfg(target_os = "macos")]
+        let brand_x = brand_x + 76. / ui.ctx().zoom_factor();
+        let brand = Rect::from_center_size(pos2(brand_x, rect.center().y), vec2(26., 26.));
+        ui.painter().rect_filled(brand, 7., ACCENT);
+        Icon::Brand.draw(ui, brand.center(), 16., BASE);
+        let compact = rect.width() < 850.;
         let area = Rect::from_min_max(
-            pos2(rect.left() + 170., rect.top() + 14.),
-            rect.right_bottom() - vec2(15., 13.),
+            pos2(brand.right() + 9., rect.top() + 6.),
+            rect.right_bottom() - vec2(9., 6.),
         );
         let mut toolbar = child(
             ui,
@@ -247,7 +254,7 @@ impl App {
         if action(
             &mut toolbar,
             Icon::Plus,
-            "New",
+            if compact { "" } else { "New" },
             "Create a folder or file",
             true,
             true,
@@ -260,54 +267,93 @@ impl App {
         toolbar.menu_button("Select", |ui| dialogs::selection_menu(ui, side, actions));
         toolbar.menu_button("View", |ui| self.view_menu(ui, side, actions));
         toolbar.menu_button("Tools", |ui| dialogs::tools_menu(ui, side, actions));
-        toolbar.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            let pending = self
-                .engine
-                .jobs
-                .iter()
-                .filter(|job| !job.state.finished())
-                .count();
-            let title = if pending > 0 {
-                format!("Queue  {pending}")
-            } else {
-                "Queue".into()
-            };
-            if action(
-                ui,
-                Icon::Queue,
-                &title,
-                "Operation queue and log",
-                true,
-                self.interface.queue,
-            )
-            .clicked()
-            {
-                self.interface.queue = !self.interface.queue;
-            }
-            if icon_button(ui, Icon::Settings, "Settings", true).clicked() {
-                actions.push(Action::Tool(side, Tool::Settings));
-            }
-            if icon_button(
-                ui,
-                if self.engine.settings.stacked {
-                    Icon::Stack
+        let drag_start = toolbar.cursor().left();
+        let drag_end = toolbar
+            .with_layout(Layout::right_to_left(Align::Center), |ui| {
+                #[cfg(not(target_os = "macos"))]
+                {
+                    if window::controls(ui) {
+                        actions.push(Action::Close);
+                    }
+                    ui.separator();
+                }
+                let pending = self
+                    .engine
+                    .jobs
+                    .iter()
+                    .filter(|job| !job.state.finished())
+                    .count();
+                let title = if compact {
+                    String::new()
+                } else if pending > 0 {
+                    format!("Queue  {pending}")
                 } else {
-                    Icon::Columns
-                },
-                "Switch panel orientation",
-                true,
-            )
-            .clicked()
-            {
-                self.engine.settings.stacked = !self.engine.settings.stacked;
-            }
-            if icon_button(ui, Icon::Refresh, "Refresh active folders · Ctrl+R", true).clicked() {
-                actions.push(Action::Command(Command::Refresh));
-            }
-            if icon_button(ui, Icon::Swap, "Swap panels", true).clicked() {
-                actions.push(Action::Command(Command::Swap));
-            }
-        });
+                    "Queue".into()
+                };
+                let queue_label = if pending > 0 {
+                    format!("Operation queue · {pending} pending")
+                } else {
+                    "Operation queue and log".into()
+                };
+                if action(
+                    ui,
+                    Icon::Queue,
+                    &title,
+                    &queue_label,
+                    true,
+                    self.interface.queue,
+                )
+                .clicked()
+                {
+                    self.interface.queue = !self.interface.queue;
+                }
+                if icon_button(ui, Icon::Settings, "Settings", true).clicked() {
+                    actions.push(Action::Tool(side, Tool::Settings));
+                }
+                if icon_button(
+                    ui,
+                    if self.engine.settings.stacked {
+                        Icon::Stack
+                    } else {
+                        Icon::Columns
+                    },
+                    "Switch panel orientation",
+                    true,
+                )
+                .clicked()
+                {
+                    self.engine.settings.stacked = !self.engine.settings.stacked;
+                }
+                if icon_button(ui, Icon::Refresh, "Refresh active folders · Ctrl+R", true).clicked()
+                {
+                    actions.push(Action::Command(Command::Refresh));
+                }
+                if icon_button(ui, Icon::Swap, "Swap panels", true).clicked() {
+                    actions.push(Action::Command(Command::Swap));
+                }
+                let places_label = if self.interface.show_places {
+                    "Hide Places sidebar"
+                } else {
+                    "Show Places sidebar"
+                };
+                if action(
+                    ui,
+                    Icon::Sidebar,
+                    "",
+                    places_label,
+                    true,
+                    self.interface.show_places,
+                )
+                .clicked()
+                {
+                    self.interface.show_places = !self.interface.show_places;
+                }
+                ui.cursor().right()
+            })
+            .inner;
+        let drag_area =
+            Rect::from_min_max(pos2(drag_start, area.top()), pos2(drag_end, rect.bottom()));
+        window::drag_region(ui, drag_area);
     }
 
     fn view_menu(&mut self, ui: &mut Ui, side: Side, actions: &mut Vec<Action>) {
@@ -813,7 +859,7 @@ impl App {
             return;
         }
         if command(Key::F) {
-            actions.push(Action::FocusFilter(side));
+            actions.push(Action::Tool(side, Tool::FilterOptions));
             return;
         }
         if editing {
@@ -945,7 +991,7 @@ impl App {
                             ("Up / Down · Space", "Move focus · toggle mark"),
                             ("Shift + Up / Down", "Extend selection"),
                             ("Ctrl + A / I", "Mark all or invert marks"),
-                            ("Ctrl + F / R", "Quick filter or refresh"),
+                            ("Ctrl + F / R", "Open filter options or refresh"),
                             ("F2 / F3", "Rename or preview"),
                             ("F5 / F6", "Copy or move to opposite panel"),
                             ("Shift + F5", "Copy in same folder"),
@@ -969,25 +1015,35 @@ impl App {
     fn content(&mut self, ui: &mut Ui, actions: &mut Vec<Action>) {
         let (root, _) = ui.allocate_exact_size(ui.available_size(), Sense::hover());
         ui.painter().rect_filled(root, 0., BASE);
-        let top = Rect::from_min_size(root.min, vec2(root.width(), 59.));
-        self.header(
-            &mut child(ui, Id::unique("header"), top, Layout::top_down(Align::Min)),
-            actions,
-        );
-        let bottom =
-            Rect::from_min_max(pos2(root.left(), root.bottom() - 41.), root.right_bottom());
-        self.footer(ui, bottom, actions);
-        let rail_w = if root.width() > 1050. { 184. } else { 158. };
-        let rail = Rect::from_min_max(
-            pos2(root.left(), top.bottom()),
-            pos2(root.left() + rail_w, bottom.top()),
-        );
-        self.rail(ui, rail, actions);
+        let top = Rect::from_min_size(root.min, vec2(root.width(), window::HEADER_HEIGHT));
+        self.header(ui, top, actions);
+        let workspace_bottom = if self.interface.show_bottom_bar {
+            let bottom =
+                Rect::from_min_max(pos2(root.left(), root.bottom() - 41.), root.right_bottom());
+            self.footer(ui, bottom, actions);
+            bottom.top()
+        } else {
+            root.bottom()
+        };
+        let rail_w = if !self.interface.show_places {
+            0.
+        } else if root.width() > 1050. {
+            184.
+        } else {
+            158.
+        };
+        if self.interface.show_places {
+            let rail = Rect::from_min_max(
+                pos2(root.left(), top.bottom()),
+                pos2(root.left() + rail_w, workspace_bottom),
+            );
+            self.rail(ui, rail, actions);
+        }
         let gap = 12.;
         let vertical_margin = if root.height() < 560. { 6. } else { 14. };
         let workspace = Rect::from_min_max(
-            pos2(rail.right() + 14., top.bottom() + vertical_margin),
-            bottom.left_top() + vec2(root.width() - 14., -vertical_margin),
+            pos2(root.left() + rail_w + 14., top.bottom() + vertical_margin),
+            pos2(root.right() - 14., workspace_bottom - vertical_margin),
         );
         let queue_gap = 11.;
         let min_queue_height = 61. + queue_gap;
@@ -1105,6 +1161,7 @@ impl App {
                 home: &self.engine.home,
                 space,
                 columns: column_set,
+                show_inline_filter: self.interface.show_inline_filter,
                 reveal_cursor: self.interface.focus_scroll == Some(side),
                 preview: quick.map(|source| (source, self.engine.tab(source).current())),
             };
@@ -1143,6 +1200,8 @@ impl App {
                 moving: false,
             });
         }
+        #[cfg(not(target_os = "macos"))]
+        window::resize_edges(ui, root);
     }
 }
 
@@ -1175,6 +1234,12 @@ impl eframe::App for App {
 
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        #[cfg(target_os = "macos")]
+        _frame.set_traffic_lights_position(
+            &ctx,
+            egui::Rangef::new(0., window::HEADER_HEIGHT),
+            12. / ctx.zoom_factor(),
+        );
         let mut actions = Vec::new();
         if self.preferences.is_none() {
             settings::zoom_shortcuts(&ctx);
@@ -1195,10 +1260,30 @@ impl eframe::App for App {
         }
         self.publish_text_clipboard(&ctx);
         self.record_notice();
+        if !self.interface.show_bottom_bar
+            && let Some((message, _)) = &self.interface.notice
+        {
+            egui::Area::new(Id::unique("status-notice"))
+                .anchor(egui::Align2::RIGHT_BOTTOM, vec2(-14., -12.))
+                .interactable(false)
+                .show(&ctx, |ui| {
+                    egui::Frame::popup(ui.style()).show(ui, |ui| {
+                        ui.set_max_width(360.);
+                        ui.label(label(message, 12., AMBER));
+                    });
+                });
+        }
     }
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
         eframe::set_value(storage, "workspace", &self.engine.snapshot());
+        eframe::set_value(
+            storage,
+            "show_inline_filter",
+            &self.interface.show_inline_filter,
+        );
+        eframe::set_value(storage, "show_places", &self.interface.show_places);
+        eframe::set_value(storage, "show_bottom_bar", &self.interface.show_bottom_bar);
         eframe::set_value(
             storage,
             "panel_display",

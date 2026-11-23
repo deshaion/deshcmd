@@ -91,10 +91,17 @@ pub enum Icon {
     Up,
     Plus,
     Close,
+    #[cfg(not(target_os = "macos"))]
+    Minimize,
+    #[cfg(not(target_os = "macos"))]
+    Maximize,
+    #[cfg(not(target_os = "macos"))]
+    Restore,
     Refresh,
     Search,
     Stack,
     Columns,
+    Sidebar,
     Grid,
     List,
     Swap,
@@ -249,6 +256,17 @@ impl Icon {
                 line(&[(4., 4.), (12., 12.)]);
                 line(&[(12., 4.), (4., 12.)]);
             }
+            #[cfg(not(target_os = "macos"))]
+            Self::Minimize => line(&[(3., 8.), (13., 8.)]),
+            #[cfg(not(target_os = "macos"))]
+            Self::Maximize => {
+                rect(3., 3., 13., 13.);
+            }
+            #[cfg(not(target_os = "macos"))]
+            Self::Restore => {
+                line(&[(6., 4.), (6., 2.), (14., 2.), (14., 10.), (12., 10.)]);
+                rect(2., 5., 11., 14.);
+            }
             Self::Refresh => {
                 line(&[
                     (13., 6.),
@@ -269,6 +287,10 @@ impl Icon {
             Self::Stack => {
                 rect(1., 2., 15., 14.);
                 line(&[(2., 8.), (14., 8.)]);
+            }
+            Self::Sidebar => {
+                rect(1., 2., 15., 14.);
+                line(&[(6., 2.), (6., 14.)]);
             }
             Self::Columns => {
                 rect(1., 2., 15., 14.);

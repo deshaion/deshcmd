@@ -197,6 +197,7 @@ pub struct Sort {
 pub struct MatchOptions {
     pub text: String,
     pub case_sensitive: bool,
+    pub recursive: bool,
     pub ignore_accents: bool,
     pub extension_only: bool,
     pub directories: bool,
@@ -213,6 +214,14 @@ impl MatchOptions {
             files: true,
             ..Self::default()
         }
+    }
+
+    pub fn is_active(&self) -> bool {
+        !self.text.is_empty()
+            || self.recursive
+            || !self.files
+            || !self.directories
+            || self.read_only
     }
 
     pub fn matching<'a>(
@@ -290,11 +299,20 @@ pub(crate) struct Scan {
     pub entries: Vec<Entry>,
     pub skipped: usize,
 }
-pub(crate) fn scan(location: &Location) -> io::Result<Scan> {
+pub(crate) fn scan(location: &Location, recursive: bool) -> io::Result<Scan> {
     let mut paths = Vec::new();
     let mut skipped = 0;
     let mut seen = std::collections::HashSet::new();
     match location {
+        Location::Directory(path) if recursive => {
+            for entry in walkdir::WalkDir::new(path).min_depth(1) {
+                match entry {
+                    Ok(entry) => paths.push(entry.into_path()),
+                    Err(error) if error.depth() == 0 => return Err(error.into()),
+                    Err(_) => skipped += 1,
+                }
+            }
+        }
         Location::Directory(path) => {
             for entry in fs::read_dir(path)? {
                 match entry {

@@ -31,6 +31,7 @@ pub(crate) struct PaneScreen<'a> {
     pub home: &'a Path,
     pub space: Option<(u64, u64)>,
     pub columns: &'a [Column],
+    pub show_inline_filter: bool,
     pub reveal_cursor: bool,
     pub preview: Option<(Side, Option<&'a Entry>)>,
 }
@@ -70,6 +71,7 @@ impl PanelUi {
             home,
             space,
             columns,
+            show_inline_filter,
             reveal_cursor,
             preview,
         } = screen;
@@ -111,7 +113,7 @@ impl PanelUi {
         );
         self.navigation(root, nav, tab, side, home, actions);
         let mut body_top = nav.bottom() + 4.;
-        if !short {
+        if show_inline_filter && !short {
             let tools = Rect::from_min_max(
                 pos2(rect.left() + 12., body_top),
                 pos2(rect.right() - 11., body_top + 33.),
@@ -191,12 +193,9 @@ impl PanelUi {
                 });
             }
         }
-        if root.input(|input| input.pointer.button_clicked(egui::PointerButton::Primary))
-            && root
-                .ctx()
-                .pointer_latest_pos()
-                .is_some_and(|pos| rect.contains(pos))
-            && !active
+        if !active
+            && drop_area.container_contains_pointer()
+            && root.input(|input| input.pointer.button_clicked(egui::PointerButton::Primary))
         {
             actions.insert(0, Action::Command(Command::Focus(side)));
         }
@@ -624,9 +623,10 @@ impl PanelUi {
             13.,
             MUTED,
         );
+        let has_clear = !self.filter.is_empty() || tab.filter.is_active();
         let field = Rect::from_min_max(
             filter_rect.min + vec2(22., 1.),
-            filter_rect.max - vec2(if self.filter.is_empty() { 5. } else { 23. }, 1.),
+            filter_rect.max - vec2(if has_clear { 23. } else { 5. }, 1.),
         );
         let mut filter = child(
             &mut ui,
@@ -647,7 +647,7 @@ impl PanelUi {
             criteria.text.clone_from(&self.filter);
             actions.push(Action::Command(Command::Filter(side, criteria)));
         }
-        if !self.filter.is_empty() {
+        if has_clear {
             let clear = Rect::from_center_size(
                 pos2(filter_rect.right() - 12., filter_rect.center().y),
                 vec2(18., 25.),
@@ -661,9 +661,10 @@ impl PanelUi {
             );
             if response.clicked() {
                 self.filter.clear();
-                let mut criteria = tab.filter.clone();
-                criteria.text.clear();
-                actions.push(Action::Command(Command::Filter(side, criteria)));
+                actions.push(Action::Command(Command::Filter(
+                    side,
+                    engine::MatchOptions::filename(""),
+                )));
             }
         }
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -1057,9 +1058,9 @@ fn gallery(ui: &mut Ui, tab: &Tab, side: Side, previews: &mut Previews, actions:
 }
 
 fn empty(ui: &mut Ui, tab: &Tab, side: Side, actions: &mut Vec<Action>) {
-    let filtering = !tab.filter.text.is_empty();
+    let filtering = tab.filter.is_active();
     let empty_message = if filtering {
-        "No matching files"
+        "No matching items"
     } else {
         "This location is empty"
     };
@@ -1197,6 +1198,10 @@ fn panel_status(root: &mut Ui, rect: Rect, side: Side, tab: &Tab, space: Option<
         11.,
         if tab.selected.is_empty() { SUB } else { ACCENT },
     ));
+    if tab.filter.is_active() {
+        ui.label(label("Filtered", 11., ACCENT))
+            .on_hover_text("Ctrl+F to open filter options");
+    }
     if tab.skipped > 0 {
         ui.label(label(format!("{} unavailable", tab.skipped), 11., AMBER));
     }

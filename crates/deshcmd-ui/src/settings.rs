@@ -64,6 +64,9 @@ impl Page {
 pub(crate) struct Preferences {
     workspace: Settings,
     directory_tree: bool,
+    show_inline_filter: bool,
+    show_places: bool,
+    show_bottom_bar: bool,
     alternate_columns: [bool; 2],
     zoom: u32,
     page: Page,
@@ -137,6 +140,9 @@ impl Preferences {
                     self.workspace.split = split / 100.;
                 }
                 ui.checkbox(&mut self.directory_tree, "Show the directory tree");
+                ui.checkbox(&mut self.show_inline_filter, "Show the inline filter");
+                ui.checkbox(&mut self.show_places, "Show the Places sidebar");
+                ui.checkbox(&mut self.show_bottom_bar, "Show the bottom bar");
             }
             Page::Navigation => {
                 ui.checkbox(&mut self.workspace.linked, "Synchronize navigation");
@@ -209,6 +215,9 @@ impl App {
         self.preferences = Some(Preferences {
             workspace: self.engine.settings.clone(),
             directory_tree: self.interface.tree,
+            show_inline_filter: self.interface.show_inline_filter,
+            show_places: self.interface.show_places,
+            show_bottom_bar: self.interface.show_bottom_bar,
             alternate_columns: self.interface.alternate_columns,
             zoom: zoom_percent(ctx.zoom_factor()),
             page: Page::Interface,
@@ -316,6 +325,9 @@ impl App {
             .alternate_columns
             .clone_from(&draft.alternate_columns);
         self.interface.tree = preferences.directory_tree;
+        self.interface.show_inline_filter = preferences.show_inline_filter;
+        self.interface.show_places = preferences.show_places;
+        self.interface.show_bottom_bar = preferences.show_bottom_bar;
         self.interface.alternate_columns = preferences.alternate_columns;
         ctx.set_zoom_factor(zoom_factor(preferences.zoom));
 

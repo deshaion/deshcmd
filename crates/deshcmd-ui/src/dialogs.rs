@@ -267,13 +267,7 @@ pub(crate) fn selection_menu(ui: &mut Ui, side: Side, actions: &mut Vec<Action>)
     });
     ui.separator();
     menu_item(ui, side, "Quick Search…", Tool::Find, actions);
-    menu_item(
-        ui,
-        side,
-        "Quick Filter options…",
-        Tool::FilterOptions,
-        actions,
-    );
+    menu_item(ui, side, "Filter… · Ctrl+F", Tool::FilterOptions, actions);
 }
 pub(crate) fn tools_menu(ui: &mut Ui, side: Side, actions: &mut Vec<Action>) {
     menu_item(ui, side, "Settings…", Tool::Settings, actions);
@@ -750,6 +744,7 @@ impl App {
                 let mut dialog = Dialog::new(Kind::Criteria, tool, side, title, selected);
                 if matches!(tool, Tool::FilterOptions) {
                     dialog.criteria = tab.filter.clone();
+                    dialog.flags[0] = matches!(tab.location(), engine::Location::Directory(_));
                 }
                 Some(dialog)
             }
@@ -901,6 +896,11 @@ impl App {
             ui.add_space(7.);
             ui.separator();
             ui.horizontal(|ui| {
+                if matches!(dialog.tool, Tool::FilterOptions) && ui.button("Clear filter").clicked()
+                {
+                    dialog.criteria = MatchOptions::filename("");
+                    outcome = Outcome::Submit(false);
+                }
                 if dialog.kind == Kind::Transfer
                     && ui
                         .button("Queue paused")
@@ -1248,10 +1248,14 @@ impl App {
                     Tool::Find => Command::Find(side, criteria.clone()),
                     Tool::MarkMask => Command::MarkMask(side, criteria.clone(), true),
                     Tool::UnmarkMask => Command::MarkMask(side, criteria.clone(), false),
-                    _ => {
+                    Tool::FilterOptions => {
+                        criteria
+                            .matching(std::iter::empty())
+                            .map_err(|error| error.to_string())?;
                         self.interface.panes[side.index()].set_filter_text(&criteria.text);
                         Command::Filter(side, criteria.clone())
                     }
+                    _ => unreachable!(),
                 };
                 Action::Command(command)
             }
@@ -1579,7 +1583,14 @@ fn draw_fields(ui: &mut Ui, dialog: &mut Dialog, outcome: &mut Outcome) {
                 ui.checkbox(&mut criteria.extension_only, "Extension only");
             });
             ui.horizontal_wrapped(|ui| {
-                ui.checkbox(&mut criteria.directories, "Folders");
+                if matches!(tool, Tool::FilterOptions) {
+                    ui.add_enabled(
+                        flags[0],
+                        egui::Checkbox::new(&mut criteria.recursive, "Recursive"),
+                    )
+                    .on_disabled_hover_text("Recursive filtering is available in directory tabs");
+                }
+                ui.checkbox(&mut criteria.directories, "Directories");
                 ui.checkbox(&mut criteria.files, "Files");
                 ui.checkbox(&mut criteria.read_only, "Read-only items");
             });

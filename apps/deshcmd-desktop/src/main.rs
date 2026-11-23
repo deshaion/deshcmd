@@ -328,12 +328,20 @@ fn main() -> eframe::Result {
             .filter(|path| path.is_dir())
             .unwrap_or(fallback)
     });
+    let viewport = egui::ViewportBuilder::default()
+        .with_title("deshcmd")
+        .with_app_id("deshcmd")
+        .with_inner_size([1220., 540.])
+        .with_icon(icon());
+    #[cfg(target_os = "macos")]
+    let viewport = viewport
+        .with_fullsize_content_view(true)
+        .with_titlebar_shown(false)
+        .with_title_shown(false);
+    #[cfg(not(target_os = "macos"))]
+    let viewport = viewport.with_decorations(false);
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_title("deshcmd")
-            .with_app_id("deshcmd")
-            .with_inner_size([1220., 540.])
-            .with_icon(icon()),
+        viewport,
         renderer: eframe::Renderer::Wgpu,
         clipboard_shortcuts: false,
         ..Default::default()
