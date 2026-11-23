@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=DeshCmd
+Comment=Dual-pane file manager
+Exec=deshcmd
+Icon=deshcmd
+Terminal=false
+Categories=System;FileTools;FileManager;
