@@ -1,0 +1,17 @@
+[workspace]
+members = ["apps/deshcmd-desktop", "crates/deshcmd-engine", "crates/deshcmd-ui"]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+license = "MIT"
+
+[workspace.dependencies]
+deshcmd-engine = { path = "crates/deshcmd-engine" }
+deshcmd-ui = { path = "crates/deshcmd-ui" }
+eframe = { version = "0.37", default-features = false, features = ["accesskit", "clipboard", "default_fonts", "persistence", "wayland", "wgpu", "x11"] }
+egui_extras = { version = "0.37", default-features = false }
+serde = { version = "1", features = ["derive"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp", "ico", "tiff"] }

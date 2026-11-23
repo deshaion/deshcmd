@@ -1,0 +1,109 @@
+# File manager features
+
+This inventory covers dual-panel file management for local files, archives, network locations, and other virtual file systems. Platform integrations, archive operations, and plugin availability vary by build and installed libraries.
+
+## Workspace and navigation
+
+- **Dual file panels.** Arrange the panels side by side or one above the other, resize the divider, change focus, or swap panels together with their tabs. Open the same location in both panels, send the current location or selected directory to the other panel, or enable synchronized navigation through matching subdirectories.
+- **Directory navigation.** Edit or paste a path, use clickable path segments, and jump to the parent, root, or home directory. Back and forward navigation and a directory history menu provide access to recently visited locations. A directory tree offers a second way to browse the hierarchy.
+- **Drives and places.** Use the drive bar or drive menu to switch locations, see available space, and access mounted volumes, network locations, and virtual file systems. Mount, unmount, or eject actions depend on the operating system and device.
+- **Folder tabs.** Open directories in foreground or background tabs, rename and reorder tabs, move or copy tabs between panels, switch by number or position, and close duplicate tabs. A tab can lock its original path, permit temporary navigation before reverting, or open visited directories in new tabs.
+- **Saved workspaces.** Save and load tab layouts as `.tab` files. Favorite Tabs stores named sets that can restore one or both panels, with options for keeping existing tabs. Save open tabs and the active locations across restarts.
+- **Directory Hotlist.** Bookmark current or selected folders in a nested menu. Entries can open paired source and destination paths, use variables, and be organized with groups and separators. The editor supports sorting, search and replace, and import/export. The Hotlist and other navigation menus can use a searchable tree presentation.
+- **File display.** Switch among detailed Columns, compact Brief, and Thumbnails views. Flat View presents files from an entire directory tree, or a selected subset, together in one panel. File lists can refresh automatically on changes, display hidden and system entries, or apply an ignore list.
+- **Sorting and columns.** Sort by name, extension, size, date, attributes, or other displayed fields, with reverse and multi-column sorting plus configurable directory ordering, case handling, and natural sorting. Set the date/time and size formats and decide where new or changed entries appear. Use different named column sets to display paths, dates, permissions, comments, or metadata from content plugins.
+- **Thumbnail and tooltip previews.** Browse image and text previews, with support for embedded MP3 cover art and OpenDocument thumbnails. Video previews require a supported thumbnailer or platform service. Thumbnail sizes and caching are configurable. Tooltips can show built-in properties and plugin metadata. The opposite panel can serve as a live Quick View for the focused item.
+
+## Selection, filtering, and file lists
+
+- **Marking items.** Select individual items, ranges, or all entries by keyboard or mouse. Invert the selection or mark and unmark groups by masks, attributes, saved criteria, or the focused item's name, extension, or path. Selection rules can account for case and accents.
+- **Quick Search and Quick Filter.** Type to jump to matching items or narrow the visible list in the current panel. Configure activation keys, matching rules, and whether the match applies to the name or extension.
+- **Reusable selections.** Save and restore marks in memory, write them to a text file, or rebuild them from a file or clipboard list. Load a text file of full paths directly into a panel as a virtual file list.
+- **Clipboard and export.** Copy names, directory paths, full paths, or tab-separated values from the displayed columns. Export file details to a file. Windows also supports copying network names as UNC paths.
+
+## File operations and integrity
+
+- **Create and organize.** Create folders and text files, open files with the associated program or a chosen application, rename in place or through a dialog, copy within a folder, and copy or move between locations. Use function keys, menus, clipboard cut/copy/paste, or drag and drop within the app and with compatible desktop applications. In-place rename can continue to the previous or next item. On Windows, dropping selected text into a panel can save it as plain text, HTML, or RTF.
+- **Copy and move controls.** Edit the destination or apply a rename mask while transferring. Filter a batch using saved search criteria, omit empty directories, check available space, preallocate storage where supported, and optionally verify a copy. Operations can preserve timestamps, attributes, ownership, or permissions where available. Symlinks can be followed or adjusted. Supported file systems can use copy-on-write cloning, including Linux reflinks and macOS APFS cloning.
+- **Conflict handling.** Decide how to handle files or folders with the same name. Options can include merge, skip, overwrite, conditional overwrite by age or size, manual or automatic renaming, append, resume of a partial file, and opening a content comparison. Apply a choice to a single collision or subsequent collisions where offered.
+- **Background operations.** Start work immediately or queue tasks, monitor per-file and overall progress, speed, and estimated time, and pause, resume, cancel, or reorder operations. View ongoing jobs in the Operations Viewer and configure which events and operation types appear in the log window or log file.
+- **Deletion and links.** Send files to the operating system trash where available, delete permanently, or use the Wipe command to overwrite file data before deleting. Wipe effectiveness depends on the storage device and file system. Create symbolic links with relative or absolute targets, hard links on supported file systems, and Windows shortcuts on Windows.
+- **Properties and comments.** Inspect file type, size, allocated space, timestamps, link information, permissions, ownership, and fields from installed content plugins. Edit timestamps or attributes in bulk, including recursively. Display and edit local `descript.ion` comments and carry them along in supported file operations.
+- **Space and counts.** Calculate the total size and counts of selected items, display folder sizes directly in the file list, and see drive capacity and free space.
+- **Split and combine.** Split a file into numbered parts using a chosen size or part count. Reassemble the parts in order or combine a selected sequence of files.
+- **Checksums and benchmarking.** Generate checksum manifests for a selection, per file, or per directory. Verify a manifest or compare a single file with a digest supplied manually or from the clipboard. Supported choices include CRC32/SFV, MD4, MD5, SHA-1, SHA-2, SHA-3, BLAKE2 variants, BLAKE3, HAVAL, RIPEMD128/160, Tiger/192, and XXH128. A benchmark reports the timing and throughput of supported hashes.
+
+## Search, duplicates, and batch renaming
+
+- **Find Files.** Search one or more locations, selected items, or all open tabs. Limit recursion depth, exclude files and folders, follow symlinks optionally, and inspect supported archives. Match exact or partial names, wildcard masks, or regular expressions.
+- **Content search and replacement.** Find files containing or lacking a string. Search across selected text encodings, use case-sensitive, hexadecimal, or regular-expression matching, and replace matching text. An Office XML option searches supported Microsoft Office and OpenDocument files such as DOCX, XLSX, ODT, and ODS.
+- **Advanced and plugin criteria.** Combine name and content matching with modification date, time or age, size, and operating-system-specific attributes or permissions. Use WDX plugin fields for metadata conditions, or use a DSX search provider for indexed search. Save named templates and reuse them in compatible tools.
+- **Duplicate finder.** Group duplicates using filename, size, hashes, or byte-for-byte comparison. In a panel of duplicate results, select candidates by rules such as newest, oldest, largest, smallest, or position while keeping an item from each group unselected.
+- **Search result actions.** Run and switch among multiple searches, inspect or edit a result, reveal it in its original directory, open results in background tabs, or send the result list to a panel for ordinary file operations. Remove entries from the displayed results without deleting the underlying files.
+- **Multi-Rename Tool.** Preview old and proposed names side by side before applying a batch. Generate names and extensions from masks, original-name slices, parent paths, dates, counters, and WDX metadata. Change case, use literal or regex replacements with capture-group substitutions, or apply an explicit list of names. Reorder the input, resolve duplicate target names by adding numbers, save presets, and log changes.
+
+## Comparison and synchronization
+
+- **Compare directories.** Mark entries missing from the opposite panel and identify newer files in same-name pairs for a quick comparison of the displayed directories.
+- **Synchronize directories.** Compare two roots with optional recursion, filename masks, date rules, and byte comparison where supported. Review identical, different, unreadable, or one-sided entries before choosing copy or delete actions. Change direction or omit actions per item. An asymmetric mode can mirror the left side to the right and mark right-only items for deletion. Open files or compare a pair from the results, then confirm the selected operations. Archive and virtual locations depend on their file source capabilities.
+- **Compare by Contents.** Compare two files side by side in text or binary mode. Navigate highlighted differences, show differences within lines, ignore case or whitespace, and scroll both sides together. Edit text, copy difference blocks in either direction, undo or redo edits, and save either side. A configured external differ can take over the command.
+
+## Built-in viewer and editor
+
+- **File viewer (F3).** Open files in a separate viewer or in the opposite panel with Quick View. Modes include plain text, source code with syntax highlighting, binary characters, hexadecimal bytes, decimal bytes, a multi-column book layout, graphics, and text extracted from supported Office XML files. Use encoding detection or choose an encoding, find text or byte sequences, jump to a position, copy a range, or follow a growing log with auto-reload. Browse the previous and next files, and see counts and size when viewing a directory.
+- **Image viewer and editing.** Display common formats including JPEG, PNG, GIF, TIFF, BMP, ICO, PSD, and SVG. Additional formats such as HEIF/AVIF, JPEG XL, and WebP depend on system codecs or libraries. Zoom, fit, rotate, mirror, crop, resize, draw, and apply red-eye correction. Save supported output formats, step through animated GIF or icon frames and export a frame, run a full-screen slideshow, or take a screenshot.
+- **Rich previews and printing.** WLX lister plugins add previews for media, documents, and other formats. Preview availability depends on registered plugins and OS services. Print from viewer plugins that expose printing.
+- **Text editor (F4).** Open and edit multiple files in tabs, or create a new text file. The editor includes configurable syntax highlighting, UTF and legacy encodings, conversion among LF, CRLF, and CR line endings, search and replace, line navigation, undo and redo, auto-indent, block indentation, and options for showing whitespace and removing trailing spaces. Viewer and editor commands can use external programs.
+
+## Archives and packages
+
+- **Browse archives as directories.** Open supported archives in either panel, navigate folders inside them, preview or extract individual members, and copy files between archives and regular folders. Add or delete members where supported and test archive integrity.
+- **Pack and unpack.** Create or update archives through the Pack dialog. Extract by mask, preserve paths or flatten them, choose overwrite behavior, and use a separate folder for each archive or Smart Extract, which creates a containing folder when the archive has multiple top-level items. Compression settings, encryption, and multi-volume handling depend on the archiver and format.
+- **ZIP and compressed streams.** The Zip plugin handles ZIP/ZIPX and ZIP-based formats such as JAR, EPUB, Office Open XML, and OpenDocument. It also handles TAR and compressed streams or tarballs using gzip, bzip2, LZMA/XZ, Zstandard, and Brotli, subject to available libraries. Brotli support is for decompression.
+- **Other formats.** SevenZip on Windows and Linux covers 7z and numerous archives and images, including ARJ, CAB, ISO, DMG, VHD, WIM, and SquashFS. Some formats support only reading, extraction, or testing. CPIO, DEB, and RPM can be unpacked via format-specific handlers where shipped. The UnRAR plugin reads RAR with the UnRAR library and can delegate RAR creation to a configured `rar` or WinRAR executable. The Base64 plugin encodes and decodes files.
+- **External archivers.** Configure command-line tools in the MultiArc system, defining how to identify formats, parse member lists, and run pack, extract, delete, and test commands. Supported actions depend on the command-line tool and its configuration.
+
+## Network, virtual file systems, and desktop integration
+
+| Platform or provider | Capabilities |
+| --- | --- |
+| FTP file-system plugin | Browse servers in a panel and transfer files using FTP, implicit or explicit FTPS, SFTP, or SCP. Save connection profiles and use supported HTTP/SOCKS proxies, SSH keys, or an SSH agent. TLS and SSH features depend on the corresponding libraries. |
+| Windows | Browse SMB shares and UNC paths, map and disconnect network drives, and browse shell locations such as the Recycle Bin, WSL distributions, and compatible phones or media devices exposed through Windows Portable Devices. Supports Windows shell actions and, on a sharing violation during deletion, can show processes holding the file open and offer an unlock action. Uses Explorer preview handlers or Windows Imaging Component codecs where available. |
+| Linux and other Unix-like builds | Browse mounted locations and use GIO/GVfs to reach network or virtual locations with installed backends. GIO builds can open supported `google-drive://` locations through an installed GVfs backend. The Linux installer also includes a Samba WFX plugin. Desktop services can provide MIME associations, icons, trash, drive handling, and terminal selection. Compatible builds can show RabbitVCS status emblems and actions when the service is present. |
+| macOS | Browse iCloud Drive, including selected app folders, and Finder Smart Folders. Use Finder tags, Quick Look, sharing, and other Finder actions. APFS supports file cloning. The MacCloud WFX plugin adds Dropbox, Yandex, OneDrive, Box, Amazon S3, Backblaze B2, Alibaba OSS, Tencent COS, Huawei OBS, Qiniu KODO, Upyun USS, and S3-compatible providers. |
+| Platform availability | Builds or ports exist for Windows, Linux, macOS, and FreeBSD, with experimental Haiku support. Toolkit and package choices affect integration and plugins. Linux builds use GTK or Qt, and macOS uses Cocoa on Apple Silicon and Intel. |
+
+The Virtual File System list provides access to applicable providers, and command shortcuts can open or close network connections. The master-password store can protect saved plugin credentials when supported by the plugin.
+
+## Customization and automation
+
+- **Toolbars and command menus.** Customize the main, middle, and extra toolbars. Buttons can run internal commands, external programs, scripts, or command sequences, open paths, and display nested menus. Configure icons and hints, and import or export compatible toolbar definitions. A searchable internal command dialog runs commands and exposes their names for hotkeys and scripting.
+- **Keyboard and mouse.** Assign shortcuts by context, including the file panels, viewer, editor, and synchronization window. Configure selection with the left or right mouse button, drag-and-drop behavior, and shortcut or mouse actions on panel controls. The function-key button bar exposes common file actions.
+- **Appearance and layout.** Set fonts, icons and icon sizes, row and selection styles, file-type colors, tooltip fields, toolbar positions, and visibility of panels, menus, drives, tabs, command line, log, and job controls. Light and dark profiles can follow the current theme. Configure status and free-space displays, single-instance behavior, minimize options, and language.
+- **File associations and external tools.** Configure actions by file mask, extension, or other supported detection rules. Choose an action from the context menu, use its output as viewer text, launch a configured terminal, or delegate viewing, editing, and comparison to external applications.
+- **Command line and terminal.** Run commands in the current directory, recall command history, and insert the selected file's name or path. Use `cd` to navigate the active panel and expand environment variables in paths. Launch an external terminal at the current folder, run a program through it with optional keep-open behavior, or use the integrated terminal window on supported builds.
+- **Variables and Lua.** Use parameter expansion to pass the active or opposite path, focused file, selected names, file lists, and prompted values to commands. Execute Lua scripts from commands, buttons, or associations. The Lua API can inspect panels and selections, work with files, show dialogs, and invoke internal commands. Lua scripts can also implement WDX content plugins.
+- **Launch and session options.** Start with given left and right paths or focus on a named file. Choose the active side, open paths in new tabs, target a running instance, use named instances or a custom configuration directory, and control the splash screen and debug log. Installations can use user-profile or portable configuration. Save window geometry, tabs, and individual histories selectively, and tune advanced options in the XML configuration file.
+- **Help and localization.** Choose among translated interfaces. The Help menu provides the user manual, a keyboard layout reference, internal command information, and the About dialog.
+
+## Plugin system
+
+Plugins can be registered from a plugin binary or a package with a `pluginst.inf` installer definition. Configure plugins by type, including file detection or extension rules where applicable. The plugin system implements Total Commander-compatible plugin interfaces and adds its own search integration. A compatible platform, architecture, and runtime are required for native plugins.
+
+| Type | What it adds | Examples in official packages or integrations |
+| --- | --- | --- |
+| WCX, packer | Treats archive formats as browsable file sources and adds pack, extract, delete, or test operations according to format. | Zip, SevenZip, UnRAR, Base64, CPIO, DEB, RPM. |
+| WDX, content | Adds fields to columns, tooltips, file properties, rules, search, and batch renaming. | Built-in JPEG EXIF, AudioInfo including tags and technical data, DEB and RPM package metadata, and optional Lua scripts for file descriptions, text lines, or ODT text. |
+| WFX, file system | Adds remote or virtual volumes and file operations to the panels. | FTP, MacCloud on macOS, and Samba in the Linux installer. |
+| WLX, lister | Adds rich preview handlers to the viewer and Quick View. | MacPreview via Quick Look, Explorer Preview, RTF and Windows Media Player plugins for Windows, and WlxMplayer for Linux. |
+| DSX, search | Lets a plugin supply results through Find Files. | DSXLocate queries the Unix `locate` database. |
+
+Additional plugins include Everything search, a Torrent packer plugin, a native TextLine content plugin, and example file-system and viewer plugins. Availability depends on the build or separate installation.
+
+## Additional features
+
+- **Stash.** Collect references to local files and folders from different paths or from search results in a virtual panel. Open the Stash, use it as a batch source, remove individual references, or clear the list. Removing a reference leaves the original item on disk. Lua scripts can read, append, or replace the Stash as text or a table.
+- **Directory synchronization and metadata.** Compare empty directories as well as files. Choose file properties to copy from left to right or right to left. In Change Attributes, load attributes from the focused file, the target-panel file, or the first file on the clipboard.
+- **Integrated terminals.** On builds with the integrated terminal, choose a shared terminal, one terminal per panel, or one per folder tab. Link the terminal and file panel so a directory change in one can update the other.
+- **Sorting, editor, and file-operation controls.** Set a panel sort mode through an internal command, toggle word wrapping in the editor, choose decimal or binary size units, and configure prompts when deleting read-only or hidden/system files.
+- **macOS shortcuts and native actions.** Bind an internal command to Share, AirDrop, Reveal in Finder, Finder Get Info, Quick Look, or Edit Finder Tags. A keyboard preference can treat the top row as standard function keys independently of the macOS setting, with Accessibility permission.
