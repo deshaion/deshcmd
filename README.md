@@ -15,7 +15,7 @@ An ordinary launch restores the saved workspace. Passing directories opens a fre
 
 ## Download builds
 
-The **Build desktop packages** workflow runs when a GitHub release is published. Download the packages from the run's **Artifacts** section. Filenames use the Cargo workspace version.
+The **Build desktop packages** workflow runs when a GitHub release is published and attaches the packages to that release. Download them from the release's **Assets** section. Filenames use the Cargo workspace version.
 
 | Platform | Package for version 0.1.0 |
 | --- | --- |
