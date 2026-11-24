@@ -2,43 +2,7 @@ use super::*;
 use eframe::App as _;
 use engine::{Column, Step};
 
-struct BenchmarkDesktop;
-
-impl Desktop for BenchmarkDesktop {
-    fn open(&mut self, _: &Path) -> Result<(), String> {
-        unreachable!()
-    }
-    fn pick_file(&mut self, _: &Path, _: &str) -> Option<PathBuf> {
-        unreachable!()
-    }
-    fn save_file(&mut self, _: &Path, _: &str, _: &str) -> Option<PathBuf> {
-        None
-    }
-    fn pick_directory(&mut self, _: &Path, _: &str) -> Option<PathBuf> {
-        unreachable!()
-    }
-    fn copy_files(&mut self, _: &[PathBuf]) -> Result<(), String> {
-        unreachable!()
-    }
-    fn clipboard_files(&mut self) -> Vec<PathBuf> {
-        vec![]
-    }
-    fn clipboard_text(&mut self) -> Option<String> {
-        None
-    }
-    fn copy_text(&mut self, _: &str) -> Result<(), String> {
-        unreachable!()
-    }
-    fn places(&mut self) -> Vec<Place> {
-        vec![]
-    }
-    fn eject(&mut self, _: &Path) -> Result<(), String> {
-        unreachable!()
-    }
-    fn shortcut(&mut self, _: &Path, _: &Path) -> Result<(), String> {
-        unreachable!()
-    }
-}
+use super::tests::TestDesktop;
 
 fn sample(label: &str, elapsed: Duration) {
     eprintln!("sample,{label},{:.6}", elapsed.as_secs_f64() * 1000.);
@@ -53,7 +17,7 @@ fn phase1_ui() {
     let cc = eframe::CreationContext::_new_kittest(ctx.clone());
     let mut app = App::new(
         &cc,
-        Box::new(BenchmarkDesktop),
+        Box::new(TestDesktop::default()),
         root.clone(),
         [empty.clone(), empty],
         true,

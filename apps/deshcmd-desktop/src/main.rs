@@ -5,6 +5,8 @@ use std::path::{Path, PathBuf};
 use deshcmd_ui::{App, Desktop, Place};
 use eframe::egui;
 
+mod launch;
+
 struct NativeDesktop {
     clipboard: Option<arboard::Clipboard>,
 }
@@ -22,7 +24,7 @@ impl NativeDesktop {
 
 impl Desktop for NativeDesktop {
     fn open(&mut self, path: &Path) -> Result<(), String> {
-        open::that_detached(path).map_err(|error| error.to_string())
+        launch::open_file(path).map_err(|error| format!("{}: {error}", path.display()))
     }
     fn pick_file(&mut self, initial: &Path, title: &str) -> Option<PathBuf> {
         rfd::FileDialog::new()

@@ -334,8 +334,17 @@ pub(crate) fn tools_menu(ui: &mut Ui, side: Side, actions: &mut Vec<Action>) {
     }
 }
 
-fn details_text(tab: &engine::Tab, columns: &[Column], export: bool) -> String {
-    fn format_rows<'a>(rows: impl Iterator<Item = &'a Entry>, columns: &[Column]) -> String {
+fn details_text(
+    tab: &engine::Tab,
+    columns: &[Column],
+    show_modified_time: bool,
+    export: bool,
+) -> String {
+    fn format_rows<'a>(
+        rows: impl Iterator<Item = &'a Entry>,
+        columns: &[Column],
+        show_modified_time: bool,
+    ) -> String {
         let mut text = String::new();
         for (row, entry) in rows.enumerate() {
             if row != 0 {
@@ -345,7 +354,7 @@ fn details_text(tab: &engine::Tab, columns: &[Column], export: bool) -> String {
                 if i != 0 {
                     text.push('\t');
                 }
-                let value = crate::panes::value(entry, column);
+                let value = crate::panes::value(entry, column, show_modified_time);
                 text.extend(value.chars().map(|c| match c {
                     '\n' | '\r' | '\t' => ' ',
                     _ => c,
@@ -355,11 +364,11 @@ fn details_text(tab: &engine::Tab, columns: &[Column], export: bool) -> String {
         text
     }
     if tab.marked_count() != 0 {
-        format_rows(tab.marked_entries(), columns)
+        format_rows(tab.marked_entries(), columns, show_modified_time)
     } else if export {
-        format_rows(tab.visible_entries(), columns)
+        format_rows(tab.visible_entries(), columns, show_modified_time)
     } else {
-        format_rows(tab.current().into_iter(), columns)
+        format_rows(tab.current().into_iter(), columns, show_modified_time)
     }
 }
 
@@ -677,7 +686,12 @@ impl App {
                     } else {
                         &self.engine.settings.columns
                     };
-                    details_text(tab, columns, matches!(tool, Tool::ExportDetails))
+                    details_text(
+                        tab,
+                        columns,
+                        self.engine.settings.show_modified_time,
+                        matches!(tool, Tool::ExportDetails),
+                    )
                 } else {
                     tab.operands()
                         .iter()
@@ -1783,12 +1797,24 @@ mod tests {
         engine.dispatch(Command::Filter(side, MatchOptions::filename("file")));
         let columns = &[Column::Name, Column::Comment];
         assert_eq!(
-            details_text(engine.tab(side), columns, true),
+            details_text(engine.tab(side), columns, true, true),
             "file2.txt\tone two\nfile10.txt\t"
         );
         assert_eq!(
-            details_text(engine.tab(side), columns, false),
+            details_text(engine.tab(side), columns, true, false),
             "file2.txt\tone two"
+        );
+        let tab = engine.tab(side);
+        let modified =
+            chrono::DateTime::<chrono::Local>::from(tab.current().unwrap().modified.unwrap());
+        let modified_column = &[Column::Modified];
+        assert_eq!(
+            details_text(tab, modified_column, true, false),
+            modified.format("%d %b %Y %H:%M").to_string()
+        );
+        assert_eq!(
+            details_text(tab, modified_column, false, false),
+            modified.format("%d %b %Y").to_string()
         );
         engine.dispatch(Command::Select(
             side,
@@ -1796,7 +1822,7 @@ mod tests {
             engine::Select::Replace,
         ));
         assert_eq!(
-            details_text(engine.tab(side), columns, true),
+            details_text(engine.tab(side), columns, true, true),
             "file10.txt\t"
         );
         engine.dispatch(Command::Select(
@@ -1805,12 +1831,12 @@ mod tests {
             engine::Select::Toggle,
         ));
         assert_eq!(
-            details_text(engine.tab(side), columns, true),
+            details_text(engine.tab(side), columns, true, true),
             "file2.txt\tone two\nfile10.txt\t"
         );
         engine.dispatch(Command::Sort(side, Column::Name, false));
         assert_eq!(
-            details_text(engine.tab(side), columns, true),
+            details_text(engine.tab(side), columns, true, true),
             "file10.txt\t\nfile2.txt\tone two"
         );
     }

@@ -95,6 +95,7 @@ pub struct Settings {
     pub auto_refresh: bool,
     pub columns: Vec<Column>,
     pub alternate_columns: Vec<Column>,
+    pub show_modified_time: bool,
     pub ignore: String,
 }
 
@@ -114,7 +115,23 @@ impl Default for Settings {
             auto_refresh: true,
             columns: vec![Column::Name, Column::Size, Column::Modified],
             alternate_columns: vec![Column::Name, Column::Kind, Column::Path, Column::Comment],
+            show_modified_time: true,
             ignore: String::new(),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct HistoryEntry {
+    location: Location,
+    entered_via: Option<PathBuf>,
+}
+
+impl HistoryEntry {
+    fn new(location: Location) -> Self {
+        Self {
+            location,
+            entered_via: None,
         }
     }
 }
@@ -128,12 +145,14 @@ pub struct Tab {
     selected_bytes: u128,
     cursor: Option<PathBuf>,
     cursor_position: Option<usize>,
+    pending_parent_focus: Option<PathBuf>,
+    parent_focus_restored: bool,
     anchor: Option<PathBuf>,
     anchor_position: Option<usize>,
     saved_marks: HashSet<PathBuf>,
     filter: MatchOptions,
     filter_query: listing::MatchQuery,
-    pub history: Vec<Location>,
+    history: Vec<HistoryEntry>,
     history_index: usize,
     pub loading: bool,
     pub error: Option<String>,
@@ -146,7 +165,7 @@ impl Tab {
     fn new(id: u64, saved: SavedTab) -> Self {
         Self {
             id,
-            history: vec![saved.location.clone()],
+            history: vec![HistoryEntry::new(saved.location.clone())],
             saved,
             entries: Vec::new(),
             visible: Vec::new(),
@@ -154,6 +173,8 @@ impl Tab {
             selected_bytes: 0,
             cursor: None,
             cursor_position: None,
+            pending_parent_focus: None,
+            parent_focus_restored: false,
             anchor: None,
             anchor_position: None,
             saved_marks: Default::default(),
@@ -188,6 +209,9 @@ impl Tab {
     }
     pub fn can_forward(&self) -> bool {
         self.history_index + 1 < self.history.len()
+    }
+    pub fn history(&self) -> impl DoubleEndedIterator<Item = &Location> + ExactSizeIterator {
+        self.history.iter().map(|entry| &entry.location)
     }
     pub fn filter(&self) -> &MatchOptions {
         &self.filter
@@ -303,9 +327,9 @@ impl Tab {
         }
     }
     fn set_location(&mut self, location: Location, record: bool) {
-        if record && self.history[self.history_index] != location {
+        if record && self.history[self.history_index].location != location {
             self.history.truncate(self.history_index + 1);
-            self.history.push(location.clone());
+            self.history.push(HistoryEntry::new(location.clone()));
             if self.history.len() > 128 {
                 self.history.remove(0);
             }
@@ -315,6 +339,8 @@ impl Tab {
         self.clear_view();
         self.clear_marks();
         self.cursor = None;
+        self.pending_parent_focus = None;
+        self.parent_focus_restored = false;
         self.anchor = None;
         self.filter.text.clear();
         self.filter_query = Default::default();
@@ -326,6 +352,15 @@ impl Tab {
         self.generation += 1;
         self.loading = false;
         self.dirty = true;
+    }
+    fn entry_in_parent(&self, parent: &Path) -> Option<&Path> {
+        let Location::Directory(directory) = self.location() else {
+            return None;
+        };
+        let entered_via = self.history[self.history_index].entered_via.as_deref();
+        entered_via
+            .filter(|path| path.parent() == Some(parent))
+            .or_else(|| (directory.parent() == Some(parent)).then_some(directory.as_path()))
     }
     fn filter_entries(&mut self, hidden: bool, ignore: Option<&globset::GlobSet>) {
         #[cfg(feature = "perf")]
@@ -642,6 +677,10 @@ impl Engine {
     }
     pub fn tab(&self, side: Side) -> &Tab {
         self.pane(side).tab()
+    }
+    /// Report a restored cursor once so a view can scroll it into sight.
+    pub fn take_parent_focus_restored(&mut self, side: Side) -> bool {
+        std::mem::take(&mut self.tab_mut(side).parent_focus_restored)
     }
     fn pane_mut(&mut self, side: Side) -> &mut Pane {
         &mut self.panes[side.index()]
@@ -1117,30 +1156,43 @@ impl Engine {
         linked: bool,
     ) -> io::Result<()> {
         let base = self.tab(side).base().to_path_buf();
-        let path = if path == Path::new("~") {
+        let resolved = if path == Path::new("~") {
             self.home.clone()
         } else if let Ok(suffix) = path.strip_prefix("~/") {
             self.home.join(suffix)
         } else {
             base.join(path)
         };
-        if !path.is_dir() {
+        if !resolved.is_dir() {
             return Err(io::Error::other(format!(
                 "{} is unavailable or is not a directory",
-                path.display()
+                resolved.display()
             )));
         }
-        let path = path.canonicalize()?;
-        let previous = self.tab(side).base().to_path_buf();
-        let lock = self.tab(side).saved.lock;
+        let path = resolved.canonicalize()?;
+        let tab = self.tab(side);
+        let previous = tab.base().to_path_buf();
+        let parent_focus = tab
+            .entry_in_parent(&resolved)
+            .or_else(|| tab.entry_in_parent(&path))
+            .and_then(Path::file_name)
+            .map(|name| path.join(name));
+        let location = Location::Directory(path.clone());
+        let location_changed = tab.location() != &location;
+        let lock = tab.saved.lock;
         let opens_tab =
             new_tab || matches!(lock, TabLock::Locked | TabLock::NewTab) && path != previous;
-        if opens_tab {
-            self.add_tab(side, default_tab(path.clone()), background);
+        let tab = if opens_tab {
+            self.add_tab(side, default_tab(path.clone()), background)
         } else {
-            self.tab_mut(side)
-                .set_location(Location::Directory(path.clone()), true);
             self.settings.active = side;
+            let tab = self.tab_mut(side);
+            tab.set_location(location, true);
+            tab
+        };
+        tab.pending_parent_focus = parent_focus;
+        if opens_tab || location_changed {
+            tab.history[tab.history_index].entered_via = Some(resolved);
         }
         if self.settings.linked && linked && !background && !opens_tab {
             let target = self.tab(side.other()).base();
@@ -1163,23 +1215,35 @@ impl Engine {
     }
     fn history(&mut self, side: Side, index: usize) -> io::Result<()> {
         let tab = self.tab_mut(side);
-        if let Some(location) = tab.history.get(index).cloned() {
+        if let Some(HistoryEntry {
+            location,
+            entered_via,
+        }) = tab.history.get(index).cloned()
+        {
             if !location.base().is_dir() {
                 return Err(io::Error::other("This history location is unavailable"));
             }
-            if matches!(tab.saved.lock, TabLock::Locked | TabLock::NewTab)
+            let parent_focus = match &location {
+                Location::Directory(parent) => tab.entry_in_parent(parent).map(Path::to_path_buf),
+                _ => None,
+            };
+            let tab = if matches!(tab.saved.lock, TabLock::Locked | TabLock::NewTab)
                 && location.base() != tab.base()
             {
-                self.add_tab(side, default_tab(location.base().to_path_buf()), false);
+                let tab = self.add_tab(side, default_tab(location.base().to_path_buf()), false);
+                tab.history[0].entered_via = entered_via;
+                tab
             } else {
                 tab.history_index = index;
                 tab.set_location(location, false);
-                self.settings.active = side;
-            }
+                tab
+            };
+            tab.pending_parent_focus = parent_focus;
+            self.settings.active = side;
         }
         Ok(())
     }
-    fn add_tab(&mut self, side: Side, saved: SavedTab, background: bool) {
+    fn add_tab(&mut self, side: Side, saved: SavedTab, background: bool) -> &mut Tab {
         self.ids += 1;
         let index = self.pane(side).tabs.len();
         let id = self.ids;
@@ -1187,6 +1251,7 @@ impl Engine {
         if !background {
             self.switch_tab(side, index);
         }
+        &mut self.pane_mut(side).tabs[index]
     }
     fn switch_tab(&mut self, side: Side, index: usize) {
         let pane = self.pane_mut(side);
@@ -1308,6 +1373,7 @@ impl Engine {
                             continue;
                         };
                         tab.loading = false;
+                        let parent_focus = tab.pending_parent_focus.take();
                         match result {
                             Ok(listing) => {
                                 #[cfg(feature = "perf")]
@@ -1321,7 +1387,15 @@ impl Engine {
                                     self.settings.directories_first,
                                     self.settings.natural_sort,
                                 );
+                                if let Some(path) = &parent_focus {
+                                    tab.cursor = Some(path.clone());
+                                }
                                 tab.filter_entries(self.settings.show_hidden, self.ignore.as_ref());
+                                if parent_focus.is_some() && parent_focus == tab.cursor {
+                                    tab.anchor.clone_from(&tab.cursor);
+                                    tab.anchor_position = tab.cursor_position;
+                                    tab.parent_focus_restored = true;
+                                }
                                 #[cfg(feature = "perf")]
                                 perf::elapsed("install", install);
                             }
