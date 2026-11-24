@@ -1,5 +1,7 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
+mod terminal;
+
 use std::path::{Path, PathBuf};
 
 use deshcmd_ui::{App, Desktop, Place};
@@ -23,6 +25,9 @@ impl NativeDesktop {
 impl Desktop for NativeDesktop {
     fn open(&mut self, path: &Path) -> Result<(), String> {
         open::that_detached(path).map_err(|error| error.to_string())
+    }
+    fn open_terminal(&mut self, directory: &Path) -> Result<(), String> {
+        terminal::open(directory)
     }
     fn pick_file(&mut self, initial: &Path, title: &str) -> Option<PathBuf> {
         rfd::FileDialog::new()

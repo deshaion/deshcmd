@@ -35,6 +35,7 @@ On Linux, mark the downloaded AppImage executable with `chmod +x deshcmd-0.1.0-x
 - Split and join files, generate and verify checksum manifests, compare a file with a pasted digest, and benchmark supported hash algorithms.
 
 Press **F1** for shortcuts. In the default keymap, **Tab** switches panels, **Ctrl+L** edits the location, and **F5** and **F6** copy and move to the opposite panel.
+Press **F9** or choose **Tools → Open Terminal** to start an external terminal in the active panel's folder.
 
 This version supports local files, mounted locations, and virtual path lists. Archive and plugin-backed volumes in [Features.md](Features.md). The deshcmd workspace and bookmark interchange format is JSON. The integrity tools support 22 checksum options, including SFV. HAVAL and native ACL editing remain outside this version. Trash, volume discovery, and system clipboard behavior depend on the desktop. Linux/X11 is the verified desktop target.
 
