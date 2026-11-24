@@ -139,3 +139,30 @@ jobs:
           path: ${{ env.PACKAGE }}
           archive: false
           if-no-files-found: error
+
+  attach:
+    name: Attach packages to the release
+    needs: package
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: deshcmd-*
+          path: dist
+          merge-multiple: true
+
+      - name: Upload release assets
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          shopt -s nullglob
+          assets=(dist/deshcmd-*.AppImage dist/deshcmd-*.exe dist/deshcmd-*.dmg)
+          if (( ${#assets[@]} != 4 )); then
+            echo "Expected four packages, found ${#assets[@]}." >&2
+            exit 1
+          fi
+          gh release upload --repo "$GITHUB_REPOSITORY" -- "$RELEASE_TAG" "${assets[@]}"
