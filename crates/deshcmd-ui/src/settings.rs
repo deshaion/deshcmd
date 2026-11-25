@@ -177,6 +177,11 @@ impl Preferences {
                 );
             }
             Page::Columns => {
+                ui.checkbox(
+                    &mut self.workspace.show_modified_time,
+                    "Show time in the Modified column",
+                );
+                ui.separator();
                 for (title, columns) in [
                     ("Default columns", &mut self.workspace.columns),
                     ("Alternate columns", &mut self.workspace.alternate_columns),
@@ -320,6 +325,7 @@ impl App {
         settings.auto_refresh = draft.auto_refresh;
         settings.natural_sort = draft.natural_sort;
         settings.directories_first = draft.directories_first;
+        settings.show_modified_time = draft.show_modified_time;
         settings.columns.clone_from(&draft.columns);
         settings
             .alternate_columns
@@ -337,6 +343,40 @@ impl App {
         if refresh {
             self.engine.dispatch(Command::Refresh);
         }
+        ctx.request_repaint();
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tests::TestDesktop;
+
+    #[test]
+    fn modified_time_preference_is_enabled_by_default_and_can_be_saved_off() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().to_path_buf();
+        let ctx = egui::Context::default();
+        let creation = eframe::CreationContext::_new_kittest(ctx.clone());
+        let mut app = App::new(
+            &creation,
+            Box::new(TestDesktop::default()),
+            path.clone(),
+            [path.clone(), path],
+            true,
+        );
+
+        let older_settings: Settings = serde_json::from_str("{}").unwrap();
+        assert!(older_settings.show_modified_time);
+        app.open_settings(&ctx);
+        let mut draft = app.preferences.take().unwrap();
+        assert!(draft.workspace.show_modified_time);
+        draft.workspace.show_modified_time = false;
+        app.save_settings(&draft, &ctx).unwrap();
+
+        let saved = serde_json::to_string(&app.engine.snapshot()).unwrap();
+        let restored: Settings = serde_json::from_str(&saved).unwrap();
+        assert!(!restored.show_modified_time);
     }
 }

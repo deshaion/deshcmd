@@ -162,6 +162,75 @@ fn duplicate_cleanup_distinguishes_virtual_tabs_with_the_same_base() {
 }
 
 #[test]
+fn parent_navigation_restores_the_child_in_linked_panes_and_locked_tabs() {
+    let fixture = tempfile::tempdir().unwrap();
+    let root = fixture.path().canonicalize().unwrap();
+    let left = root.join("left");
+    let right = root.join("right");
+    for parent in [&left, &right] {
+        fs::create_dir_all(parent.join("first")).unwrap();
+        fs::create_dir(parent.join("previous")).unwrap();
+    }
+    let left_child = left.join("previous");
+    let right_child = right.join("previous");
+    let mut engine = open(&left_child, &right_child);
+    let side = Side::Left;
+    engine.settings.linked = true;
+    engine.dispatch(Command::Parent(side));
+    pump(&mut engine, |engine| {
+        Side::ALL.into_iter().all(|side| !engine.tab(side).loading)
+    });
+    assert_eq!(engine.settings.active, side);
+    for (pane, child) in [(Side::Left, &left_child), (Side::Right, &right_child)] {
+        assert_eq!(engine.tab(pane).current().unwrap().path, *child);
+        assert!(engine.take_parent_focus_restored(pane));
+        assert!(!engine.take_parent_focus_restored(pane));
+    }
+
+    engine.dispatch(Command::Back(side));
+    engine.dispatch(Command::Forward(side));
+    pump(&mut engine, |engine| !engine.tab(side).loading);
+    assert_eq!(engine.tab(side).current().unwrap().path, left_child);
+
+    engine.dispatch(Command::Back(side));
+    engine.dispatch(Command::LockTab(side, 0, TabLock::NewTab));
+    engine.dispatch(Command::Parent(side));
+    pump(&mut engine, |engine| !engine.tab(side).loading);
+    assert_eq!(engine.pane(side).tabs.len(), 2);
+    assert_eq!(engine.tab(side).current().unwrap().path, left_child);
+}
+
+#[cfg(unix)]
+#[test]
+fn navigating_back_from_a_directory_symlink_focuses_the_link() {
+    let fixture = tempfile::tempdir().unwrap();
+    let parent = fixture.path().canonicalize().unwrap();
+    fs::create_dir(parent.join("0-first")).unwrap();
+    let target = parent.join("z-real");
+    fs::create_dir(&target).unwrap();
+    let link = parent.join("a-link");
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+
+    let mut engine = open(&parent, &parent);
+    let side = Side::Left;
+    engine.dispatch(Command::Navigate {
+        side,
+        path: link.clone(),
+        new_tab: false,
+        background: false,
+    });
+    assert_eq!(engine.tab(side).base(), target);
+    engine.dispatch(Command::Back(side));
+    pump(&mut engine, |engine| !engine.tab(side).loading);
+    assert_eq!(engine.tab(side).current().unwrap().path, link);
+
+    engine.dispatch(Command::Forward(side));
+    engine.dispatch(Command::Parent(side));
+    pump(&mut engine, |engine| !engine.tab(side).loading);
+    assert_eq!(engine.tab(side).current().unwrap().path, link);
+}
+
+#[test]
 fn recursive_filter_applies_to_nested_items_and_can_be_cleared() {
     let fixture = tempfile::tempdir().unwrap();
     let root = fixture.path();

@@ -1,3 +1,5 @@
+use std::f32::consts::{FRAC_PI_2, TAU};
+
 use eframe::egui;
 use egui::{
     Align2, Color32 as C, CornerRadius, FontId, Pos2, Rect, RichText, Sense, Stroke, StrokeKind,
@@ -359,11 +361,18 @@ impl Icon {
                 }
             }
             Self::Settings => {
-                painter.circle_stroke(point(8., 8.), size / 3., stroke);
-                painter.circle_stroke(point(8., 8.), size / 8., stroke);
-                for (x, y) in [(2., 8.), (8., 2.), (14., 8.), (8., 14.)] {
-                    painter.circle_filled(point(x, y), size / 12., color);
-                }
+                let tooth_profile = [(-0.27, 5.3), (-0.17, 7.2), (0.17, 7.2), (0.27, 5.3)];
+                let outline = (0..6)
+                    .flat_map(|tooth| {
+                        let angle = tooth as f32 * TAU / 6. - FRAC_PI_2;
+                        tooth_profile.map(|(offset, radius)| {
+                            let (y, x) = (angle + offset).sin_cos();
+                            point(8. + x * radius, 8. + y * radius)
+                        })
+                    })
+                    .collect();
+                painter.add(egui::Shape::closed_line(outline, stroke));
+                painter.circle_stroke(center, size * 0.15, stroke);
             }
             Self::Link => {
                 line(&[
