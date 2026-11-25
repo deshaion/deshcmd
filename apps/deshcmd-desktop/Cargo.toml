@@ -4,6 +4,12 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+standalone-updater = [
+    "dep:flate2", "dep:hex", "dep:ring", "dep:semver", "dep:serde",
+    "dep:serde_json", "dep:tar", "dep:ureq", "dep:windows-sys", "dep:zip",
+]
+
 [dependencies]
 deshcmd-ui.workspace = true
 deshcmd-engine.workspace = true
@@ -12,12 +18,22 @@ rfd = "0.17"
 open = "5"
 dirs = "6"
 arboard = { version = "3.7", default-features = false, features = ["wayland-data-control"] }
-
-[target.'cfg(target_os = "linux")'.dependencies]
 tempfile = "3"
+flate2 = { version = "1", optional = true }
+hex = { version = "0.4", optional = true }
+ring = { version = "0.17", optional = true }
+semver = { version = "1", optional = true }
+serde = { workspace = true, optional = true }
+serde_json = { version = "1", optional = true }
+tar = { version = "0.4", default-features = false, optional = true }
+ureq = { version = "3", default-features = false, features = ["rustls"], optional = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
-[dev-dependencies]
-tempfile = "3"
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Threading"], optional = true }
+zip = { version = "4.6", default-features = false, features = ["deflate-flate2-zlib-rs"], optional = true }
+
+[target.'cfg(windows)'.dev-dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }

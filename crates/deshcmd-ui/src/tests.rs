@@ -71,6 +71,57 @@ impl Desktop for TestDesktop {
 }
 
 #[test]
+fn escape_dismisses_an_update_check_and_ignores_its_result() {
+    let root = tempfile::tempdir().unwrap();
+    let ctx = egui::Context::default();
+    let creation = eframe::CreationContext::_new_kittest(ctx.clone());
+    let mut app = App::new(
+        &creation,
+        Box::new(TestDesktop::default()),
+        root.path().to_path_buf(),
+        [root.path().to_path_buf(), root.path().to_path_buf()],
+        true,
+    );
+    let (sender, receiver) = mpsc::channel();
+    app.update_check = Some(receiver);
+    app.update = Some(updates::UpdateDialog::Checking);
+    let draw = |app: &mut App, events| {
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, vec2(800., 600.))),
+                events,
+                ..Default::default()
+            },
+            |ui| app.update_dialog(ui.ctx()),
+        );
+        output.textures_delta.clear();
+    };
+    draw(&mut app, vec![]);
+    draw(
+        &mut app,
+        vec![egui::Event::Key {
+            key: Key::Escape,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        }],
+    );
+    assert!(
+        app.update.is_none(),
+        "Escape did not dismiss the update dialog"
+    );
+    assert!(app.update_check.is_some());
+    sender.send(Ok(None)).unwrap();
+    app.poll_update();
+    assert!(
+        app.update.is_none(),
+        "A dismissed check reopened its dialog"
+    );
+    assert!(app.update_check.is_none());
+}
+
+#[test]
 fn panel_navigation_and_preview_shortcuts() {
     let root = tempfile::tempdir().unwrap();
     let source = root.path().join("source");

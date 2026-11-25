@@ -1,15 +1,61 @@
 name: Build desktop packages
 
 on:
-  release:
-    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing Git tag for the draft release
+        type: string
+        required: true
 
 permissions:
   contents: read
 
+concurrency:
+  group: desktop-release-${{ inputs.tag }}
+
+env:
+  RELEASE_TAG: ${{ inputs.tag }}
+
 jobs:
+  prepare:
+    name: Check draft release
+    runs-on: ubuntu-24.04
+    outputs:
+      commit: ${{ steps.source.outputs.commit }}
+      signed: ${{ steps.draft.outputs.signed }}
+    steps:
+      - name: Check release status
+        id: draft
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          UPDATE_PUBLIC_KEY: ${{ vars.DESHCMD_UPDATE_PUBLIC_KEY }}
+        run: |
+          if [[ ! "$RELEASE_TAG" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.+-]+)?$ ]]; then
+            echo "Expected a version tag, such as v0.1.1." >&2
+            exit 1
+          fi
+          release=$(gh release view --repo "$GITHUB_REPOSITORY" --json isDraft,isPrerelease -- "$RELEASE_TAG")
+          jq -e '.isDraft' <<< "$release" >/dev/null || { echo "Release must be a draft." >&2; exit 1; }
+          signed=false
+          if [[ -n "$UPDATE_PUBLIC_KEY" ]] && jq -e '.isPrerelease | not' <<< "$release" >/dev/null; then
+            signed=true
+          fi
+          printf 'signed=%s\n' "$signed" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v6
+        with:
+          ref: refs/tags/${{ inputs.tag }}
+          persist-credentials: false
+
+      - name: Record release commit
+        id: source
+        run: printf 'commit=%s\n' "$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
   package:
     name: ${{ matrix.platform }} (${{ matrix.arch }})
+    needs: prepare
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -20,6 +66,10 @@ jobs:
             target: x86_64-unknown-linux-gnu
             arch: x86_64
             extension: AppImage
+          - platform: Linux
+            runner: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
+            arch: aarch64
           - platform: Windows
             runner: windows-2022
             target: x86_64-pc-windows-msvc
@@ -44,10 +94,12 @@ jobs:
       ARCH: ${{ matrix.arch }}
       EXTENSION: ${{ matrix.extension }}
       CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS: '-C target-feature=+crt-static'
+      BUILD_STANDALONE: ${{ needs.prepare.outputs.signed }}
 
     steps:
       - uses: actions/checkout@v6
         with:
+          ref: ${{ needs.prepare.outputs.commit }}
           persist-credentials: false
 
       - name: Set up Rust
@@ -68,10 +120,11 @@ jobs:
             "$version" "$version" "$ARCH" "$EXTENSION" >> "$GITHUB_ENV"
 
       - name: Build desktop executable
+        if: matrix.extension != ''
         run: cargo +stable build --locked --release --package deshcmd --target "$TARGET"
 
       - name: Package Linux AppImage
-        if: runner.os == 'Linux'
+        if: matrix.extension == 'AppImage'
         run: |
           tool="$RUNNER_TEMP/appimagetool"
           runtime="$RUNNER_TEMP/runtime-x86_64"
@@ -134,21 +187,54 @@ jobs:
           hdiutil verify "$PACKAGE"
 
       - name: Upload package
+        if: matrix.extension != ''
         uses: actions/upload-artifact@v7
         with:
           path: ${{ env.PACKAGE }}
           archive: false
           if-no-files-found: error
 
+      - name: Build and archive standalone executable
+        if: env.BUILD_STANDALONE == 'true'
+        env:
+          DESHCMD_UPDATE_PUBLIC_KEY: ${{ vars.DESHCMD_UPDATE_PUBLIC_KEY }}
+        run: |
+          cargo +stable build --locked --release --package deshcmd --target "$TARGET" --features standalone-updater
+          executable="target/$TARGET/release"
+          case "$RUNNER_OS" in
+            Linux) asset="dist/deshcmd-linux-$ARCH.tar.gz" ;;
+            macOS) asset="dist/deshcmd-macos-$ARCH.tar.gz" ;;
+            Windows) asset="dist/deshcmd-windows-$ARCH.zip" ;;
+          esac
+          if [[ "$RUNNER_OS" == Windows ]]; then
+            (cd "$executable" && python -m zipfile -c "${GITHUB_WORKSPACE}/$asset" deshcmd.exe)
+          else
+            if [[ "$RUNNER_OS" == macOS ]]; then
+              codesign --force --sign - "$executable/deshcmd"
+              codesign --verify --strict "$executable/deshcmd"
+            fi
+            COPYFILE_DISABLE=1 tar -czf "$asset" -C "$executable" deshcmd
+          fi
+          printf 'STANDALONE_ASSET=%s\n' "$asset" >> "$GITHUB_ENV"
+
+      - name: Upload standalone archive
+        if: env.BUILD_STANDALONE == 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          path: ${{ env.STANDALONE_ASSET }}
+          archive: false
+          if-no-files-found: error
+
   attach:
-    name: Attach packages to the release
-    needs: package
+    name: Attach packages and publish release
+    needs: [prepare, package]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
     steps:
       - uses: actions/checkout@v6
         with:
+          ref: ${{ needs.prepare.outputs.commit }}
           persist-credentials: false
 
       - uses: actions/download-artifact@v8
@@ -156,17 +242,45 @@ jobs:
           pattern: deshcmd-*
           path: dist
           merge-multiple: true
+          skip-decompress: true
 
       - name: Upload release assets
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ github.event.release.tag_name }}
         run: |
+          draft=$(gh release view --repo "$GITHUB_REPOSITORY" --json isDraft --jq '.isDraft' -- "$RELEASE_TAG")
+          [[ "$draft" == true ]] || { echo "Release must still be a draft." >&2; exit 1; }
           shopt -s nullglob
           assets=(dist/deshcmd-*.AppImage dist/deshcmd-*.exe dist/deshcmd-*.dmg)
           if (( ${#assets[@]} != 4 )); then
             echo "Expected four packages, found ${#assets[@]}." >&2
             exit 1
           fi
-          gh release upload --repo "$GITHUB_REPOSITORY" -- "$RELEASE_TAG" "${assets[@]}" LICENSE
+          gh release upload --repo "$GITHUB_REPOSITORY" --clobber -- "$RELEASE_TAG" "${assets[@]}" LICENSE
+
+      - name: Sign and upload standalone updates
+        if: needs.prepare.outputs.signed == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          UPDATE_PUBLIC_KEY: ${{ vars.DESHCMD_UPDATE_PUBLIC_KEY }}
+          UPDATE_SIGNING_KEY: ${{ secrets.DESHCMD_UPDATE_SIGNING_KEY }}
+        run: |
+          test -n "$UPDATE_SIGNING_KEY" || { echo "Missing DESHCMD_UPDATE_SIGNING_KEY" >&2; exit 1; }
+          umask 077
+          signing_key=$(mktemp)
+          trap 'rm -f -- "$signing_key"' EXIT
+          printf '%s\n' "$UPDATE_SIGNING_KEY" > "$signing_key"
+          unset UPDATE_SIGNING_KEY
+          version=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"])')
+          python3 packaging/sign-update.py dist "$version" "$RELEASE_TAG" "$signing_key" "$UPDATE_PUBLIC_KEY"
+          gh release upload --repo "$GITHUB_REPOSITORY" --clobber -- "$RELEASE_TAG" dist/*.tar.gz dist/*.zip
+          gh release upload --repo "$GITHUB_REPOSITORY" --clobber -- "$RELEASE_TAG" dist/latest.json dist/latest.json.sig
+
+      - name: Publish complete release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PROMOTE: ${{ needs.prepare.outputs.signed }}
+        run: gh release edit --repo "$GITHUB_REPOSITORY" --verify-tag --draft=false --latest="$PROMOTE" -- "$RELEASE_TAG"
