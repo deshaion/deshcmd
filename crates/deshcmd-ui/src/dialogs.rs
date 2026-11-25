@@ -2264,7 +2264,7 @@ fn describe(entry: &Entry) -> String {
 mod tests {
     use super::*;
 
-    fn draw_dialog(app: &mut App, ctx: &egui::Context, key: Option<egui::Key>) {
+    pub(super) fn draw_dialog(app: &mut App, ctx: &egui::Context, key: Option<egui::Key>) {
         let events = key
             .into_iter()
             .flat_map(|key| {
@@ -2528,3 +2528,6 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod workflow_tests;

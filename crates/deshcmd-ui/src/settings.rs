@@ -442,3 +442,6 @@ mod tests {
         assert!(!restored.show_modified_time);
     }
 }
+
+#[cfg(test)]
+mod view_tests;

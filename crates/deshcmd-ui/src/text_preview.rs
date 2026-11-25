@@ -230,3 +230,6 @@ impl LargeTextView {
         None
     }
 }
+
+#[cfg(test)]
+mod tests;

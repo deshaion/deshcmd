@@ -345,6 +345,7 @@ fn move_conflicts_keep_skipped_files_and_never_clobber_on_rename() {
     assert_eq!(fs::read(&target).unwrap(), b"kept");
     assert_eq!(fs::read(right.join("folder/fresh.txt")).unwrap(), b"fresh");
     assert!(!engine.jobs[0].warnings.is_empty());
+    assert!(engine.jobs[0].message.contains("Skipped "));
 
     assert!(!left.join("folder/fresh.txt").exists());
     let protected = left.join("folder/guard.txt");
@@ -359,6 +360,208 @@ fn move_conflicts_keep_skipped_files_and_never_clobber_on_rename() {
     assert_eq!(engine.jobs.last().unwrap().state, JobState::Failed);
     assert_eq!(fs::read(source).unwrap(), b"incoming");
     assert_eq!(fs::read(protected).unwrap(), b"protected");
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+#[test]
+fn rename_existing_moves_the_incoming_file_and_reports_the_original() {
+    let fixture = tempfile::tempdir().unwrap();
+    let cross_volume = std::env::var_os("DESHCMD_TEST_DESTINATION");
+    let destination = tempfile::tempdir_in(
+        cross_volume
+            .as_deref()
+            .map(Path::new)
+            .unwrap_or(fixture.path()),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    if cross_volume.is_some() {
+        use std::os::unix::fs::MetadataExt;
+        assert_ne!(
+            fixture.path().metadata().unwrap().dev(),
+            destination.path().metadata().unwrap().dev()
+        );
+    }
+    let source = fixture.path().join("example.txt");
+    let target = destination.path().join("example.txt");
+    let taken = destination.path().join("example (1).txt");
+    let backup = destination.path().join("example (2).txt");
+    fs::write(&source, b"incoming").unwrap();
+    fs::write(&target, b"existing").unwrap();
+    fs::write(&taken, b"already taken").unwrap();
+
+    let mut engine = open(fixture.path(), destination.path());
+    run(
+        &mut engine,
+        Operation::Transfer {
+            paths: vec![source.clone()],
+            destination: destination.path().to_path_buf(),
+            moving: true,
+            options: TransferOptions {
+                collision: Collision::RenameExisting,
+                verify: true,
+                ..TransferOptions::default()
+            },
+        },
+    );
+    let job = engine.jobs.last().unwrap();
+    assert_eq!(job.state, JobState::Done, "{:?}", job.warnings);
+    assert!(job.message.contains("Moved 1 of 1"));
+    assert!(job.message.contains("example (2).txt"));
+    assert!(!source.exists());
+    assert_eq!(fs::read(target).unwrap(), b"incoming");
+    assert_eq!(fs::read(taken).unwrap(), b"already taken");
+    assert_eq!(fs::read(backup).unwrap(), b"existing");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn rename_existing_leaves_the_destination_in_place_when_space_check_fails() {
+    let fixture = tempfile::tempdir().unwrap();
+    let destination = fixture.path().join("destination");
+    fs::create_dir(&destination).unwrap();
+    let source = fixture.path().join("example.txt");
+    let target = destination.join("example.txt");
+    let length = fs2::total_space(&destination).unwrap() + 1;
+    fs::File::create(&source).unwrap().set_len(length).unwrap();
+    fs::write(&target, b"existing").unwrap();
+
+    let mut engine = open(fixture.path(), &destination);
+    run(
+        &mut engine,
+        Operation::Transfer {
+            paths: vec![source.clone()],
+            destination: destination.clone(),
+            moving: false,
+            options: TransferOptions {
+                collision: Collision::RenameExisting,
+                ..TransferOptions::default()
+            },
+        },
+    );
+    let job = engine.jobs.last().unwrap();
+    assert_eq!(job.state, JobState::Failed);
+    assert!(
+        job.warnings
+            .iter()
+            .any(|warning| warning.contains("Insufficient free space"))
+    );
+    assert_eq!(source.metadata().unwrap().len(), length);
+    assert_eq!(fs::read(target).unwrap(), b"existing");
+    assert_eq!(fs::read_dir(destination).unwrap().count(), 1);
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_failed_staged_folder_move_keeps_the_destination_and_source_tree() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+
+    let fixture = tempfile::tempdir().unwrap();
+    let left = fixture.path().join("left");
+    let right = fixture.path().join("right");
+    let source = left.join("outer/folder");
+    let target = right.join("outer/folder");
+    fs::create_dir_all(source.join("readonly")).unwrap();
+    fs::create_dir_all(&target).unwrap();
+    fs::write(source.join("readonly/incoming.txt"), b"incoming").unwrap();
+    fs::set_permissions(source.join("readonly"), fs::Permissions::from_mode(0o500)).unwrap();
+    fs::write(target.join("existing.txt"), b"existing").unwrap();
+    let blocked = source.join("blocked");
+    fs::write(&blocked, b"blocked").unwrap();
+    fs::set_permissions(&blocked, fs::Permissions::from_mode(0o000)).unwrap();
+    let source_is_readable = fs::File::open(&blocked).is_ok();
+    if source_is_readable {
+        fs::remove_file(&blocked).unwrap();
+        symlink("missing", &blocked).unwrap();
+    }
+    let mut engine = open(&left, &right);
+    engine.dispatch(Command::Queue(
+        Operation::Transfer {
+            paths: vec![left.join("outer")],
+            destination: right.clone(),
+            moving: true,
+            options: TransferOptions {
+                follow_links: true,
+                ..TransferOptions::default()
+            },
+        },
+        false,
+    ));
+    for (conflict_target, choice) in [
+        (right.join("outer"), Collision::Merge),
+        (target.clone(), Collision::RenameExisting),
+    ] {
+        pump(&mut engine, |engine| {
+            engine.jobs[0]
+                .conflict
+                .as_ref()
+                .is_some_and(|conflict| conflict.target == conflict_target.canonicalize().unwrap())
+        });
+        engine.dispatch(Command::Resolve(engine.jobs[0].id, choice, false));
+    }
+    pump(&mut engine, |engine| engine.jobs[0].state.finished());
+    fs::set_permissions(source.join("readonly"), fs::Permissions::from_mode(0o700)).unwrap();
+    let job = &engine.jobs[0];
+    assert_eq!(job.state, JobState::Failed);
+    assert!(
+        job.warnings
+            .iter()
+            .any(|warning| warning.contains("blocked")),
+        "{:?}",
+        job.warnings
+    );
+    assert_eq!(
+        fs::read(source.join("readonly/incoming.txt")).unwrap(),
+        b"incoming"
+    );
+    assert_eq!(fs::read(target.join("existing.txt")).unwrap(), b"existing");
+    assert!(blocked.symlink_metadata().is_ok());
+    assert_eq!(fs::read_dir(target.parent().unwrap()).unwrap().count(), 1);
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn rename_existing_preserves_adjusted_relative_links_in_a_filtered_folder_move() {
+    use std::os::unix::fs::symlink;
+
+    let fixture = tempfile::tempdir().unwrap();
+    let left = fixture.path().join("left");
+    let right = fixture.path().join("right");
+    let source = left.join("folder");
+    let target = right.join("folder");
+    fs::create_dir_all(source.join("nested")).unwrap();
+    fs::create_dir_all(&target).unwrap();
+    fs::write(left.join("original"), b"referenced").unwrap();
+    fs::write(source.join("keep.bin"), b"excluded").unwrap();
+    fs::write(target.join("existing"), b"existing").unwrap();
+    symlink("../../original", source.join("nested/link.txt")).unwrap();
+
+    let mut engine = open(&left, &right);
+    run(
+        &mut engine,
+        Operation::Transfer {
+            paths: vec![source.clone()],
+            destination: right.clone(),
+            moving: true,
+            options: TransferOptions {
+                directory_collision: Collision::RenameExisting,
+                adjust_links: true,
+                mask: "*.txt".into(),
+                ..TransferOptions::default()
+            },
+        },
+    );
+    assert!(engine.jobs.last().unwrap().message.contains("folder (1)"));
+    assert_eq!(fs::read(source.join("keep.bin")).unwrap(), b"excluded");
+    assert!(!source.join("nested").exists());
+    assert_eq!(
+        fs::read(target.join("nested/link.txt")).unwrap(),
+        b"referenced"
+    );
+    assert_eq!(
+        fs::read(right.join("folder (1)/existing")).unwrap(),
+        b"existing"
+    );
 }
 
 #[test]
@@ -724,4 +927,407 @@ fn delayed_directory_result_cannot_replace_newer_navigation() {
     assert_eq!(engine.tab(side).base(), fast);
     assert_eq!(engine.tab(side).current().unwrap().name, "fast.txt");
     assert!(!engine.tab(side).loading);
+}
+
+#[test]
+fn workspace_tabs_and_bookmarks_round_trip_through_settings() {
+    use deshcmd_engine::{Bookmark, Column, SavedPane, View};
+
+    let fixture = tempfile::tempdir().unwrap();
+    let root = fixture.path().canonicalize().unwrap();
+    let left = root.join("left");
+    let right = root.join("right");
+    let child = left.join("child");
+    fs::create_dir_all(&child).unwrap();
+    fs::create_dir(&right).unwrap();
+    let mut engine = open(&left, &right);
+
+    let bookmark = Bookmark {
+        name: "Pair".into(),
+        path: left.clone(),
+        opposite: Some(right.clone()),
+        group: "Work".into(),
+    };
+    engine.dispatch(Command::AddBookmark(bookmark.clone()));
+    engine.dispatch(Command::ImportBookmarks(vec![bookmark.clone()]));
+    let mut edited = bookmark.clone();
+    edited.name = "Edited pair".into();
+    engine.dispatch(Command::EditBookmark(0, edited.clone()));
+    assert_eq!(engine.settings.bookmarks, [edited.clone()]);
+
+    engine.dispatch(Command::Select(Side::Left, child.clone(), Select::Focus));
+    engine.dispatch(Command::OpenFocusedDirectoryInTab {
+        source: Side::Left,
+        destination: Side::Right,
+    });
+    assert_eq!(engine.tab(Side::Right).base(), child);
+    engine.dispatch(Command::RenameTab(Side::Right, 1, "  Work tab  ".into()));
+    engine.dispatch(Command::View(Side::Right, View::Gallery));
+    engine.dispatch(Command::Sort(Side::Right, Column::Size, false));
+    engine.dispatch(Command::Sort(Side::Right, Column::Extension, true));
+    engine.dispatch(Command::ReorderTab(Side::Right, 1, 0));
+    assert_eq!(engine.tab(Side::Right).title(), "Work tab");
+    assert_eq!(engine.pane(Side::Right).active, 0);
+    engine.dispatch(Command::SendTab(Side::Right, 0, true));
+    assert_eq!(engine.pane(Side::Right).tabs.len(), 1);
+    assert_eq!(engine.tab(Side::Left).base(), child);
+    engine.dispatch(Command::ToggleTabPin(Side::Left, 1));
+    engine.dispatch(Command::CloseTab(Side::Left, 1));
+    assert_eq!(engine.pane(Side::Left).tabs.len(), 2);
+    engine.dispatch(Command::Tab(Side::Left, 0));
+    engine.dispatch(Command::SaveFavorite("Desk".into()));
+    engine.dispatch(Command::SaveFavorite("Desk".into()));
+    assert_eq!(engine.settings.favorites.len(), 1);
+
+    engine.dispatch(Command::Swap);
+    engine.dispatch(Command::MatchPanes);
+    assert_eq!(
+        engine.tab(Side::Left).base(),
+        engine.tab(Side::Right).base()
+    );
+    engine.dispatch(Command::Focus(Side::Left));
+    engine.dispatch(Command::OpenBookmark(0));
+    assert_eq!(engine.tab(Side::Left).base(), left);
+    assert_eq!(engine.tab(Side::Right).base(), right);
+
+    let saved: Settings =
+        serde_json::from_str(&serde_json::to_string(&engine.snapshot()).unwrap()).unwrap();
+    let mut restored = Engine::new(root, [left.clone(), right.clone()], saved, || {});
+    assert_eq!(restored.settings.bookmarks, [edited]);
+    restored.dispatch(Command::LoadFavorite(0, false));
+    assert_eq!(restored.tab(Side::Left).base(), left);
+    restored.dispatch(Command::LoadFavorite(0, true));
+    assert_eq!(restored.pane(Side::Left).tabs.len(), 4);
+    assert_eq!(restored.tab(Side::Left).base(), left);
+    restored.dispatch(Command::Tab(Side::Left, 1));
+    let snapshot = restored.snapshot();
+    let tab = &snapshot.panes[0].tabs[1];
+    assert!(tab.pinned);
+    assert_eq!(tab.view, View::Gallery);
+    assert_eq!(
+        tab.sort.iter().map(|sort| sort.column).collect::<Vec<_>>(),
+        [Column::Size, Column::Extension]
+    );
+    restored.dispatch(Command::RestoreTabs([
+        SavedPane::default(),
+        snapshot.panes[1].clone(),
+    ]));
+    assert_eq!(restored.pane(Side::Left).tabs.len(), 1);
+    assert_eq!(restored.tab(Side::Left).base(), child);
+    restored.dispatch(Command::RemoveBookmark(0));
+    restored.dispatch(Command::RemoveFavorite(0));
+    assert!(restored.settings.bookmarks.is_empty());
+    assert!(restored.settings.favorites.is_empty());
+}
+
+#[test]
+fn find_navigation_and_mark_commands_follow_the_visible_list() {
+    use deshcmd_engine::{Column, Step};
+
+    let fixture = tempfile::tempdir().unwrap();
+    let root = fixture.path().canonicalize().unwrap();
+    for (name, contents) in [
+        ("alpha.txt", "abc"),
+        ("alpha.md", "ab"),
+        ("beta.txt", "12345"),
+        (".hidden", "hidden"),
+    ] {
+        fs::write(root.join(name), contents).unwrap();
+    }
+    let mut engine = open(&root, &root);
+    let side = Side::Left;
+    let alpha = root.join("alpha.txt");
+    let beta = root.join("beta.txt");
+    let marked = |engine: &Engine| {
+        engine
+            .tab(side)
+            .marked_entries()
+            .map(|entry| entry.name.clone())
+            .collect::<Vec<_>>()
+    };
+
+    engine.dispatch(Command::Find(side, MatchOptions::filename("*.txt")));
+    assert_eq!(engine.tab(side).current().unwrap().path, alpha);
+    engine.dispatch(Command::Find(side, MatchOptions::filename("*.txt")));
+    assert_eq!(engine.tab(side).current().unwrap().path, beta);
+    engine.dispatch(Command::Find(side, MatchOptions::filename("*.txt")));
+    assert_eq!(engine.tab(side).current().unwrap().path, alpha);
+    engine.dispatch(Command::Find(side, MatchOptions::filename("no match")));
+    assert_eq!(engine.notice.as_deref(), Some("No names match"));
+
+    engine.dispatch(Command::MarkLike(side, Column::Extension, true));
+    assert_eq!(marked(&engine), ["alpha.txt", "beta.txt"]);
+    assert!(engine.tab(side).single_operand().is_none());
+    engine.dispatch(Command::RememberMarks(side));
+    engine.dispatch(Command::Invert(side));
+    assert_eq!(engine.tab(side).single_operand().unwrap().name, "alpha.md");
+    engine.dispatch(Command::RestoreMarks(side));
+    assert_eq!(engine.tab(side).selected_bytes(), 8);
+    engine.dispatch(Command::UnmarkAll(side));
+    engine.dispatch(Command::MarkLike(side, Column::Name, true));
+    assert_eq!(marked(&engine), ["alpha.md", "alpha.txt"]);
+    engine.dispatch(Command::MarkLike(side, Column::Path, false));
+    assert_eq!(engine.tab(side).marked_count(), 0);
+    engine.dispatch(Command::LoadMarks(
+        side,
+        format!("\u{feff}{}\nalpha.md\nabsent\n", beta.display()),
+    ));
+    assert_eq!(marked(&engine), ["alpha.md", "beta.txt"]);
+
+    for (step, expected) in [
+        (Step::First, "alpha.md"),
+        (Step::Next, "alpha.txt"),
+        (Step::Last, "beta.txt"),
+        (Step::Previous, "alpha.txt"),
+        (Step::PageUp, "alpha.md"),
+        (Step::PageDown, "beta.txt"),
+    ] {
+        engine.dispatch(Command::Step(side, step, false));
+        assert_eq!(engine.tab(side).current().unwrap().name, expected);
+    }
+    engine.dispatch(Command::Step(side, Step::First, true));
+    assert_eq!(engine.tab(side).marked_count(), 3);
+    engine.dispatch(Command::ToggleHidden);
+    assert_eq!(engine.tab(side).visible_count(), 4);
+    engine.dispatch(Command::Ignore("*.md".into()));
+    assert_eq!(engine.tab(side).visible_count(), 3);
+    engine.dispatch(Command::ToggleHidden);
+    engine.dispatch(Command::MarkAll(side));
+    assert_eq!(marked(&engine), ["alpha.txt", "beta.txt"]);
+}
+
+#[test]
+fn history_skips_missing_locations_and_reset_tabs_return_home() {
+    let fixture = tempfile::tempdir().unwrap();
+    let root = fixture.path().canonicalize().unwrap();
+    let past = root.join("past");
+    let current = root.join("current");
+    fs::create_dir(&past).unwrap();
+    fs::create_dir(&current).unwrap();
+    let mut engine = open(&root, &root);
+    let side = Side::Left;
+    for path in [&past, &current] {
+        engine.dispatch(Command::Navigate {
+            side,
+            path: path.clone(),
+            new_tab: false,
+            background: false,
+        });
+        assert_eq!(engine.tab(side).base(), path);
+    }
+    fs::remove_dir(&past).unwrap();
+    engine.dispatch(Command::History(side, 1));
+    assert_eq!(
+        engine.notice.as_deref(),
+        Some("This history location is unavailable")
+    );
+    engine.dispatch(Command::Back(side));
+    assert_eq!(engine.tab(side).base(), root);
+    assert!(engine.tab(side).can_forward());
+    engine.dispatch(Command::Forward(side));
+    assert_eq!(engine.tab(side).base(), current);
+    assert_eq!(engine.tab(side).history().count(), 3);
+
+    engine.dispatch(Command::LockTab(side, 0, TabLock::Reset));
+    engine.dispatch(Command::Parent(side));
+    assert_eq!(engine.tab(side).base(), root);
+    engine.dispatch(Command::NewTab(side));
+    engine.dispatch(Command::Tab(side, 0));
+    assert_eq!(engine.tab(side).base(), current);
+    engine.dispatch(Command::CloseTab(side, 0));
+    assert_eq!(engine.pane(side).tabs.len(), 1);
+}
+
+#[test]
+fn queued_jobs_can_be_held_reordered_cancelled_and_cleared() {
+    let fixture = tempfile::tempdir().unwrap();
+    let root = fixture.path();
+    let mut engine = open(root, root);
+    for name in ["cancelled", "second", "first"] {
+        engine.dispatch(Command::Queue(Operation::Create(root.join(name)), true));
+    }
+    let [cancelled, second, first] = std::array::from_fn(|index| engine.jobs[index].id);
+    assert_eq!(engine.jobs[1].state, JobState::Held);
+    assert_eq!(engine.jobs[1].state.label(), "On hold");
+    engine.dispatch(Command::CancelJob(cancelled));
+    assert_eq!(engine.jobs[0].state, JobState::Cancelled);
+    engine.dispatch(Command::PrioritizeJob(first));
+    assert_eq!(engine.jobs[0].id, first);
+    for id in [first, second] {
+        engine.dispatch(Command::ResumeJob(id));
+    }
+    pump(&mut engine, |engine| {
+        engine.jobs.iter().all(|job| job.state.finished())
+    });
+    assert!(!root.join("cancelled").exists());
+    assert!(root.join("first").is_file());
+    assert!(root.join("second").is_file());
+    assert!(engine.jobs[0].started <= engine.jobs[2].started);
+    engine.dispatch(Command::ClearJobs);
+    assert!(engine.jobs.is_empty());
+}
+
+#[test]
+fn filesystem_helpers_sort_folders_and_validate_path_lists() {
+    use deshcmd_engine::{lines, local_properties, numbered_parts, read_list, space, tree_folders};
+
+    let fixture = tempfile::tempdir().unwrap();
+    let root = fixture.path();
+    let first = root.join("report.001");
+    let second = root.join("report.002");
+    let list = root.join("list.txt");
+    for path in [
+        &second,
+        &first,
+        &root.join("report.0002"),
+        &root.join("other.003"),
+    ] {
+        fs::write(path, "part").unwrap();
+    }
+    fs::create_dir(root.join("Beta")).unwrap();
+    fs::create_dir(root.join("alpha")).unwrap();
+    assert_eq!(
+        tree_folders(root).unwrap(),
+        [root.join("alpha"), root.join("Beta")]
+    );
+    assert_eq!(numbered_parts(&second), [first.clone(), second]);
+    assert_eq!(numbered_parts(&list), std::slice::from_ref(&list));
+    assert_eq!(
+        numbered_parts(&root.join("absent.001")),
+        [root.join("absent.001")]
+    );
+    fs::write(&list, "\u{feff}report.001\r\n\n  \nreport.002\n").unwrap();
+    assert_eq!(
+        lines(&read_list(&list).unwrap()).collect::<Vec<_>>(),
+        ["report.001", "report.002"]
+    );
+    fs::File::options()
+        .write(true)
+        .open(&list)
+        .unwrap()
+        .set_len(16 * 1024 * 1024 + 1)
+        .unwrap();
+    assert!(read_list(&list).unwrap_err().to_string().contains("16 MiB"));
+    let (available, total) = space(root).unwrap();
+    assert!(total >= available && total > 0);
+    assert!(local_properties(&root.join("missing")).is_none());
+    #[cfg(unix)]
+    {
+        let link = root.join("link");
+        std::os::unix::fs::symlink("report.001", &link).unwrap();
+        assert_eq!(
+            local_properties(&link).as_deref(),
+            Some("Link target  report.001")
+        );
+        assert!(local_properties(&first).unwrap().contains("Links  1"));
+    }
+}
+
+#[test]
+fn large_text_preview_rejects_invalid_offsets_and_non_files() {
+    use deshcmd_engine::TextPreviewReader;
+
+    let fixture = tempfile::tempdir().unwrap();
+    let file = fixture.path().join("empty.log");
+    fs::write(&file, "").unwrap();
+    let mut reader = TextPreviewReader::open(&file, 0).unwrap();
+    assert!(reader.read_window(0).unwrap().rows.is_empty());
+    assert!(
+        matches!(reader.read_window(1), Err(error) if error.kind() == std::io::ErrorKind::InvalidInput)
+    );
+    assert!(
+        matches!(TextPreviewReader::open(fixture.path(), 0), Err(error) if error.to_string().contains("regular file"))
+    );
+}
+
+#[test]
+fn transfer_conflict_can_be_compared_then_cancelled_after_resuming() {
+    let fixture = tempfile::tempdir().unwrap();
+    let left = fixture.path().join("left");
+    let right = fixture.path().join("right");
+    fs::create_dir(&left).unwrap();
+    fs::create_dir(&right).unwrap();
+    for folder in [&left, &right] {
+        fs::write(folder.join("file"), "identical").unwrap();
+    }
+    let mut engine = open(&left, &right);
+    engine.dispatch(Command::Queue(
+        Operation::Transfer {
+            paths: vec![left.join("file")],
+            destination: right.clone(),
+            moving: true,
+            options: TransferOptions::default(),
+        },
+        false,
+    ));
+    let id = engine.jobs[0].id;
+    engine.dispatch(Command::PauseJob(id));
+    assert_eq!(engine.jobs[0].state, JobState::Paused);
+    engine.dispatch(Command::Queue(
+        Operation::Create(right.join("later")),
+        false,
+    ));
+    let later = engine.jobs[1].id;
+    engine.dispatch(Command::PauseJob(later));
+    assert_eq!(engine.jobs[1].state, JobState::Held);
+    engine.dispatch(Command::ResumeJob(id));
+    pump(&mut engine, |engine| {
+        engine.jobs[0].state == JobState::Conflict
+    });
+    engine.dispatch(Command::CompareConflict(id));
+    pump(&mut engine, |engine| {
+        engine.jobs[0].message == "Files are identical"
+    });
+    engine.dispatch(Command::Resolve(id, Collision::Cancel, false));
+    pump(&mut engine, |engine| engine.jobs[0].state.finished());
+    assert_eq!(engine.jobs[0].state, JobState::Cancelled);
+    assert_eq!(fs::read(left.join("file")).unwrap(), b"identical");
+    assert_eq!(fs::read(right.join("file")).unwrap(), b"identical");
+    assert!(!right.join("later").exists());
+}
+
+#[test]
+fn flat_view_can_be_limited_to_marked_folders_and_restored() {
+    let fixture = tempfile::tempdir().unwrap();
+    let root = fixture.path().canonicalize().unwrap();
+    let child = root.join("child");
+    fs::create_dir(&child).unwrap();
+    fs::write(child.join("nested.txt"), "nested").unwrap();
+    fs::write(root.join("top.txt"), "top").unwrap();
+    let mut engine = open(&root, &root);
+    let side = Side::Left;
+    engine.dispatch(Command::Select(side, child.clone(), Select::Toggle));
+    engine.dispatch(Command::Flat(side, true));
+    pump(&mut engine, |engine| !engine.tab(side).loading);
+    assert!(
+        matches!(engine.tab(side).location(), Location::Flat { roots, .. } if roots.as_slice() == std::slice::from_ref(&child))
+    );
+    assert_eq!(engine.tab(side).title(), "Flat view");
+    assert_eq!(
+        engine
+            .tab(side)
+            .visible_entries()
+            .map(|entry| entry.name.as_str())
+            .collect::<Vec<_>>(),
+        ["nested.txt"]
+    );
+    engine.dispatch(Command::Flat(side, false));
+    pump(&mut engine, |engine| !engine.tab(side).loading);
+    assert!(matches!(engine.tab(side).location(), Location::Directory(base) if base == &root));
+    assert_eq!(engine.tab(side).visible_count(), 2);
+
+    engine.dispatch(Command::Navigate {
+        side,
+        path: "~/child".into(),
+        new_tab: false,
+        background: false,
+    });
+    assert_eq!(engine.tab(side).base(), child);
+    engine.dispatch(Command::Navigate {
+        side,
+        path: "~".into(),
+        new_tab: false,
+        background: false,
+    });
+    assert_eq!(engine.tab(side).base(), root);
 }

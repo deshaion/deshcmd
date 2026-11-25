@@ -3,6 +3,8 @@ mod listing;
 mod operations;
 #[cfg(feature = "perf")]
 mod perf;
+#[cfg(test)]
+mod tests;
 mod text_preview;
 
 use std::collections::{HashMap, HashSet};

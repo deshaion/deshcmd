@@ -1,10 +1,22 @@
 use super::*;
 use eframe::App as _;
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
+use std::rc::Rc;
+
+#[derive(Default)]
+pub(super) struct DesktopState {
+    pub(super) files: Vec<PathBuf>,
+    pub(super) text: Option<String>,
+    pub(super) file_clipboard_unavailable: bool,
+    pub(super) terminal: Option<PathBuf>,
+    pick: Option<PathBuf>,
+    save: Option<PathBuf>,
+}
 
 #[derive(Default)]
 pub(super) struct TestDesktop {
     opened: Option<mpsc::Sender<PathBuf>>,
+    pub(super) state: Rc<RefCell<DesktopState>>,
 }
 
 impl Desktop for TestDesktop {
@@ -16,29 +28,39 @@ impl Desktop for TestDesktop {
             .unwrap();
         Ok(())
     }
-    fn open_terminal(&mut self, _: &Path) -> Result<(), String> {
-        unreachable!()
+    fn open_terminal(&mut self, directory: &Path) -> Result<(), String> {
+        self.state.borrow_mut().terminal = Some(directory.into());
+        Ok(())
     }
     fn pick_file(&mut self, _: &Path, _: &str) -> Option<PathBuf> {
-        unreachable!()
+        self.state.borrow_mut().pick.take()
     }
     fn save_file(&mut self, _: &Path, _: &str, _: &str) -> Option<PathBuf> {
-        None
+        self.state.borrow_mut().save.take()
     }
     fn pick_directory(&mut self, _: &Path, _: &str) -> Option<PathBuf> {
-        unreachable!()
+        self.state.borrow_mut().pick.take()
     }
-    fn copy_files(&mut self, _: &[PathBuf]) -> Result<(), String> {
-        unreachable!()
+    fn copy_files(&mut self, paths: &[PathBuf]) -> Result<(), String> {
+        let mut state = self.state.borrow_mut();
+        if state.file_clipboard_unavailable {
+            return Err("System clipboard unavailable".into());
+        }
+        state.files = paths.to_vec();
+        state.text = None;
+        Ok(())
     }
     fn clipboard_files(&mut self) -> Vec<PathBuf> {
-        vec![]
+        self.state.borrow().files.clone()
     }
     fn clipboard_text(&mut self) -> Option<String> {
-        None
+        self.state.borrow().text.clone()
     }
-    fn copy_text(&mut self, _: &str) -> Result<(), String> {
-        unreachable!()
+    fn copy_text(&mut self, text: &str) -> Result<(), String> {
+        let mut state = self.state.borrow_mut();
+        state.text = Some(text.into());
+        state.files.clear();
+        Ok(())
     }
     fn places(&mut self) -> Vec<Place> {
         vec![]
@@ -72,6 +94,7 @@ fn panel_navigation_and_preview_shortcuts() {
         &creation,
         Box::new(TestDesktop {
             opened: Some(opened),
+            ..Default::default()
         }),
         root.path().to_path_buf(),
         [source.clone(), destination],
@@ -308,5 +331,444 @@ fn held_delete_shortcuts_only_dispatch_on_the_initial_press() {
         }
         assert!(input(true).is_empty());
         assert!(input(false).is_empty());
+    }
+}
+
+pub(super) fn settle(app: &mut App) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        app.engine.poll();
+        if Side::ALL
+            .into_iter()
+            .all(|side| !app.engine.tab(side).loading)
+            && app.engine.jobs.iter().all(|job| job.state.finished())
+        {
+            return;
+        }
+        assert!(Instant::now() < deadline, "listing or job timed out");
+        std::thread::sleep(Duration::from_millis(2));
+    }
+}
+
+#[test]
+fn workspace_exports_can_be_imported_through_native_file_pickers() {
+    let fixture = tempfile::tempdir().unwrap();
+    let root = fixture.path().canonicalize().unwrap();
+    let left = root.join("left");
+    let right = root.join("right");
+    std::fs::create_dir(&left).unwrap();
+    std::fs::create_dir(&right).unwrap();
+    let ctx = egui::Context::default();
+    let creation = eframe::CreationContext::_new_kittest(ctx.clone());
+    let desktop = TestDesktop::default();
+    let native = desktop.state.clone();
+    let mut app = App::new(
+        &creation,
+        Box::new(desktop),
+        root.clone(),
+        [left.clone(), right.clone()],
+        true,
+    );
+    let bookmark = engine::Bookmark {
+        name: "Original bookmarks".into(),
+        path: left.clone(),
+        opposite: Some(right),
+        group: "Fixtures".into(),
+    };
+    app.engine.dispatch(Command::AddBookmark(bookmark.clone()));
+    app.engine.dispatch(Command::NewTab(Side::Left));
+
+    let tabs = root.join("export.tabs");
+    native.borrow_mut().save = Some(tabs.clone());
+    app.invoke(Side::Left, Tool::ExportTabs, &ctx);
+    settle(&mut app);
+    assert!(tabs.exists());
+    app.engine.dispatch(Command::CloseTab(Side::Left, 1));
+    native.borrow_mut().pick = Some(tabs);
+    app.invoke(Side::Left, Tool::ImportTabs, &ctx);
+    assert_eq!(app.engine.pane(Side::Left).tabs.len(), 2);
+
+    let bookmarks = root.join("export.bookmarks");
+    native.borrow_mut().save = Some(bookmarks.clone());
+    app.invoke(Side::Left, Tool::ExportBookmarks, &ctx);
+    settle(&mut app);
+    app.engine.dispatch(Command::RemoveBookmark(0));
+    native.borrow_mut().pick = Some(bookmarks);
+    app.invoke(Side::Left, Tool::ImportBookmarks, &ctx);
+    assert_eq!(app.engine.settings.bookmarks, [bookmark]);
+
+    let invalid = root.join("bad.bookmarks");
+    std::fs::write(&invalid, "invalid json").unwrap();
+    native.borrow_mut().pick = Some(invalid);
+    app.invoke(Side::Left, Tool::ImportBookmarks, &ctx);
+    assert!(
+        app.interface
+            .notice
+            .as_ref()
+            .unwrap()
+            .0
+            .contains("expected")
+    );
+    assert_eq!(app.engine.settings.bookmarks.len(), 1);
+}
+
+#[test]
+fn close_request_reveals_the_queue_until_pending_work_is_cancelled() {
+    let fixture = tempfile::tempdir().unwrap();
+    let root = fixture.path().to_path_buf();
+    let ctx = egui::Context::default();
+    let creation = eframe::CreationContext::_new_kittest(ctx.clone());
+    let mut app = App::new(
+        &creation,
+        Box::new(TestDesktop::default()),
+        root.clone(),
+        [root.clone(), root.clone()],
+        true,
+    );
+    settle(&mut app);
+    app.apply(
+        Action::Command(Command::Queue(
+            engine::Operation::Create(root.join("held")),
+            true,
+        )),
+        &ctx,
+    );
+    app.interface.queue = false;
+    app.apply(Action::Close, &ctx);
+    assert!(app.interface.queue);
+    assert!(!app.interface.closing);
+    assert!(
+        app.interface
+            .notice
+            .as_ref()
+            .unwrap()
+            .0
+            .contains("pending operations")
+    );
+    let job = app.engine.jobs[0].id;
+    assert_eq!(app.engine.jobs[0].state, engine::JobState::Held);
+    app.apply(Action::Command(Command::CancelJob(job)), &ctx);
+    app.apply(Action::Close, &ctx);
+    assert!(app.interface.closing);
+    assert!(!root.join("held").exists());
+}
+
+#[derive(Default)]
+struct MemoryStorage(HashMap<String, String>);
+
+impl eframe::Storage for MemoryStorage {
+    fn get_string(&self, key: &str) -> Option<String> {
+        self.0.get(key).cloned()
+    }
+
+    fn set_string(&mut self, key: &str, value: String) {
+        self.0.insert(key.into(), value);
+    }
+
+    fn remove_string(&mut self, key: &str) {
+        self.0.remove(key);
+    }
+
+    fn flush(&mut self) {}
+}
+
+#[test]
+fn app_storage_restores_workspace_and_independent_display_preferences() {
+    let fixture = tempfile::tempdir().unwrap();
+    let root = fixture.path().canonicalize().unwrap();
+    let left = root.join("left");
+    let right = root.join("right");
+    std::fs::create_dir(&left).unwrap();
+    std::fs::create_dir(&right).unwrap();
+    let ctx = egui::Context::default();
+    let creation = eframe::CreationContext::_new_kittest(ctx.clone());
+    let mut app = App::new(
+        &creation,
+        Box::new(TestDesktop::default()),
+        root.clone(),
+        [left.clone(), right.clone()],
+        true,
+    );
+    app.engine.dispatch(Command::NewTab(Side::Right));
+    app.engine
+        .dispatch(Command::RenameTab(Side::Right, 1, "Saved tab".into()));
+    app.engine.settings.stacked = true;
+    app.interface.tree = true;
+    app.interface.alternate_columns = [true, false];
+    app.interface.show_inline_filter = false;
+    app.interface.show_places = false;
+    app.interface.show_bottom_bar = false;
+    app.interface.ui_font = theme::UiFont::DejaVuSansMono;
+
+    let mut storage = MemoryStorage::default();
+    app.save(&mut storage);
+    let mut creation = eframe::CreationContext::_new_kittest(egui::Context::default());
+    creation.storage = Some(&storage);
+    let reopen = |fresh| {
+        App::new(
+            &creation,
+            Box::new(TestDesktop::default()),
+            root.clone(),
+            [left.clone(), right.clone()],
+            fresh,
+        )
+    };
+    let restored = reopen(false);
+    assert!(restored.engine.settings.stacked);
+    assert_eq!(restored.engine.tab(Side::Right).title(), "Saved tab");
+    assert!(restored.interface.tree);
+    assert_eq!(restored.interface.alternate_columns, [true, false]);
+    assert!(!restored.interface.show_inline_filter);
+    assert!(!restored.interface.show_places);
+    assert!(!restored.interface.show_bottom_bar);
+    assert!(restored.interface.ui_font == theme::UiFont::DejaVuSansMono);
+    let fresh = reopen(true);
+    assert_eq!(fresh.engine.pane(Side::Right).tabs.len(), 1);
+    assert!(!fresh.engine.settings.stacked);
+    assert!(!fresh.interface.show_places);
+}
+
+fn frame_contains(shapes: &[egui::epaint::ClippedShape], expected: &str) -> bool {
+    fn matches(shape: &egui::Shape, expected: &str) -> bool {
+        match shape {
+            egui::Shape::Text(text) => text.galley.text().contains(expected),
+            egui::Shape::Vec(shapes) => shapes.iter().any(|shape| matches(shape, expected)),
+            _ => false,
+        }
+    }
+    shapes.iter().any(|shape| matches(&shape.shape, expected))
+}
+
+#[test]
+fn workspace_renders_tree_gallery_help_and_a_transfer_conflict() {
+    let fixture = tempfile::tempdir().unwrap();
+    let root = fixture.path().canonicalize().unwrap();
+    let left = root.join("left");
+    let right = root.join("right");
+    let source = left.join("shared.txt");
+    std::fs::create_dir_all(left.join("directory")).unwrap();
+    std::fs::create_dir(&right).unwrap();
+    std::fs::write(&source, "incoming").unwrap();
+    std::fs::write(right.join("shared.txt"), "existing").unwrap();
+    let ctx = egui::Context::default();
+    let creation = eframe::CreationContext::_new_kittest(ctx.clone());
+    let mut app = App::new(
+        &creation,
+        Box::new(TestDesktop::default()),
+        root,
+        [left.clone(), right.clone()],
+        true,
+    );
+    settle(&mut app);
+    app.places = vec![
+        Place {
+            name: "Fixture place".into(),
+            path: left,
+            drive: false,
+            ejectable: false,
+        },
+        Place {
+            name: "Fixture drive".into(),
+            path: right.clone(),
+            drive: true,
+            ejectable: true,
+        },
+    ];
+    app.interface.tree = true;
+    app.engine.settings.stacked = true;
+
+    let mut frame = eframe::Frame::_new_kittest();
+    let mut draw = |app: &mut App| {
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, vec2(1280., 800.))),
+                ..Default::default()
+            },
+            |ui| app.ui(ui, &mut frame),
+        );
+        output.textures_delta.clear();
+        output.shapes
+    };
+    app.engine
+        .dispatch(Command::View(Side::Left, engine::View::Gallery));
+    app.engine
+        .dispatch(Command::View(Side::Right, engine::View::Compact));
+    let shapes = draw(&mut app);
+    assert!(frame_contains(&shapes, "Fixture place"));
+    assert!(frame_contains(&shapes, "Fixture drive"));
+    assert!(frame_contains(&shapes, "directory"));
+    assert!(frame_contains(&shapes, "shared.txt"));
+    app.interface.show_help = true;
+    draw(&mut app);
+    assert!(frame_contains(&draw(&mut app), "Keyboard shortcuts"));
+    app.interface.show_help = false;
+
+    let operation = engine::Operation::Transfer {
+        paths: vec![source],
+        destination: right.clone(),
+        moving: false,
+        options: engine::TransferOptions::default(),
+    };
+    app.apply(Action::Command(Command::Queue(operation, false)), &ctx);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while app.engine.jobs[0].state != engine::JobState::Conflict {
+        app.engine.poll();
+        assert!(
+            Instant::now() < deadline,
+            "transfer conflict was not reported"
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    draw(&mut app);
+    let shapes = draw(&mut app);
+    assert!(frame_contains(&shapes, "shared.txt"));
+    assert!(frame_contains(&shapes, "Skip"));
+    let id = app.engine.jobs[0].id;
+    app.apply(
+        Action::Command(Command::Resolve(id, engine::Collision::Skip, false)),
+        &ctx,
+    );
+    settle(&mut app);
+    assert_eq!(
+        std::fs::read(right.join("shared.txt")).unwrap(),
+        b"existing"
+    );
+    assert!(frame_contains(&draw(&mut app), "1 skipped"));
+}
+
+#[test]
+fn quick_view_changes_between_a_large_log_image_and_unavailable_file() {
+    let fixture = tempfile::tempdir().unwrap();
+    let root = fixture.path().canonicalize().unwrap();
+    let log = root.join("large.log");
+    let image = root.join("pixel.png");
+    let binary = root.join("binary.bin");
+    std::fs::write(&log, "Live log text\n".repeat(4_000)).unwrap();
+    std::fs::write(&binary, b"\0\xff").unwrap();
+    // A one-pixel RGBA PNG, independent of the system image libraries.
+    const PIXEL: &[u8] = &[
+        137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1, 0, 0, 0, 1, 8, 6,
+        0, 0, 0, 31, 21, 196, 137, 0, 0, 0, 13, 73, 68, 65, 84, 120, 156, 99, 184, 147, 34, 249,
+        31, 0, 5, 210, 2, 89, 77, 189, 91, 80, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66, 96, 130,
+    ];
+    std::fs::write(&image, PIXEL).unwrap();
+
+    let ctx = egui::Context::default();
+    let creation = eframe::CreationContext::_new_kittest(ctx.clone());
+    let mut app = App::new(
+        &creation,
+        Box::new(TestDesktop::default()),
+        root.clone(),
+        [root.clone(), root],
+        true,
+    );
+    let mut frame = eframe::Frame::_new_kittest();
+    settle(&mut app);
+    app.apply(Action::ToggleQuick(Side::Left), &ctx);
+    let mut await_preview =
+        |app: &mut App,
+         path: &Path,
+         ready: &dyn Fn(&App, &[egui::epaint::ClippedShape]) -> bool| {
+            app.engine.dispatch(Command::Select(
+                Side::Left,
+                path.into(),
+                engine::Select::Focus,
+            ));
+            assert_eq!(app.engine.tab(Side::Left).current().unwrap().path, path);
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                let mut output = ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, vec2(1280., 800.))),
+                        ..Default::default()
+                    },
+                    |ui| {
+                        app.logic(&ctx, &mut frame);
+                        app.ui(ui, &mut frame);
+                    },
+                );
+                output.textures_delta.clear();
+                if ready(app, &output.shapes) {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "Quick View timed out for {}",
+                    path.display()
+                );
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        };
+    await_preview(&mut app, &log, &|_, shapes| {
+        frame_contains(shapes, "Live log text")
+    });
+    await_preview(&mut app, &image, &|app, shapes| {
+        frame_contains(shapes, "pixel.png")
+            && app
+                .previews
+                .cached
+                .values()
+                .any(|item| matches!(item, CachedPreview::Image(_, size) if size.x == size.y && size.x > 0.))
+    });
+    await_preview(&mut app, &binary, &|_, shapes| {
+        frame_contains(shapes, "Preview unavailable for this file.")
+    });
+}
+
+#[test]
+fn clipboard_shortcuts_route_to_files_or_text_based_on_focus_context() {
+    let fixture = tempfile::tempdir().unwrap();
+    let root = fixture.path().to_path_buf();
+    let ctx = egui::Context::default();
+    let creation = eframe::CreationContext::_new_kittest(ctx.clone());
+    let desktop = TestDesktop::default();
+    desktop.state.borrow_mut().text = Some("first\r\nsecond".into());
+    let mut app = App::new(
+        &creation,
+        Box::new(desktop),
+        root.clone(),
+        [root.clone(), root],
+        true,
+    );
+    let route = |app: &mut App, key| {
+        let modifiers = egui::Modifiers::COMMAND;
+        let mut actions = Vec::new();
+        let mut events = Vec::new();
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                events: [true, false]
+                    .map(|pressed| egui::Event::Key {
+                        key,
+                        physical_key: None,
+                        pressed,
+                        repeat: false,
+                        modifiers,
+                    })
+                    .into(),
+                ..Default::default()
+            },
+            |_| {
+                app.clipboard_shortcuts(&ctx, &mut actions);
+                events = ctx.input(|input| input.events.clone());
+            },
+        );
+        output.textures_delta.clear();
+        (actions, events)
+    };
+    let (actions, _) = route(&mut app, Key::C);
+    assert!(matches!(
+        actions.as_slice(),
+        [Action::Tool(Side::Left, Tool::CopyClipboard)]
+    ));
+
+    app.open_settings(&ctx);
+    for (key, expected) in [
+        (Key::C, egui::Event::Copy),
+        (Key::X, egui::Event::Cut),
+        (Key::V, egui::Event::Paste("first\nsecond".into())),
+    ] {
+        let (actions, events) = route(&mut app, key);
+        assert!(actions.is_empty());
+        assert!(events.contains(&expected), "{events:?}");
     }
 }

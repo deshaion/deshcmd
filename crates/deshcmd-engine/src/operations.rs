@@ -496,7 +496,7 @@ impl Worker<'_> {
             } => {
                 if symbolic {
                     let points_to = if relative {
-                        relative_to(parent(&target)?, &source)?
+                        relative_to(&parent(&target)?.canonicalize()?, &source)?
                     } else {
                         source.clone()
                     };
@@ -695,7 +695,6 @@ fn symlink(_source: &Path, _target: &Path, _directory: bool) -> io::Result<()> {
 }
 
 fn relative_to(from: &Path, to: &Path) -> io::Result<PathBuf> {
-    let from = fs::canonicalize(from)?;
     let to = if let Some(file) = to.file_name() {
         fs::canonicalize(parent(to)?)?.join(file)
     } else {
@@ -800,6 +799,8 @@ struct Transfer<'a, 'worker> {
     moving: bool,
     ancestors: Vec<PathBuf>,
     transferred: std::collections::HashSet<PathBuf>,
+    staged_destination: Option<(PathBuf, PathBuf)>,
+    details: Vec<String>,
     worker: &'a mut Worker<'worker>,
 }
 
@@ -843,13 +844,29 @@ impl Worker<'_> {
             moving,
             ancestors: Vec::new(),
             transferred: Default::default(),
+            staged_destination: None,
+            details: Vec::new(),
             worker: self,
         };
         let mut complete = 0;
+        let mut skipped = 0;
+        let mut incomplete = 0;
+        let total = paths.len();
+        let mut stopped = None;
         for path in paths {
-            transfer.worker.control.check()?;
-            let target =
-                destination.join(rename_for_transfer(&path, &transfer.options.rename_mask)?);
+            let target = match transfer
+                .worker
+                .control
+                .check()
+                .and_then(|()| rename_for_transfer(&path, &transfer.options.rename_mask))
+            {
+                Ok(name) => destination.join(name),
+                Err(error) => {
+                    stopped = Some(error);
+                    break;
+                }
+            };
+            let warnings_before = transfer.worker.warnings.len();
             let result = (|| {
                 let meta = path.symlink_metadata()?;
                 if path == target && moving {
@@ -908,19 +925,51 @@ impl Worker<'_> {
                 Ok(copied)
             })();
             match result {
-                Ok(true) => {
+                Ok(true) if transfer.worker.warnings.len() == warnings_before => {
                     complete += 1;
                     transfer.worker.finish_item();
                 }
-                Ok(false) => transfer.worker.finish_item(),
-                Err(error) => transfer.worker.attempt(&path, Err(error))?,
+                Ok(false) if transfer.worker.warnings.len() == warnings_before => {
+                    skipped += 1;
+                    transfer.worker.finish_item();
+                }
+                Ok(_) => {
+                    incomplete += 1;
+                    transfer.worker.finish_item();
+                }
+                Err(error) => {
+                    incomplete += 1;
+                    if let Err(error) = transfer.worker.attempt(&path, Err(error)) {
+                        transfer
+                            .details
+                            .push(format!("Stopped at {}", path.display()));
+                        stopped = Some(error);
+                        break;
+                    }
+                }
             }
         }
-        Ok(format!(
-            "{} {complete} of {} items",
+        let mut summary = format!(
+            "{} {complete} of {total} items, {skipped} skipped, {incomplete} incomplete",
             if moving { "Moved" } else { "Copied" },
-            transfer.worker.progress.items
-        ))
+        );
+        let remaining = total - complete - skipped - incomplete;
+        if remaining > 0 {
+            summary.push_str(&format!(", {remaining} not started"));
+        }
+        for detail in transfer.details {
+            summary.push('\n');
+            summary.push_str(&detail);
+        }
+        match stopped {
+            None => Ok(summary),
+            Some(error) => {
+                if error.to_string() == "Cancelled" {
+                    transfer.worker.control.cancel();
+                }
+                Err(io::Error::new(error.kind(), format!("{error} · {summary}")))
+            }
+        }
     }
 
     fn wipe(&mut self, path: &Path, passes: u8) -> io::Result<()> {
@@ -1030,14 +1079,6 @@ impl Transfer<'_, '_> {
         }
         match choice {
             Collision::RenameIncoming => Ok((unique_path(target), Collision::Skip)),
-            Collision::RenameExisting => {
-                if !try_rename_noreplace(target, &unique_path(target))? {
-                    return Err(io::Error::other(
-                        "Renaming the existing file safely is unsupported on this filesystem",
-                    ));
-                }
-                Ok((target.to_path_buf(), Collision::Skip))
-            }
             Collision::Replace if directory || target_meta.is_dir() => Err(io::Error::other(
                 "Use merge for two folders or choose a different destination name",
             )),
@@ -1073,15 +1114,37 @@ impl Transfer<'_, '_> {
         }
         let (target, choice) = self.resolve(source, target, meta.is_dir(), meta.is_file())?;
         if choice == Collision::Skip && exists(&target) {
+            self.details.push(format!(
+                "Skipped {} because {} already exists",
+                source.display(),
+                target.display()
+            ));
             return Ok(false);
         }
+        if choice == Collision::RenameExisting {
+            return self.copy_renaming_existing(source, &target, &meta);
+        }
+        self.copy_entry(source, &target, &meta, top, choice)
+    }
+
+    fn copy_entry(
+        &mut self,
+        source: &Path,
+        target: &Path,
+        meta: &fs::Metadata,
+        top: bool,
+        choice: Collision,
+    ) -> io::Result<bool> {
         if meta.is_dir() {
             let real_source = source.canonicalize()?;
+            if target.starts_with(&real_source) {
+                return Err(io::Error::other("Cannot transfer a folder into itself"));
+            }
             if self.ancestors.contains(&real_source) {
                 return Err(io::Error::other("Symbolic link cycle"));
             }
             self.ancestors.push(real_source);
-            let result = self.copy_dir(source, &target, &meta, top, choice == Collision::Merge);
+            let result = self.copy_dir(source, target, meta, top, choice == Collision::Merge);
             self.ancestors.pop();
             if self.moving && matches!(result, Ok(true)) {
                 self.transferred.insert(source.to_path_buf());
@@ -1091,15 +1154,22 @@ impl Transfer<'_, '_> {
         if meta.is_symlink() {
             let mut link = fs::read_link(source)?;
             if self.options.adjust_links && link.is_relative() {
-                link = relative_to(parent(&target)?, &parent(source)?.join(&link))?;
+                let destination_parent = match &self.staged_destination {
+                    Some((staged, destination)) if let Ok(suffix) = target.strip_prefix(staged) => {
+                        let final_path = destination.join(suffix);
+                        parent(&final_path)?.to_path_buf()
+                    }
+                    _ => parent(target)?.canonicalize()?,
+                };
+                link = relative_to(&destination_parent, &parent(source)?.join(&link))?;
             }
             if choice == Collision::Replace {
-                let staging = tempfile::tempdir_in(parent(&target)?)?;
+                let staging = tempfile::tempdir_in(parent(target)?)?;
                 let staged = staging.path().join("link");
                 symlink(&link, &staged, source.is_dir())?;
                 fs::rename(staged, target)?;
             } else {
-                symlink(&link, &target, source.is_dir())?;
+                symlink(&link, target, source.is_dir())?;
             }
             if self.moving {
                 self.transferred.insert(source.to_path_buf());
@@ -1109,11 +1179,80 @@ impl Transfer<'_, '_> {
         if !meta.is_file() {
             return Err(io::Error::other("Unsupported file type"));
         }
-        self.copy_file(source, &target, &meta, choice)?;
+        self.copy_file(source, target, meta, choice)?;
         if self.moving {
             self.transferred.insert(source.to_path_buf());
         }
         Ok(true)
+    }
+
+    fn copy_renaming_existing(
+        &mut self,
+        source: &Path,
+        target: &Path,
+        meta: &fs::Metadata,
+    ) -> io::Result<bool> {
+        let original = target.symlink_metadata()?;
+        let staging = tempfile::tempdir_in(parent(target)?)?;
+        let staged = staging.path().join("incoming");
+        let warnings_before = self.worker.warnings.len();
+
+        // A move may remove only entries that reached their final destination.
+        let transferred_before = std::mem::take(&mut self.transferred);
+        self.staged_destination = Some((staged.clone(), target.to_path_buf()));
+        let result = self.copy_entry(source, &staged, meta, false, Collision::Skip);
+        self.staged_destination = None;
+        let staged_transfers = std::mem::replace(&mut self.transferred, transferred_before);
+
+        let result = (|| {
+            let complete = result?;
+            if self.worker.warnings.len() != warnings_before {
+                return Err(io::Error::other(format!(
+                    "The incoming folder could not be copied. The existing item remains at {}",
+                    target.display()
+                )));
+            }
+            match staged.symlink_metadata() {
+                Ok(_) => {}
+                Err(error) if !complete && error.kind() == io::ErrorKind::NotFound => {
+                    return Ok(false);
+                }
+                Err(error) => return Err(error),
+            }
+            let backup = unique_path(target);
+            self.worker.control.check()?;
+            if !same_metadata(&original, &target.symlink_metadata()?) {
+                return Err(io::Error::other(format!(
+                    "The destination changed while copying: {}",
+                    target.display()
+                )));
+            }
+            publish_renaming_existing(&staged, target, &backup)?;
+            self.transferred.extend(staged_transfers);
+            self.details.push(format!(
+                "Previous item at {} kept as {}",
+                target.display(),
+                backup.display()
+            ));
+            if self.moving && !complete {
+                self.worker.warnings.push(format!(
+                    "{} retained because some contents were skipped",
+                    source.display()
+                ));
+            }
+            Ok(complete)
+        })();
+        let staging_path = staging.path().to_path_buf();
+        if let Err(error) = staging.close().or_else(|_| {
+            make_staging_removable(&staging_path)?;
+            fs::remove_dir_all(&staging_path)
+        }) {
+            self.worker.warnings.push(format!(
+                "Could not remove transfer staging files at {}: {error}",
+                staging_path.display()
+            ));
+        }
+        result
     }
 
     fn copy_dir(
@@ -1406,6 +1545,64 @@ fn unique_path(path: &Path) -> PathBuf {
         .unwrap()
 }
 
+fn publish_renaming_existing(staged: &Path, target: &Path, backup: &Path) -> io::Result<()> {
+    rename_noreplace(target, backup)?;
+    if let Err(error) = rename_noreplace(staged, target) {
+        if let Err(restore_error) = rename_noreplace(backup, target) {
+            return Err(io::Error::other(format!(
+                "Could not publish {}: {error}. The previous item is at {}. Could not restore it: {restore_error}",
+                target.display(),
+                backup.display()
+            )));
+        }
+        return Err(io::Error::new(
+            error.kind(),
+            format!(
+                "Could not publish {}: {error}. Restored the previous item",
+                target.display()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn rename_noreplace(source: &Path, target: &Path) -> io::Result<()> {
+    if try_rename_noreplace(source, target)? {
+        Ok(())
+    } else {
+        Err(io::Error::other(
+            "Renaming without replacing an item is unsupported on this filesystem",
+        ))
+    }
+}
+
+fn make_staging_removable(path: &Path) -> io::Result<()> {
+    let metadata = path.symlink_metadata()?;
+    if metadata.is_symlink() {
+        return Ok(());
+    }
+    #[cfg(unix)]
+    if metadata.is_dir() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = metadata.permissions().mode();
+        if mode & 0o700 != 0o700 {
+            fs::set_permissions(path, fs::Permissions::from_mode(mode | 0o700))?;
+        }
+    }
+    #[cfg(windows)]
+    if metadata.permissions().readonly() {
+        let mut permissions = metadata.permissions();
+        permissions.set_readonly(false);
+        fs::set_permissions(path, permissions)?;
+    }
+    if metadata.is_dir() {
+        for entry in fs::read_dir(path)? {
+            make_staging_removable(&entry?.path())?;
+        }
+    }
+    Ok(())
+}
+
 #[cfg(target_os = "linux")]
 fn try_rename_noreplace(source: &Path, target: &Path) -> io::Result<bool> {
     use std::os::unix::ffi::OsStrExt;
@@ -1484,6 +1681,9 @@ fn try_clone(source: &File, target: &File) -> bool {
 fn try_clone(_source: &File, _target: &File) -> bool {
     false
 }
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos", windows)))]
+mod tests;
 
 enum HashState {
     Blake3(Box<blake3::Hasher>),
@@ -1728,9 +1928,10 @@ impl Worker<'_> {
         let count = by_output.len();
         for (manifest, paths) in by_output {
             let folder = parent(&manifest)?;
+            let relative_base = folder.canonicalize()?;
             let mut temporary = NamedTempFile::new_in(folder)?;
             for path in paths {
-                let relative = relative_to(folder, &path)?;
+                let relative = relative_to(&relative_base, &path)?;
                 let path_text = relative
                     .to_str()
                     .ok_or_else(|| io::Error::other("Checksum manifests require UTF-8 paths"))?;
