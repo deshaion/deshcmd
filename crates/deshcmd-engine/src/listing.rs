@@ -137,7 +137,7 @@ impl Entry {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Location {
     Directory(PathBuf),
     Flat { base: PathBuf, roots: Vec<PathBuf> },

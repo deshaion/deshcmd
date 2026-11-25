@@ -28,14 +28,20 @@ On Linux, mark the downloaded AppImage executable with `chmod +x deshcmd-0.1.0-x
 
 ## What is available
 
-- Independent panels with tabs, tab locks, named workspaces, bookmarks, breadcrumbs, history, a folder tree, and mounted volumes. The panel divider is draggable. Layout can be side by side or stacked.
+- Independent panels with tabs, tab pins and locks, named workspaces, bookmarks, breadcrumbs, history, a folder tree, and mounted volumes. The panel divider is draggable. Layout can be side by side or stacked.
 - Details, compact, gallery, and recursive flat views. Quick View shows common images and UTF-8 text. Quick Search jumps to matching names, while the filter narrows the visible list.
 - Keyboard and mouse marking, mask and attribute matching, reusable selections, clipboard actions, and import/export of path lists and displayed details.
 - Background copy and move with conflict choices, symlink options, masks, and copy verification. Create, rename, trash, delete, link, or change file attributes, and inspect logs and progress from **Queue**.
 - Split and join files, generate and verify checksum manifests, compare a file with a pasted digest, and benchmark supported hash algorithms.
 
 Press **F1** for shortcuts. In the default keymap, **Tab** switches panels, **Ctrl+L** edits the location, and **F5** and **F6** copy and move to the opposite panel.
+Press **Ctrl+Up** to open the focused folder in a new tab in the same panel, or **Ctrl+Right** from the left panel to open it in a new tab on the right. **Ctrl+T** duplicates the current location in the same panel. **Ctrl+Shift+T** copies the current tab to the opposite panel.
+Right-click a tab to **Pin tab** or **Unpin tab**. Pinned tabs stay in their current positions, survive restarts, and are protected from closing and duplicate cleanup.
 Press **F9** or choose **Tools → Open Terminal** to start an external terminal in the active panel's folder.
+
+On Linux, choose **Tools → Add DeshCmd to Application Menu** or run `deshcmd --install-menu-entry` to install a launcher for your user account. The launcher points to the running executable or AppImage. Run the command again after moving it.
+
+On Windows, choose **Tools → Add DeshCmd to Start Menu** or run the executable with `--install-menu-entry` to create a Start menu shortcut for your user account. Run the command again if you move the executable.
 
 This version supports local files, mounted locations, and virtual path lists. Archive and plugin-backed volumes in [Features.md](Features.md). The deshcmd workspace and bookmark interchange format is JSON. The integrity tools support 22 checksum options, including SFV. HAVAL and native ACL editing remain outside this version. Trash, volume discovery, and system clipboard behavior depend on the desktop. Linux/X11 is the verified desktop target.
 

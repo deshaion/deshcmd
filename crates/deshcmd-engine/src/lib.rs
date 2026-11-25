@@ -54,6 +54,8 @@ pub struct SavedTab {
     pub location: Location,
     pub title: String,
     pub lock: TabLock,
+    #[serde(default)]
+    pub pinned: bool,
     pub home: PathBuf,
     pub view: View,
     pub sort: Vec<Sort>,
@@ -491,6 +493,10 @@ pub enum Command {
     Parent(Side),
     Refresh,
     NewTab(Side),
+    OpenFocusedDirectoryInTab {
+        source: Side,
+        destination: Side,
+    },
     Tab(Side, usize),
     CloseTab(Side, usize),
     CloseDuplicates(Side),
@@ -498,6 +504,7 @@ pub enum Command {
     SendTab(Side, usize, bool),
     RenameTab(Side, usize, String),
     LockTab(Side, usize, TabLock),
+    ToggleTabPin(Side, usize),
     Swap,
     MatchPanes,
     Flat(Side, bool),
@@ -711,6 +718,19 @@ impl Engine {
                 let saved = default_tab(self.tab(side).base().to_path_buf());
                 self.add_tab(side, saved, false);
             }
+            Command::OpenFocusedDirectoryInTab {
+                source,
+                destination,
+            } => {
+                let path = self
+                    .tab(source)
+                    .current()
+                    .filter(|entry| entry.is_dir())
+                    .ok_or_else(|| io::Error::other("Focus a folder first"))?
+                    .path
+                    .clone();
+                self.navigate(destination, &path, true, false, false)?;
+            }
             Command::Tab(side, index) => self.switch_tab(side, index),
             Command::CloseTab(side, index) => self.close_tab(side, index),
             Command::CloseDuplicates(side) => {
@@ -718,21 +738,27 @@ impl Engine {
                 let mut best = HashMap::new();
                 for (index, tab) in pane.tabs.iter().enumerate() {
                     let rank = (
+                        tab.saved.pinned,
                         tab.saved.lock != TabLock::Normal,
                         !tab.saved.title.is_empty(),
                         index == pane.active,
                     );
-                    let current = best
-                        .entry(tab.saved.location.base().to_owned())
-                        .or_insert((rank, tab.id));
+                    let current = best.entry(tab.location()).or_insert((rank, tab.id));
                     if rank > current.0 {
                         *current = (rank, tab.id);
                     }
                 }
                 let old = pane.tab().id;
+                let replacement = best[pane.tab().location()].1;
+                let keep: HashSet<_> = best.into_values().map(|(_, id)| id).collect();
                 pane.tabs
-                    .retain(|tab| best.get(tab.base()).is_some_and(|v| v.1 == tab.id));
-                pane.active = pane.tabs.iter().position(|tab| tab.id == old).unwrap_or(0);
+                    .retain(|tab| tab.saved.pinned || keep.contains(&tab.id));
+                pane.active = pane
+                    .tabs
+                    .iter()
+                    .position(|tab| tab.id == old)
+                    .or_else(|| pane.tabs.iter().position(|tab| tab.id == replacement))
+                    .unwrap_or(0);
             }
             Command::ReorderTab(side, from, to) => {
                 let pane = self.pane_mut(side);
@@ -744,8 +770,11 @@ impl Engine {
                 }
             }
             Command::SendTab(side, index, moving) => {
-                if let Some(tab) = self.pane(side).tabs.get(index) {
-                    let saved = tab.saved.clone();
+                if let Some(tab) = self.pane(side).tabs.get(index)
+                    && !(moving && tab.saved.pinned)
+                {
+                    let mut saved = tab.saved.clone();
+                    saved.pinned = false;
                     self.add_tab(side.other(), saved, false);
                     if moving {
                         self.close_tab(side, index);
@@ -761,6 +790,11 @@ impl Engine {
                 if let Some(tab) = self.pane_mut(side).tabs.get_mut(index) {
                     tab.saved.home = tab.base().to_path_buf();
                     tab.saved.lock = lock;
+                }
+            }
+            Command::ToggleTabPin(side, index) => {
+                if let Some(tab) = self.pane_mut(side).tabs.get_mut(index) {
+                    tab.saved.pinned = !tab.saved.pinned;
                 }
             }
             Command::Swap => {
@@ -1204,7 +1238,7 @@ impl Engine {
     }
     fn close_tab(&mut self, side: Side, index: usize) {
         let pane = self.pane_mut(side);
-        if index >= pane.tabs.len() || pane.tabs.len() <= 1 {
+        if pane.tabs.len() <= 1 || pane.tabs.get(index).is_none_or(|tab| tab.saved.pinned) {
             return;
         }
         pane.tabs.remove(index);
@@ -1424,6 +1458,7 @@ fn default_tab(path: PathBuf) -> SavedTab {
         location: Location::Directory(path),
         title: String::new(),
         lock: TabLock::Normal,
+        pinned: false,
         view: View::Details,
         sort: vec![Sort::default()],
     }

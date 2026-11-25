@@ -814,6 +814,7 @@ dependencies = [
  "eframe",
  "open",
  "rfd",
+ "tempfile",
 ]
 
 [[package]]

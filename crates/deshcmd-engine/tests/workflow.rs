@@ -3,8 +3,8 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use deshcmd_engine::{
-    Algorithm, Collision, Command, Engine, JobState, ManifestMode, MatchOptions, Operation, Select,
-    Settings, Side, TabLock, TransferOptions,
+    Algorithm, Collision, Command, Engine, JobState, Location, ManifestMode, MatchOptions,
+    Operation, Select, Settings, Side, TabLock, TransferOptions,
 };
 
 fn pump(engine: &mut Engine, done: impl Fn(&Engine) -> bool) {
@@ -100,6 +100,65 @@ fn pane_navigation_filters_and_restores_marks() {
         || {},
     );
     assert_eq!(reopened.tab(side).base(), root.join("sub"));
+}
+
+#[test]
+fn duplicate_cleanup_keeps_pinned_tabs_and_selects_the_surviving_location() {
+    let fixture = tempfile::tempdir().unwrap();
+    let root = fixture.path();
+    let folder = root.join("folder");
+    fs::create_dir(&folder).unwrap();
+    let mut engine = open(root, root);
+    let side = Side::Left;
+
+    engine.dispatch(Command::OpenFocusedDirectoryInTab {
+        source: side,
+        destination: side,
+    });
+    assert_eq!(engine.tab(side).base(), folder);
+    engine.dispatch(Command::ToggleTabPin(side, 1));
+    engine.dispatch(Command::NewTab(side));
+    engine.dispatch(Command::ToggleTabPin(side, 2));
+    engine.dispatch(Command::NewTab(side));
+    engine.dispatch(Command::CloseDuplicates(side));
+
+    let pane = engine.pane(side);
+    assert_eq!(pane.tabs.len(), 3);
+    assert!(pane.tabs[1..].iter().all(|tab| tab.saved.pinned));
+    assert_eq!(pane.tab().base(), folder);
+    assert!(pane.tab().saved.pinned);
+}
+
+#[test]
+fn duplicate_cleanup_distinguishes_virtual_tabs_with_the_same_base() {
+    let fixture = tempfile::tempdir().unwrap();
+    let root = fixture.path();
+    let mut engine = open(root, root);
+    let side = Side::Left;
+    engine.dispatch(Command::ToggleTabPin(side, 0));
+
+    for filename in ["first.txt", "second.txt", "first.txt"] {
+        fs::write(root.join(filename), "").unwrap();
+        engine.dispatch(Command::NewTab(side));
+        engine.dispatch(Command::LoadList(side, filename.to_owned()));
+    }
+    let active_id = engine.tab(side).id;
+    engine.dispatch(Command::CloseDuplicates(side));
+
+    let pane = engine.pane(side);
+    assert_eq!(pane.tabs.len(), 3);
+    assert!(pane.tabs[0].saved.pinned);
+    assert_eq!(pane.tabs[0].location(), &Location::Directory(root.into()));
+    assert_eq!(pane.tab().id, active_id);
+    for (tab, filename) in pane.tabs[1..].iter().zip(["second.txt", "first.txt"]) {
+        assert_eq!(
+            tab.location(),
+            &Location::List {
+                base: root.into(),
+                paths: vec![root.join(filename)],
+            }
+        );
+    }
 }
 
 #[test]
