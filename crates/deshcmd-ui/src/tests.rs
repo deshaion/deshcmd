@@ -5,6 +5,7 @@ use std::rc::Rc;
 
 #[derive(Default)]
 pub(super) struct DesktopState {
+    supports_updates: bool,
     pub(super) files: Vec<PathBuf>,
     pub(super) text: Option<String>,
     pub(super) file_clipboard_unavailable: bool,
@@ -20,6 +21,9 @@ pub(super) struct TestDesktop {
 }
 
 impl Desktop for TestDesktop {
+    fn supports_updates(&self) -> bool {
+        self.state.borrow().supports_updates
+    }
     fn open(&mut self, path: &Path) -> Result<(), String> {
         self.opened
             .as_ref()
@@ -68,6 +72,66 @@ impl Desktop for TestDesktop {
     fn shortcut(&mut self, _: &Path, _: &Path) -> Result<(), String> {
         unreachable!()
     }
+}
+
+#[test]
+fn update_item_is_visible_in_help_in_a_short_window() {
+    let fixture = tempfile::tempdir().unwrap();
+    let path = fixture.path().to_path_buf();
+    let ctx = egui::Context::default();
+    let creation = eframe::CreationContext::_new_kittest(ctx.clone());
+    let desktop = TestDesktop::default();
+    desktop.state.borrow_mut().supports_updates = true;
+    let mut app = App::new(
+        &creation,
+        Box::new(desktop),
+        path.clone(),
+        [path.clone(), path],
+        true,
+    );
+    let mut frame = eframe::Frame::_new_kittest();
+    let screen = Rect::from_min_size(egui::Pos2::ZERO, vec2(900., 480.));
+    let mut draw = |events| {
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(screen),
+                events,
+                ..Default::default()
+            },
+            |ui| app.ui(ui, &mut frame),
+        );
+        output.textures_delta.clear();
+        output.shapes
+    };
+    let menu_button = draw(vec![])
+        .into_iter()
+        .find_map(|shape| match shape.shape {
+            egui::Shape::Text(text) if text.galley.text() == "Help" => {
+                Some(text.pos + text.galley.size() * 0.5)
+            }
+            _ => None,
+        })
+        .expect("Help menu button");
+    draw(vec![egui::Event::PointerMoved(menu_button)]);
+    for pressed in [true, false] {
+        draw(vec![egui::Event::PointerButton {
+            pos: menu_button,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        }]);
+    }
+    assert!(egui::Popup::is_any_open(&ctx));
+    assert!(
+        draw(vec![]).into_iter().any(|shape| match shape.shape {
+            egui::Shape::Text(text) if text.galley.text() == "Check for Updates…" => {
+                let bounds = Rect::from_min_size(text.pos, text.galley.size());
+                bounds.bottom() < 140. && shape.clip_rect.contains_rect(bounds)
+            }
+            _ => false,
+        }),
+        "Check for Updates should be visible in Help"
+    );
 }
 
 #[test]
