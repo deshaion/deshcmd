@@ -26,6 +26,41 @@ The **Build desktop packages** workflow runs when a GitHub release is published 
 
 On Linux, mark the downloaded AppImage executable with `chmod +x deshcmd-0.1.0-x86_64.AppImage`, then run it. On Windows, launch the `.exe` directly. On macOS, open the disk image and drag `DeshCmd.app` into Applications. The macOS app is ad hoc signed. Gatekeeper may block downloaded copies until a build is signed with a Developer ID and notarized.
 
+### Standalone updates
+
+Extract the executable from a standalone archive into a folder you can write to. The standalone archives are `deshcmd-linux-x86_64.tar.gz`, `deshcmd-linux-aarch64.tar.gz`, `deshcmd-windows-x86_64.zip`, `deshcmd-macos-aarch64.tar.gz`, and `deshcmd-macos-x86_64.tar.gz`.
+
+Choose **Tools → Check for Updates…** and then **Install and Restart** when a newer version is ready. From a terminal, run `deshcmd --update` to check and install in one step. DeshCmd verifies the Ed25519 signature on the release manifest and the SHA-256 digests of the archive and extracted executable. A temporary copy of DeshCmd waits for the original process to exit, saves the old executable as `<executable>.previous`, replaces it, and restarts DeshCmd. It restores the backup if the OS rejects the launch. To restore that backup manually, close DeshCmd and rename it to the original executable filename.
+
+For APT, Flatpak, Homebrew, and other package managers, use the package manager's update command. AppImages, DMG-installed apps, and the separate versioned Windows executable use manual release downloads. Package maintainers should build with Cargo's default features.
+
+#### Set up release signing
+
+Generate a dedicated Ed25519 signing key once with OpenSSL 3. Keep a secure copy of the private key outside the repository.
+
+```sh
+key_dir="$HOME/.config/deshcmd-release"
+mkdir -m 700 -p "$key_dir"
+(umask 077
+ test ! -e "$key_dir/update-key.pem" &&
+ openssl genpkey -algorithm ED25519 -out "$key_dir/update-key.pem")
+
+openssl pkey -in "$key_dir/update-key.pem" -pubout -outform DER |
+  tail -c 32 | od -An -v -tx1 | tr -d ' \n'
+printf '\n'
+```
+
+In GitHub, open **Settings → Secrets and variables → Actions** and add these repository settings.
+
+| Setting | Value |
+| --- | --- |
+| Variable `DESHCMD_UPDATE_PUBLIC_KEY` | The 64 hex characters printed above |
+| Secret `DESHCMD_UPDATE_SIGNING_KEY` | The complete contents of `update-key.pem`, including its PEM header and footer |
+
+Publish a stable release with a tag matching the workspace version, such as `v0.1.1` for version `0.1.1`, and designate it as the latest release. The workflow embeds the public key in standalone builds, then signs and uploads `latest.json` and `latest.json.sig` alongside the archives. First-time users and users of pre-updater builds need to download the first standalone build manually. Keep the same key for subsequent releases so installed builds can verify them. A replacement key requires users to download a build that trusts it.
+
+Update signing authenticates files to DeshCmd. macOS Gatekeeper and Windows SmartScreen use their own code-signing systems.
+
 ## What is available
 
 - Independent panels with tabs, tab pins and locks, named workspaces, bookmarks, breadcrumbs, history, a folder tree, and mounted volumes. The panel divider is draggable. Layout can be side by side or stacked.

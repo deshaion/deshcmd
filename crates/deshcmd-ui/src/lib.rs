@@ -3,6 +3,7 @@ mod panes;
 mod settings;
 mod text_preview;
 mod theme;
+mod updates;
 mod window;
 
 use std::collections::{HashMap, HashSet};
@@ -19,6 +20,7 @@ use egui::{
 use dialogs::{Dialog, Tool};
 use panes::PanelUi;
 use theme::*;
+pub use updates::{DesktopUpdate, UpdateCheck};
 
 #[derive(Clone)]
 pub struct Place {
@@ -29,6 +31,12 @@ pub struct Place {
 }
 
 pub trait Desktop {
+    fn supports_updates(&self) -> bool {
+        false
+    }
+    fn check_for_update(&mut self, _ctx: egui::Context) -> Result<UpdateCheck, String> {
+        Err("Standalone updates are unavailable".into())
+    }
     fn open(&mut self, path: &Path) -> Result<(), String>;
     fn open_terminal(&mut self, directory: &Path) -> Result<(), String>;
     #[cfg(any(target_os = "linux", windows))]
@@ -61,6 +69,7 @@ enum Action {
     ToggleQuick(Side),
     ClipboardText(String),
     Eject(PathBuf),
+    CheckForUpdates,
     Close,
 }
 
@@ -98,6 +107,7 @@ pub struct App {
     spaces: HashMap<PathBuf, (u64, u64)>,
     last_places: Instant,
     previews: Previews,
+    update: Option<updates::UpdateDialog>,
 }
 
 impl App {
@@ -161,6 +171,7 @@ impl App {
             spaces: HashMap::new(),
             last_places: Instant::now(),
             previews: Previews::new(context.egui_ctx.clone()),
+            update: None,
         }
     }
 
@@ -237,6 +248,7 @@ impl App {
             Action::Eject(path) => {
                 self.dialog = Some(Dialog::eject(path));
             }
+            Action::CheckForUpdates => self.check_for_updates(ctx),
             Action::Close => {
                 if self.engine.jobs.iter().any(|job| !job.state.finished()) {
                     self.interface.queue = true;
@@ -301,7 +313,13 @@ impl App {
         toolbar.menu_button("File", |ui| dialogs::file_menu(ui, side, actions));
         toolbar.menu_button("Select", |ui| dialogs::selection_menu(ui, side, actions));
         toolbar.menu_button("View", |ui| self.view_menu(ui, side, actions));
-        toolbar.menu_button("Tools", |ui| dialogs::tools_menu(ui, side, actions));
+        toolbar.menu_button("Tools", |ui| {
+            dialogs::tools_menu(ui, side, actions);
+            if self.desktop.supports_updates() && ui.button("Check for Updates…").clicked() {
+                actions.push(Action::CheckForUpdates);
+                ui.close();
+            }
+        });
         let drag_start = toolbar.cursor().left();
         let drag_end = toolbar
             .with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -822,6 +840,7 @@ impl App {
         }
         let text_context = self.text_field_focused(ctx)
             || self.dialog.is_some()
+            || self.update.is_some()
             || self.preferences.is_some()
             || self.interface.show_help
             || self.engine.jobs.iter().any(|job| job.conflict.is_some());
@@ -872,6 +891,7 @@ impl App {
 
     fn keyboard(&mut self, ctx: &egui::Context, actions: &mut Vec<Action>) {
         if self.dialog.is_some()
+            || self.update.is_some()
             || self.preferences.is_some()
             || self.interface.show_help
             || egui::Popup::is_any_open(ctx)
@@ -1355,6 +1375,7 @@ impl App {
 impl eframe::App for App {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.engine.poll();
+        self.poll_update();
         self.record_notice();
         self.previews.poll();
         if self.last_places.elapsed() >= Duration::from_secs(10) {
@@ -1408,6 +1429,7 @@ impl eframe::App for App {
         if self.interface.show_help {
             self.shortcuts(&ctx);
         }
+        self.update_dialog(&ctx);
         self.publish_text_clipboard(&ctx);
         self.record_notice();
         if !self.interface.show_bottom_bar

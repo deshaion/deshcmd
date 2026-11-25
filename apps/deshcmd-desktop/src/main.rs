@@ -3,6 +3,8 @@
 #[cfg(target_os = "linux")]
 mod menu;
 mod terminal;
+#[cfg(feature = "standalone-updater")]
+mod updater;
 
 use std::path::{Path, PathBuf};
 
@@ -27,6 +29,32 @@ impl NativeDesktop {
 }
 
 impl Desktop for NativeDesktop {
+    #[cfg(feature = "standalone-updater")]
+    fn supports_updates(&self) -> bool {
+        updater::available()
+    }
+    #[cfg(feature = "standalone-updater")]
+    fn check_for_update(&mut self, ctx: egui::Context) -> Result<deshcmd_ui::UpdateCheck, String> {
+        let (send, receive) = std::sync::mpsc::channel();
+        std::thread::Builder::new()
+            .name("deshcmd-update".into())
+            .spawn(move || {
+                let result = updater::prepare()
+                    .map(|update| {
+                        update.map(|prepared| deshcmd_ui::DesktopUpdate {
+                            version: prepared.version.clone(),
+                            install: Box::new(move || {
+                                prepared.install().map_err(|error| error.to_string())
+                            }),
+                        })
+                    })
+                    .map_err(|error| error.to_string());
+                let _ = send.send(result);
+                ctx.request_repaint();
+            })
+            .map_err(|error| error.to_string())?;
+        Ok(receive)
+    }
     fn open(&mut self, path: &Path) -> Result<(), String> {
         launch::open_file(path).map_err(|error| format!("{}: {error}", path.display()))
     }
@@ -394,8 +422,37 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("deshcmd [LEFT_DIRECTORY [RIGHT_DIRECTORY]]");
         #[cfg(any(target_os = "linux", windows))]
         println!("deshcmd --install-menu-entry");
+        #[cfg(feature = "standalone-updater")]
+        if updater::available() {
+            println!("deshcmd --update");
+        }
         return Ok(());
     }
+    #[cfg(not(feature = "standalone-updater"))]
+    if args.peek().is_some_and(|arg| {
+        arg == "--update" || arg == "--install-update" || arg == "--finish-update"
+    }) {
+        return Err("Standalone updates are unavailable in this installation".into());
+    }
+    #[cfg(feature = "standalone-updater")]
+    let update_status = match args.peek().and_then(|arg| arg.to_str()) {
+        Some("--update") => {
+            args.next();
+            if args.next().is_some() {
+                return Err("--update takes no arguments".into());
+            }
+            if let Some(update) = updater::prepare()? {
+                println!("Installing DeshCmd {}", update.version);
+                update.install()?;
+            } else {
+                println!("DeshCmd is up to date");
+            }
+            return Ok(());
+        }
+        Some("--install-update") => return updater::install_cli(args.skip(1)),
+        Some("--finish-update") => updater::finish(args.by_ref().skip(1))?,
+        _ => None,
+    };
     #[cfg(any(target_os = "linux", windows))]
     if args.peek().is_some_and(|arg| arg == "--install-menu-entry") {
         if args.nth(1).is_some() {
@@ -453,6 +510,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 initial,
                 fresh,
             );
+            #[cfg(feature = "standalone-updater")]
+            let app = {
+                let mut app = app;
+                if let Some(error) = update_status {
+                    app.show_update_error(error);
+                }
+                app
+            };
             // Keep the native window's minimum independent of interface zoom.
             let ctx = &context.egui_ctx;
             ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(
