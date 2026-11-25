@@ -171,9 +171,6 @@ impl App {
                     self.interface.focus_scroll = Some(side);
                     ctx.request_repaint();
                 }
-                if matches!(command, Command::Queue(..)) {
-                    self.interface.queue = true;
-                }
                 self.engine.dispatch(command);
             }
             Action::Tool(side, tool) => self.invoke(side, tool, ctx),
@@ -1283,8 +1280,7 @@ impl App {
 
         for (side, rect) in Side::ALL.into_iter().zip([panel1, panel2]) {
             let quick = self.interface.quick.filter(|source| source.other() == side);
-            let parent_focus_restored =
-                quick.is_none() && self.engine.take_parent_focus_restored(side);
+            let cursor_restored = quick.is_none() && self.engine.take_cursor_restored(side);
             let pane = self.engine.pane(side);
             let root = pane.tab().base();
             let space = self
@@ -1309,7 +1305,7 @@ impl App {
                 columns: column_set,
                 show_modified_time: self.engine.settings.show_modified_time,
                 show_inline_filter: self.interface.show_inline_filter,
-                reveal_cursor: self.interface.focus_scroll == Some(side) || parent_focus_restored,
+                reveal_cursor: self.interface.focus_scroll == Some(side) || cursor_restored,
                 preview: quick.map(|source| (source, self.engine.tab(source).current())),
             };
             self.interface.panes[side.index()].show(
