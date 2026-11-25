@@ -12,3 +12,9 @@ rfd = "0.17"
 open = "5"
 dirs = "6"
 arboard = { version = "3.7", default-features = false, features = ["wayland-data-control"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"

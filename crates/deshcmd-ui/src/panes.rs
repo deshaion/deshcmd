@@ -31,6 +31,7 @@ pub(crate) struct PaneScreen<'a> {
     pub home: &'a Path,
     pub space: Option<(u64, u64)>,
     pub columns: &'a [Column],
+    pub show_modified_time: bool,
     pub show_inline_filter: bool,
     pub reveal_cursor: bool,
     pub preview: Option<(Side, Option<&'a Entry>)>,
@@ -71,6 +72,7 @@ impl PanelUi {
             home,
             space,
             columns,
+            show_modified_time,
             show_inline_filter,
             reveal_cursor,
             preview,
@@ -158,23 +160,23 @@ impl PanelUi {
         );
         contents.spacing_mut().item_spacing = vec2(0., 0.);
         match tab.saved.view {
-            View::Gallery => gallery(&mut contents, tab, side, previews, actions),
+            View::Gallery => gallery(&mut contents, tab, side, reveal_cursor, previews, actions),
             View::Compact => rows(
                 &mut contents,
                 tab,
                 side,
-                &[Column::Name],
+                None,
+                show_modified_time,
                 reveal_cursor,
-                false,
                 actions,
             ),
             View::Details => rows(
                 &mut contents,
                 tab,
                 side,
-                columns,
+                Some(columns),
+                show_modified_time,
                 reveal_cursor,
-                true,
                 actions,
             ),
         }
@@ -462,7 +464,7 @@ impl PanelUi {
             egui::ScrollArea::vertical()
                 .max_height(250.)
                 .show(ui, |ui| {
-                    for (index, location) in tab.history.iter().enumerate().rev() {
+                    for (index, location) in tab.history().enumerate().rev() {
                         if ui.button(location.base().display().to_string()).clicked() {
                             actions.push(Action::Command(Command::History(side, index)));
                             ui.close();
@@ -713,17 +715,44 @@ fn crumbs(path: &Path, home: &Path) -> Vec<(String, PathBuf)> {
     result
 }
 
+fn file_scroll_area(ui: &Ui, salt: &str, target: Option<usize>, height: f32) -> egui::ScrollArea {
+    let area = egui::ScrollArea::vertical()
+        .id_salt(salt)
+        .auto_shrink([false, false]);
+    if let Some(index) = target {
+        // Match the persistent ID ScrollArea builds from its stored salt.
+        let id = ui.make_persistent_id(egui::IdSalt::new(salt));
+        let offset = egui::scroll_area::State::load(ui.ctx(), id)
+            .map(|state| state.clamped_offset().y)
+            .unwrap_or_default();
+        let top = index as f32 * (height + ui.spacing().item_spacing.y);
+        let bottom = top + height;
+        if top < offset {
+            return area.vertical_scroll_offset(top);
+        }
+        if bottom > offset + ui.available_height() {
+            return area.vertical_scroll_offset((bottom - ui.available_height()).max(0.));
+        }
+    }
+    area
+}
+
 fn rows(
     ui: &mut Ui,
     tab: &Tab,
     side: Side,
-    columns: &[Column],
+    columns: Option<&[Column]>,
+    show_modified_time: bool,
     reveal: bool,
-    details: bool,
     actions: &mut Vec<Action>,
 ) {
     let width = ui.available_width();
-    let columns = column_widths(columns, width);
+    let details = columns.is_some();
+    let (columns, show_modified_time) = column_widths(
+        columns.unwrap_or(&[Column::Name]),
+        width,
+        show_modified_time,
+    );
     if details {
         let (header, _) = ui.allocate_exact_size(vec2(width, 28.), Sense::hover());
         ui.painter().rect_filled(header, 0., RAISED);
@@ -785,24 +814,7 @@ fn rows(
     }
     let h = if details { 36. } else { 29. };
     let target = if reveal { tab.cursor_position() } else { None };
-    let mut area = egui::ScrollArea::vertical()
-        .id_salt("rows")
-        .auto_shrink([false, false]);
-    if let Some(index) = target {
-        let id = ui.make_persistent_id(egui::Id::unique("rows"));
-        let offset = egui::scroll_area::State::load(ui.ctx(), id)
-            .map(|state| state.clamped_offset().y)
-            .unwrap_or_default();
-        let y = index as f32 * h;
-        let height = ui.available_height();
-        if y < offset {
-            area = area.vertical_scroll_offset(y);
-        }
-        if y + h > offset + height {
-            area = area.vertical_scroll_offset((y + h - height).max(0.));
-        }
-    }
-    area.show_rows(ui, h, tab.visible_count(), |ui, range| {
+    file_scroll_area(ui, "rows", target, h).show_rows(ui, h, tab.visible_count(), |ui, range| {
         for index in range {
             let entry = tab.visible_entry(index).unwrap();
             let (rect, response) = ui.allocate_exact_size(vec2(width, h), Sense::click_and_drag());
@@ -825,11 +837,12 @@ fn rows(
                     rect.top() + 6. ..=rect.bottom() - 6.,
                     Stroke::new(2., ACCENT),
                 );
-            } else if focused {
+            }
+            if focused {
                 ui.painter().rect_stroke(
                     rect.shrink2(vec2(3., 2.)),
                     4.,
-                    Stroke::new(1., LINE),
+                    Stroke::new(2., ACCENT),
                     egui::StrokeKind::Inside,
                 );
             }
@@ -873,7 +886,7 @@ fn rows(
                     painter.text(
                         pos2(x + 13., rect.center().y),
                         Align2::LEFT_CENTER,
-                        value(entry, column),
+                        value(entry, column, show_modified_time),
                         FontId::proportional(12.),
                         if marked { TEXT } else { SUB },
                     );
@@ -972,7 +985,14 @@ fn folder_drop(ui: &Ui, response: &Response, entry: &Entry, side: Side, actions:
     }
 }
 
-fn gallery(ui: &mut Ui, tab: &Tab, side: Side, previews: &mut Previews, actions: &mut Vec<Action>) {
+fn gallery(
+    ui: &mut Ui,
+    tab: &Tab,
+    side: Side,
+    reveal: bool,
+    previews: &mut Previews,
+    actions: &mut Vec<Action>,
+) {
     if tab.visible_count() == 0 {
         empty(ui, tab, side, actions);
         return;
@@ -981,75 +1001,79 @@ fn gallery(ui: &mut Ui, tab: &Tab, side: Side, previews: &mut Previews, actions:
     let columns = ((outer_width - 10.) / 123.).floor().max(1.) as usize;
     let width = ((outer_width - 12.) / columns as f32).max(40.);
     let height = 112.;
-    egui::ScrollArea::vertical()
-        .id_salt("gallery")
-        .auto_shrink([false, false])
-        .show_rows(
-            ui,
-            height,
-            tab.visible_count().div_ceil(columns),
-            |ui, range| {
-                for row in range {
-                    ui.horizontal(|ui| {
-                        ui.add_space(5.);
-                        for index in
-                            row * columns..(row * columns + columns).min(tab.visible_count())
-                        {
-                            let entry = tab.visible_entry(index).unwrap();
-                            let (outer, response) = ui
-                                .allocate_exact_size(vec2(width, height), Sense::click_and_drag());
-                            row_interaction(ui, &response, entry, tab, side, actions);
-                            let rect = outer.shrink(4.);
-                            let marked = tab.is_marked(&entry.path);
-                            let (icon, ink) = icon_for(entry.kind);
-                            card(
-                                ui,
-                                rect,
-                                if marked {
-                                    ACCENT_DARK
-                                } else if response.hovered() {
-                                    HOVER
-                                } else {
-                                    RAIL
-                                },
-                            );
-                            let image = Rect::from_min_max(
-                                rect.min + vec2(4., 4.),
-                                pos2(rect.right() - 4., rect.bottom() - 28.),
-                            );
-                            if entry.kind == engine::Kind::Image
-                                && let Some(CachedPreview::Image(texture, size)) =
-                                    previews.get(entry, 176)
-                            {
-                                ui.painter().image(
-                                    texture.id(),
-                                    Rect::from_center_size(
-                                        image.center(),
-                                        contained_size(*size, image.size() - vec2(4., 4.)),
-                                    ),
-                                    Rect::from_min_max(pos2(0., 0.), pos2(1., 1.)),
-                                    Color32::WHITE,
-                                );
+    let target = if reveal {
+        tab.cursor_position().map(|index| index / columns)
+    } else {
+        None
+    };
+    file_scroll_area(ui, "gallery", target, height).show_rows(
+        ui,
+        height,
+        tab.visible_count().div_ceil(columns),
+        |ui, range| {
+            for row in range {
+                ui.horizontal(|ui| {
+                    ui.add_space(5.);
+                    for index in row * columns..(row * columns + columns).min(tab.visible_count()) {
+                        let entry = tab.visible_entry(index).unwrap();
+                        let (outer, response) =
+                            ui.allocate_exact_size(vec2(width, height), Sense::click_and_drag());
+                        row_interaction(ui, &response, entry, tab, side, actions);
+                        let rect = outer.shrink(4.);
+                        let marked = tab.is_marked(&entry.path);
+                        let (icon, ink) = icon_for(entry.kind);
+                        ui.painter().rect(
+                            rect,
+                            10.,
+                            if marked {
+                                ACCENT_DARK
+                            } else if response.hovered() {
+                                HOVER
                             } else {
-                                icon.draw(ui, image.center(), 32., ink);
-                            }
-                            ui.painter()
-                                .with_clip_rect(
-                                    rect.shrink2(vec2(6., 0.)).intersect(ui.clip_rect()),
-                                )
-                                .text(
-                                    pos2(rect.center().x, rect.bottom() - 14.),
-                                    Align2::CENTER_CENTER,
-                                    &entry.name,
-                                    FontId::proportional(12.),
-                                    if marked { ACCENT } else { TEXT },
-                                );
-                            folder_drop(ui, &response, entry, side, actions);
+                                RAIL
+                            },
+                            if tab.cursor_position() == Some(index) {
+                                Stroke::new(2., ACCENT)
+                            } else {
+                                Stroke::new(1., LINE)
+                            },
+                            egui::StrokeKind::Inside,
+                        );
+                        let image = Rect::from_min_max(
+                            rect.min + vec2(4., 4.),
+                            pos2(rect.right() - 4., rect.bottom() - 28.),
+                        );
+                        if entry.kind == engine::Kind::Image
+                            && let Some(CachedPreview::Image(texture, size)) =
+                                previews.get(entry, 176)
+                        {
+                            ui.painter().image(
+                                texture.id(),
+                                Rect::from_center_size(
+                                    image.center(),
+                                    contained_size(*size, image.size() - vec2(4., 4.)),
+                                ),
+                                Rect::from_min_max(pos2(0., 0.), pos2(1., 1.)),
+                                Color32::WHITE,
+                            );
+                        } else {
+                            icon.draw(ui, image.center(), 32., ink);
                         }
-                    });
-                }
-            },
-        );
+                        ui.painter()
+                            .with_clip_rect(rect.shrink2(vec2(6., 0.)).intersect(ui.clip_rect()))
+                            .text(
+                                pos2(rect.center().x, rect.bottom() - 14.),
+                                Align2::CENTER_CENTER,
+                                &entry.name,
+                                FontId::proportional(12.),
+                                if marked { ACCENT } else { TEXT },
+                            );
+                        folder_drop(ui, &response, entry, side, actions);
+                    }
+                });
+            }
+        },
+    );
 }
 
 fn empty(ui: &mut Ui, tab: &Tab, side: Side, actions: &mut Vec<Action>) {
@@ -1106,14 +1130,18 @@ fn empty(ui: &mut Ui, tab: &Tab, side: Side, actions: &mut Vec<Action>) {
     });
 }
 
-fn column_widths(columns: &[Column], width: f32) -> Vec<(Column, f32)> {
+fn column_widths(
+    columns: &[Column],
+    width: f32,
+    show_modified_time: bool,
+) -> (Vec<(Column, f32)>, bool) {
     let mut chosen = vec![Column::Name];
     for column in columns {
         if *column != Column::Name && !chosen.contains(column) && chosen.len() < 5 {
             chosen.push(*column);
         }
     }
-    let estimate = |column| match column {
+    let date_only_width = |column| match column {
         Column::Size => 79.,
         Column::Modified => 116.,
         Column::Kind => 87.,
@@ -1122,28 +1150,31 @@ fn column_widths(columns: &[Column], width: f32) -> Vec<(Column, f32)> {
         Column::Path | Column::Comment => 140.,
         _ => 110.,
     };
-    while chosen.len() > 1
-        && chosen.iter().map(|column| estimate(*column)).sum::<f32>() > width + 30.
-    {
-        chosen.pop();
+    let budget = width + 30.;
+    let mut estimated_width = chosen.iter().copied().map(date_only_width).sum::<f32>();
+    while chosen.len() > 1 && estimated_width > budget {
+        estimated_width -= date_only_width(chosen.pop().unwrap());
     }
-    let used: f32 = chosen.iter().skip(1).map(|column| estimate(*column)).sum();
-    chosen
+    let time_width = 36.;
+    let show_modified_time = show_modified_time
+        && chosen.contains(&Column::Modified)
+        && estimated_width + time_width <= budget;
+    let mut columns: Vec<_> = chosen
         .into_iter()
         .map(|column| {
-            (
-                column,
-                if column == Column::Name {
-                    width - used
-                } else {
-                    estimate(column)
-                },
-            )
+            let width = date_only_width(column);
+            if column == Column::Modified && show_modified_time {
+                (column, width + time_width)
+            } else {
+                (column, width)
+            }
         })
-        .collect()
+        .collect();
+    columns[0].1 = width - columns.iter().skip(1).map(|(_, width)| width).sum::<f32>();
+    (columns, show_modified_time)
 }
 
-pub(crate) fn value(entry: &Entry, column: Column) -> String {
+pub(crate) fn value(entry: &Entry, column: Column, show_modified_time: bool) -> String {
     match column {
         Column::Name => entry.name.clone(),
         Column::Size => {
@@ -1156,8 +1187,13 @@ pub(crate) fn value(entry: &Entry, column: Column) -> String {
         Column::Modified => entry
             .modified
             .map(|date| {
+                let format = if show_modified_time {
+                    "%d %b %Y %H:%M"
+                } else {
+                    "%d %b %Y"
+                };
                 chrono::DateTime::<chrono::Local>::from(date)
-                    .format("%d %b %Y")
+                    .format(format)
                     .to_string()
             })
             .unwrap_or_else(|| "—".into()),
@@ -1331,5 +1367,26 @@ pub(crate) fn tree(
     });
     if response.header_response.double_clicked() {
         actions.push(Action::Path(side, path.to_path_buf()));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn modified_column_keeps_the_date_when_the_time_will_not_fit() {
+        let default_columns = &[Column::Name, Column::Size, Column::Modified];
+        for width in [275., 300., 310.] {
+            let (columns, includes_time) = column_widths(default_columns, width, true);
+            assert_eq!(columns.last(), Some(&(Column::Modified, 116.)));
+            assert!(!includes_time);
+        }
+        let (columns, includes_time) = column_widths(default_columns, 311., true);
+        assert_eq!(columns.last(), Some(&(Column::Modified, 152.)));
+        assert!(includes_time);
+        let (columns, includes_time) = column_widths(default_columns, 400., false);
+        assert_eq!(columns.last(), Some(&(Column::Modified, 116.)));
+        assert!(!includes_time);
     }
 }

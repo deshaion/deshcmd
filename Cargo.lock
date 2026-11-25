@@ -812,8 +812,10 @@ dependencies = [
  "deshcmd-ui",
  "dirs",
  "eframe",
+ "libc",
  "open",
  "rfd",
+ "tempfile",
 ]
 
 [[package]]

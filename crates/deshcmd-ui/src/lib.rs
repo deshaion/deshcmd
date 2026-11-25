@@ -104,6 +104,12 @@ impl App {
     ) -> Self {
         theme::install(&context.egui_ctx);
         settings::install_zoom(&context.egui_ctx);
+        #[cfg(not(target_os = "macos"))]
+        context.egui_ctx.options_mut(|options| {
+            // Reserve Ctrl+Q for Quick View.
+            let quit = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, Key::Q);
+            options.quit_shortcuts.retain(|shortcut| *shortcut != quit);
+        });
         let (tree, alternate_columns) = context
             .storage
             .and_then(|storage| eframe::get_value(storage, "panel_display"))
@@ -150,8 +156,9 @@ impl App {
     fn apply(&mut self, action: Action, ctx: &egui::Context) {
         match action {
             Action::Command(command) => {
-                if matches!(command, Command::Step(..) | Command::Find(..)) {
-                    self.interface.focus_scroll = Some(self.engine.settings.active);
+                if let Command::Step(side, ..) | Command::Find(side, ..) = command {
+                    self.interface.focus_scroll = Some(side);
+                    ctx.request_repaint();
                 }
                 if matches!(command, Command::Queue(..)) {
                     self.interface.queue = true;
@@ -840,6 +847,7 @@ impl App {
         if self.dialog.is_some()
             || self.preferences.is_some()
             || self.interface.show_help
+            || egui::Popup::is_any_open(ctx)
             || self.engine.jobs.iter().any(|job| job.conflict.is_some())
         {
             return;
@@ -851,6 +859,26 @@ impl App {
         let command = |key| pressed(egui::Modifiers::COMMAND, key);
         let shift = |key| pressed(egui::Modifiers::SHIFT, key);
         let alt = |key| pressed(egui::Modifiers::ALT, key);
+        // egui records directional widget navigation before the app consumes keys.
+        let stop_widget_navigation =
+            || ctx.memory_mut(|memory| memory.move_focus(egui::FocusDirection::None));
+        let exact = |modifiers, key| {
+            ctx.input_mut(|input| {
+                let before = input.events.len();
+                input.events.retain(|event| {
+                    !matches!(
+                        event,
+                        egui::Event::Key {
+                            key: event_key,
+                            modifiers: event_modifiers,
+                            pressed: true,
+                            ..
+                        } if *event_key == key && event_modifiers.matches_exact(modifiers)
+                    )
+                });
+                before != input.events.len()
+            })
+        };
         if just(Key::F1) {
             self.interface.show_help = true;
             return;
@@ -918,7 +946,11 @@ impl App {
         if alt(Key::ArrowRight) {
             actions.push(Action::Command(Command::Forward(side)));
         }
-        if alt(Key::ArrowUp) || just(Key::Backspace) {
+        let left = exact(egui::Modifiers::NONE, Key::ArrowLeft);
+        if left {
+            stop_widget_navigation();
+        }
+        if alt(Key::ArrowUp) || just(Key::Backspace) || left {
             actions.push(Action::Command(Command::Parent(side)));
         }
         if command(Key::R) {
@@ -944,6 +976,9 @@ impl App {
         ] {
             let extend = shift(key);
             if extend || just(key) {
+                if matches!(key, Key::ArrowUp | Key::ArrowDown) {
+                    stop_widget_navigation();
+                }
                 actions.push(Action::Command(Command::Step(side, step, extend)));
             }
         }
@@ -961,7 +996,18 @@ impl App {
         {
             actions.push(Action::Open(side, entry, false));
         }
-        if just(Key::F3) {
+        if exact(egui::Modifiers::NONE, Key::ArrowRight) {
+            stop_widget_navigation();
+            if let Some(entry) = self
+                .engine
+                .tab(side)
+                .current()
+                .filter(|entry| entry.is_dir())
+            {
+                actions.push(Action::Path(side, entry.path.clone()));
+            }
+        }
+        if just(Key::F3) || exact(egui::Modifiers::CTRL, Key::Q) {
             actions.push(Action::ToggleQuick(side));
         }
         if shift(Key::F5) {
@@ -1000,7 +1046,8 @@ impl App {
                         for (keys, purpose) in [
                             ("Tab", "Switch active panel"),
                             ("Alt + Left / Right", "Go back or forward"),
-                            ("Alt + Up", "Go to parent"),
+                            ("Left / Alt + Up", "Go to parent"),
+                            ("Right", "Open focused directory"),
                             ("Ctrl + L", "Edit location"),
                             ("Ctrl + T / W", "Open or close tab"),
                             ("Alt + 1–9", "Switch to tab"),
@@ -1009,7 +1056,8 @@ impl App {
                             ("Shift + Up / Down", "Extend selection"),
                             ("Ctrl + A / I", "Mark all or invert marks"),
                             ("Ctrl + F / R", "Open filter options or refresh"),
-                            ("F2 / F3", "Rename or preview"),
+                            ("F2", "Rename"),
+                            ("Ctrl + Q / F3", "Toggle Quick View"),
                             ("F5 / F6", "Copy or move to opposite panel"),
                             ("Shift + F5", "Copy in same folder"),
                             ("F7 / F8", "Create folder or move to Trash"),
@@ -1156,6 +1204,9 @@ impl App {
         }
 
         for (side, rect) in Side::ALL.into_iter().zip([panel1, panel2]) {
+            let quick = self.interface.quick.filter(|source| source.other() == side);
+            let parent_focus_restored =
+                quick.is_none() && self.engine.take_parent_focus_restored(side);
             let pane = self.engine.pane(side);
             let root = pane.tab().base();
             let space = self
@@ -1166,7 +1217,6 @@ impl App {
             if let Some(space) = space {
                 self.spaces.insert(root.to_owned(), space);
             }
-            let quick = self.interface.quick.filter(|source| source.other() == side);
             let column_set = if self.interface.alternate_columns[side.index()] {
                 &self.engine.settings.alternate_columns
             } else {
@@ -1179,8 +1229,9 @@ impl App {
                 home: &self.engine.home,
                 space,
                 columns: column_set,
+                show_modified_time: self.engine.settings.show_modified_time,
                 show_inline_filter: self.interface.show_inline_filter,
-                reveal_cursor: self.interface.focus_scroll == Some(side),
+                reveal_cursor: self.interface.focus_scroll == Some(side) || parent_focus_restored,
                 preview: quick.map(|source| (source, self.engine.tab(source).current())),
             };
             self.interface.panes[side.index()].show(
@@ -1264,6 +1315,9 @@ impl eframe::App for App {
         }
         self.clipboard_shortcuts(&ctx, &mut actions);
         self.keyboard(&ctx, &mut actions);
+        for action in actions.drain(..) {
+            self.apply(action, &ctx);
+        }
         self.content(ui, &mut actions);
         for action in actions {
             self.apply(action, &ctx);
@@ -1395,3 +1449,6 @@ impl Previews {
 
 #[cfg(all(test, feature = "perf"))]
 mod performance;
+
+#[cfg(test)]
+mod tests;

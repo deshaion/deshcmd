@@ -34,7 +34,10 @@ On Linux, mark the downloaded AppImage executable with `chmod +x deshcmd-0.1.0-x
 - Background copy and move with conflict choices, symlink options, masks, and copy verification. Create, rename, trash, delete, link, or change file attributes, and inspect logs and progress from **Queue**.
 - Split and join files, generate and verify checksum manifests, compare a file with a pasted digest, and benchmark supported hash algorithms.
 
-Press **F1** for shortcuts. In the default keymap, **Tab** switches panels, **Ctrl+L** edits the location, and **F5** and **F6** copy and move to the opposite panel.
+Press **F1** for shortcuts. **Right** opens the focused directory, **Left** goes up one directory, and **Ctrl+Q** toggles the focused file’s preview in the opposite panel. **Tab** switches panels, **Ctrl+L** edits the location, and **F5** and **F6** copy and move to the opposite panel.
+
+Double-click a file or press **Enter** to open it. On Linux and macOS, executable binaries and scripts with a shebang run from their containing folder. Windows uses the system’s default action to launch programs. Images, documents, and other files open in the application associated with their type by the desktop.
+
 Press **F9** or choose **Tools → Open Terminal** to start an external terminal in the active panel's folder.
 
 This version supports local files, mounted locations, and virtual path lists. Archive and plugin-backed volumes in [Features.md](Features.md). The deshcmd workspace and bookmark interchange format is JSON. The integrity tools support 22 checksum options, including SFV. HAVAL and native ACL editing remain outside this version. Trash, volume discovery, and system clipboard behavior depend on the desktop. Linux/X11 is the verified desktop target.
