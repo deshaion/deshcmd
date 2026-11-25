@@ -43,6 +43,44 @@ fn run(engine: &mut Engine, operation: Operation) {
 }
 
 #[test]
+fn removing_an_open_folder_recovers_to_its_nearest_existing_parent() {
+    let fixture = tempfile::tempdir().unwrap();
+    let root = fixture.path().canonicalize().unwrap();
+    let parent = root.join("parent");
+    let removed = parent.join("removed");
+    let child = removed.join("nested");
+    fs::create_dir_all(&child).unwrap();
+    let mut engine = open(&root, &root);
+    engine.settings.auto_refresh = false;
+    for path in [&parent, &removed, &child] {
+        engine.dispatch(Command::Navigate {
+            side: Side::Left,
+            path: path.clone(),
+            new_tab: false,
+            background: false,
+        });
+    }
+    engine.dispatch(Command::Focus(Side::Right));
+    run(
+        &mut engine,
+        Operation::Delete {
+            paths: vec![removed],
+            trash: false,
+        },
+    );
+    assert_eq!(engine.jobs.last().unwrap().state, JobState::Done);
+    pump(&mut engine, |engine| {
+        !engine.tab(Side::Left).loading && engine.tab(Side::Left).base() == parent
+    });
+    assert!(engine.tab(Side::Left).error.is_none());
+    assert_eq!(engine.settings.active, Side::Right);
+    engine.dispatch(Command::Back(Side::Left));
+    assert_eq!(engine.tab(Side::Left).base(), root);
+    engine.dispatch(Command::Forward(Side::Left));
+    assert_eq!(engine.tab(Side::Left).base(), parent);
+}
+
+#[test]
 fn pane_navigation_filters_and_restores_marks() {
     let fixture = tempfile::tempdir().unwrap();
     let root = fixture.path();
@@ -571,7 +609,8 @@ fn cursor_and_mark_totals_follow_the_visible_view() {
     fs::remove_dir_all(&folder).unwrap();
     engine.dispatch(Command::Refresh);
     pump(&mut engine, |engine| !engine.tab(side).loading);
-    assert!(engine.tab(side).error.is_some());
+    assert!(engine.tab(side).error.is_none());
+    assert_eq!(engine.tab(side).base(), fixture.path());
     check(engine.tab(side), None, 0, 0);
 }
 

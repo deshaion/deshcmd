@@ -934,7 +934,7 @@ impl App {
         if just(Key::Tab) {
             actions.push(Action::Command(Command::Focus(side.other())));
         }
-        let tab_shortcut = |modifiers, key| {
+        let initial_press = |modifiers, key| {
             ctx.input_mut(|input| {
                 let mut pressed = false;
                 input.events.retain(|event| {
@@ -956,20 +956,20 @@ impl App {
                 pressed
             })
         };
-        if tab_shortcut(egui::Modifiers::COMMAND | egui::Modifiers::SHIFT, Key::T) {
+        if initial_press(egui::Modifiers::COMMAND | egui::Modifiers::SHIFT, Key::T) {
             let index = self.engine.pane(side).active;
             actions.push(Action::Command(Command::SendTab(side, index, false)));
         }
         if command(Key::T) {
             actions.push(Action::Command(Command::NewTab(side)));
         }
-        if tab_shortcut(egui::Modifiers::CTRL, Key::ArrowUp) {
+        if initial_press(egui::Modifiers::CTRL, Key::ArrowUp) {
             actions.push(Action::Command(Command::OpenFocusedDirectoryInTab {
                 source: side,
                 destination: side,
             }));
         }
-        if tab_shortcut(egui::Modifiers::CTRL, Key::ArrowRight) && side == Side::Left {
+        if initial_press(egui::Modifiers::CTRL, Key::ArrowRight) && side == Side::Left {
             actions.push(Action::Command(Command::OpenFocusedDirectoryInTab {
                 source: side,
                 destination: Side::Right,
@@ -1071,16 +1071,20 @@ impl App {
         if shift(Key::F5) {
             actions.push(Action::Tool(side, Tool::CopyHere));
         }
-        if shift(Key::Delete) {
-            actions.push(Action::Tool(side, Tool::Delete));
+        for (modifiers, key, tool) in [
+            (egui::Modifiers::SHIFT, Key::Delete, Tool::Delete),
+            (egui::Modifiers::NONE, Key::Delete, Tool::Trash),
+            (egui::Modifiers::NONE, Key::F8, Tool::Trash),
+        ] {
+            if initial_press(modifiers, key) {
+                actions.push(Action::Tool(side, tool));
+            }
         }
         for (key, tool) in [
             (Key::F2, Tool::Rename),
             (Key::F5, Tool::Copy),
             (Key::F6, Tool::Move),
             (Key::F7, Tool::NewFolder),
-            (Key::F8, Tool::Trash),
-            (Key::Delete, Tool::Trash),
         ] {
             if just(key) {
                 actions.push(Action::Tool(side, tool));

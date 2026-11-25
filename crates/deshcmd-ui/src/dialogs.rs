@@ -120,6 +120,7 @@ pub(crate) struct Dialog {
     archives: Vec<ArchiveSelection>,
     archive_target: Option<(PathBuf, PathBuf)>,
     focus: bool,
+    focus_footer: bool,
     error: Option<String>,
 }
 
@@ -145,7 +146,11 @@ impl Dialog {
             extract: ExtractOptions::default(),
             archives: Vec::new(),
             archive_target: None,
-            focus: true,
+            focus: kind != Kind::Unpack,
+            focus_footer: matches!(
+                kind,
+                Kind::Delete | Kind::DeleteArchiveMembers | Kind::Unpack
+            ),
             error: None,
         }
     }
@@ -806,7 +811,19 @@ impl App {
                 );
                 dialog.description = summarize(&dialog.paths);
                 dialog.numeric = "3".into();
-                Some(dialog)
+                let confirm = match tool {
+                    Tool::Trash => self.engine.settings.confirm_trash,
+                    Tool::Delete => self.engine.settings.confirm_delete,
+                    _ => true,
+                };
+                if confirm {
+                    Some(dialog)
+                } else {
+                    if let Err(error) = self.submit(&dialog, false, ctx) {
+                        self.notice(error);
+                    }
+                    None
+                }
             }
             Tool::Trash | Tool::Delete | Tool::Wipe => {
                 self.notice(empty());
@@ -1268,22 +1285,45 @@ impl App {
                     );
                     let ink = BASE;
                     let fill = if dangerous { RED } else { ACCENT };
-                    if ui
-                        .add(
-                            egui::Button::new(label(button_text, 13., ink).strong())
-                                .fill(fill)
-                                .stroke(egui::Stroke::NONE),
-                        )
-                        .clicked()
-                    {
+                    let confirm = ui.add(
+                        egui::Button::new(label(button_text, 13., ink).strong())
+                            .fill(fill)
+                            .stroke(egui::Stroke::NONE),
+                    );
+                    if confirm.clicked() {
                         outcome = if only_close {
                             Outcome::Close
                         } else {
                             Outcome::Submit(false)
                         };
                     }
-                    if !only_close && ui.button("Cancel").clicked() {
-                        outcome = Outcome::Close;
+                    if !only_close {
+                        let cancel = ui.button("Cancel");
+                        if std::mem::take(&mut dialog.focus_footer) {
+                            if dangerous {
+                                cancel.request_focus();
+                            } else {
+                                confirm.request_focus();
+                            }
+                        }
+                        if matches!(
+                            dialog.kind,
+                            Kind::Delete | Kind::DeleteArchiveMembers | Kind::Unpack
+                        ) {
+                            for button in [&confirm, &cancel] {
+                                if button.has_focus() {
+                                    ui.painter().rect_stroke(
+                                        button.rect.expand(2.),
+                                        5.,
+                                        egui::Stroke::new(1.5, TEXT),
+                                        egui::StrokeKind::Outside,
+                                    );
+                                }
+                            }
+                        }
+                        if cancel.clicked() {
+                            outcome = Outcome::Close;
+                        }
                     }
                 });
             });
@@ -1314,6 +1354,12 @@ impl App {
                 if let Err(error) = self.submit(&dialog, held, ctx) {
                     dialog.error = Some(error);
                     self.dialog = Some(dialog);
+                } else if dialog.kind == Kind::Delete && dialog.flags[0] {
+                    if matches!(dialog.tool, Tool::Trash) {
+                        self.engine.settings.confirm_trash = false;
+                    } else {
+                        self.engine.settings.confirm_delete = false;
+                    }
                 }
             }
         }
@@ -1933,6 +1979,7 @@ fn draw_fields(ui: &mut Ui, dialog: &mut Dialog, outcome: &mut Outcome) {
                     RED
                 },
             ));
+            ui.checkbox(&mut flags[0], "Don't ask again for this action");
         }
         Kind::Wipe => {
             ui.label(label("File contents will be overwritten before deletion. Recovery may still be possible on SSDs, snapshots, and copy-on-write storage.",13.,RED));
@@ -2217,6 +2264,83 @@ fn describe(entry: &Entry) -> String {
 mod tests {
     use super::*;
 
+    fn draw_dialog(app: &mut App, ctx: &egui::Context, key: Option<egui::Key>) {
+        let events = key
+            .into_iter()
+            .flat_map(|key| {
+                [true, false].map(|pressed| egui::Event::Key {
+                    key,
+                    physical_key: None,
+                    pressed,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                })
+            })
+            .collect();
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1100., 700.),
+                )),
+                events,
+                ..Default::default()
+            },
+            |_| app.dialogs(ctx),
+        );
+        output.textures_delta.clear();
+    }
+
+    #[test]
+    fn delete_confirmation_has_keyboard_focus_and_can_be_disabled() {
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path().canonicalize().unwrap();
+        let first = root.join("first.txt");
+        let second = root.join("second.txt");
+        std::fs::write(&first, "").unwrap();
+        std::fs::write(&second, "").unwrap();
+        let ctx = egui::Context::default();
+        let creation = eframe::CreationContext::_new_kittest(ctx.clone());
+        let mut app = App::new(
+            &creation,
+            Box::new(crate::tests::TestDesktop::default()),
+            root.clone(),
+            [root.clone(), root],
+            true,
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while app.engine.tab(Side::Left).loading {
+            app.engine.poll();
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        app.engine
+            .dispatch(Command::Select(Side::Left, first, engine::Select::Focus));
+        app.invoke(Side::Left, Tool::Delete, &ctx);
+        app.dialog.as_mut().unwrap().flags[0] = true;
+        draw_dialog(&mut app, &ctx, None);
+        draw_dialog(&mut app, &ctx, Some(egui::Key::Enter));
+        assert!(app.dialog.is_none());
+        assert!(app.engine.jobs.is_empty());
+        assert!(app.engine.settings.confirm_delete);
+
+        app.invoke(Side::Left, Tool::Delete, &ctx);
+        app.dialog.as_mut().unwrap().flags[0] = true;
+        draw_dialog(&mut app, &ctx, None);
+        draw_dialog(&mut app, &ctx, Some(egui::Key::ArrowRight));
+        draw_dialog(&mut app, &ctx, Some(egui::Key::Enter));
+        assert!(app.dialog.is_none());
+        assert_eq!(app.engine.jobs.len(), 1);
+        assert!(!app.engine.settings.confirm_delete);
+        assert!(app.engine.settings.confirm_trash);
+
+        app.engine
+            .dispatch(Command::Select(Side::Left, second, engine::Select::Focus));
+        app.invoke(Side::Left, Tool::Delete, &ctx);
+        assert!(app.dialog.is_none());
+        assert_eq!(app.engine.jobs.len(), 2);
+    }
+
     #[test]
     fn pack_and_copy_archive_members_use_archive_dialogs() {
         let archiver_found = ["7zz", "7z", "7za"].iter().any(|program| {
@@ -2285,6 +2409,15 @@ mod tests {
         let locked_revision = entry.archive.as_ref().unwrap().revision;
         app.apply(Action::Open(Side::Left, entry, false), &ctx);
         assert_eq!(app.interface.quick, Some(Side::Left));
+        app.invoke(Side::Left, Tool::Copy, &ctx);
+        draw_dialog(&mut app, &ctx, None);
+        draw_dialog(&mut app, &ctx, Some(egui::Key::Enter));
+        assert!(app.dialog.is_none());
+        wait(&mut app, true);
+        let failed = app.engine.jobs.last().unwrap();
+        assert_eq!(failed.state, engine::JobState::Failed);
+        assert!(failed.message.starts_with("Password required"));
+        assert!(!destination.join("note.txt").exists());
         app.invoke(Side::Left, Tool::UnlockArchive, &ctx);
         let mut dialog = app.dialog.take().unwrap();
         assert!(dialog.kind == Kind::UnlockArchive);
@@ -2305,10 +2438,13 @@ mod tests {
             engine::Preview::Text(text) if text == "Archive member"
         ));
         app.invoke(Side::Left, Tool::Copy, &ctx);
-        let dialog = app.dialog.take().unwrap();
+        let dialog = app.dialog.as_ref().unwrap();
         assert!(dialog.kind == Kind::Unpack);
         assert_eq!(dialog.extract.password, password);
-        app.submit(&dialog, false, &ctx).unwrap();
+        draw_dialog(&mut app, &ctx, None);
+        draw_dialog(&mut app, &ctx, Some(egui::Key::Enter));
+        assert!(app.dialog.is_none());
+        assert_eq!(app.engine.jobs.len(), 3);
         wait(&mut app, true);
         assert_eq!(
             app.engine.jobs.last().unwrap().state,

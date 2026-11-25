@@ -254,3 +254,59 @@ fn panel_navigation_and_preview_shortcuts() {
     press(&mut app, &mut frame, Key::ArrowLeft, plain);
     assert_eq!(app.engine.tab(side).base(), parent);
 }
+
+#[test]
+fn held_delete_shortcuts_only_dispatch_on_the_initial_press() {
+    let fixture = tempfile::tempdir().unwrap();
+    let path = fixture.path().to_owned();
+    let ctx = egui::Context::default();
+    let creation = eframe::CreationContext::_new_kittest(ctx.clone());
+    let mut app = App::new(
+        &creation,
+        Box::new(TestDesktop::default()),
+        path.clone(),
+        [path.clone(), path],
+        true,
+    );
+    app.engine.settings.confirm_trash = false;
+    app.engine.settings.confirm_delete = false;
+
+    for (key, modifiers, permanent) in [
+        (Key::Delete, egui::Modifiers::SHIFT, true),
+        (Key::Delete, egui::Modifiers::NONE, false),
+        (Key::F8, egui::Modifiers::NONE, false),
+    ] {
+        let mut input = |pressed| {
+            let mut actions = Vec::new();
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    events: vec![egui::Event::Key {
+                        key,
+                        physical_key: None,
+                        pressed,
+                        repeat: false,
+                        modifiers,
+                    }],
+                    ..Default::default()
+                },
+                |_| app.keyboard(&ctx, &mut actions),
+            );
+            output.textures_delta.clear();
+            actions
+        };
+        let actions = input(true);
+        if permanent {
+            assert!(matches!(
+                actions.as_slice(),
+                [Action::Tool(Side::Left, Tool::Delete)]
+            ));
+        } else {
+            assert!(matches!(
+                actions.as_slice(),
+                [Action::Tool(Side::Left, Tool::Trash)]
+            ));
+        }
+        assert!(input(true).is_empty());
+        assert!(input(false).is_empty());
+    }
+}

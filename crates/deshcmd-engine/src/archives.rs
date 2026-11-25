@@ -316,6 +316,7 @@ struct Member {
     folder: bool,
     mode: Option<u32>,
     crc: Option<u32>,
+    encrypted: bool,
 }
 
 #[derive(Default)]
@@ -435,6 +436,7 @@ fn read_listing(text: &str) -> io::Result<Inventory> {
                 crc: record
                     .get("CRC")
                     .and_then(|value| u32::from_str_radix(value, 16).ok()),
+                encrypted: record.get("Encrypted") == Some(&"+"),
             });
         } else if key.trim_end_matches(['/', '\\']) != "." {
             inventory.skipped += 1;
@@ -464,7 +466,13 @@ fn list(file: &Path, password: &str, control: &Control) -> io::Result<Inventory>
     if tool.is_none()
         && let Some(mut command) = unrar(file, "lt", password)
     {
-        run_listing(command.arg("--").arg(file), &mut output, control, MAX_LIST)?;
+        run_listing(
+            command.arg("--").arg(file),
+            file,
+            &mut output,
+            control,
+            MAX_LIST,
+        )?;
         return read_rar_listing(&read_limited(&mut output, MAX_LIST)?);
     }
     let mut command = if let Some(tool) = tool {
@@ -474,7 +482,7 @@ fn list(file: &Path, password: &str, control: &Control) -> io::Result<Inventory>
         command.args(["-slt", "-ba", "--"]).arg(file);
         command
     };
-    run_listing(&mut command, &mut output, control, MAX_LIST)?;
+    run_listing(&mut command, file, &mut output, control, MAX_LIST)?;
     let text = read_limited(&mut output, MAX_LIST)?;
     match tool.map_or(ListingFormat::Technical, |tool| tool.listing) {
         ListingFormat::Technical => read_listing(&text),
@@ -484,6 +492,7 @@ fn list(file: &Path, password: &str, control: &Control) -> io::Result<Inventory>
 
 fn run_listing(
     command: &mut Command,
+    file: &Path,
     output: &mut NamedTempFile,
     control: &Control,
     limit: u64,
@@ -495,25 +504,87 @@ fn run_listing(
             if output.rewind().is_ok() {
                 let _ = output.as_file_mut().take(8192).read_to_end(&mut stdout);
             }
-            let diagnostic =
-                format!("{}\n{error}", String::from_utf8_lossy(&stdout)).to_ascii_lowercase();
-            if [
-                "enter password",
-                "wrong password",
-                "password is incorrect",
-                "encrypted archive",
-            ]
-            .iter()
-            .any(|message| diagnostic.contains(message))
-            {
+            if password_diagnostic(
+                &format!("{}\n{error}", String::from_utf8_lossy(&stdout)),
+                file,
+            ) {
                 Err(io::Error::new(
                     io::ErrorKind::PermissionDenied,
-                    "Enter the correct archive password to browse its contents",
+                    ArchiveLocked,
                 ))
             } else {
                 Err(error)
             }
         }
+    }
+}
+
+#[derive(Debug)]
+struct ArchiveLocked;
+
+impl std::fmt::Display for ArchiveLocked {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("Enter the correct archive password to browse its contents")
+    }
+}
+
+impl std::error::Error for ArchiveLocked {}
+
+pub(crate) fn is_password_error(error: &io::Error) -> bool {
+    error
+        .get_ref()
+        .is_some_and(|source| source.is::<ArchiveLocked>())
+}
+
+fn password_diagnostic(message: &str, file: &Path) -> bool {
+    message.lines().any(|line| {
+        let line = line.trim();
+        let diagnostic = line.strip_prefix("ERROR: ").unwrap_or(line);
+        // 7-Zip places the archive path before the diagnostic for a header error.
+        if diagnostic
+            .strip_prefix(file.to_string_lossy().as_ref())
+            .and_then(|suffix| suffix.strip_prefix(" : "))
+            .is_some_and(|suffix| {
+                suffix.eq_ignore_ascii_case("Cannot open encrypted archive. Wrong password?")
+            })
+        {
+            return true;
+        }
+        // Member errors have the opposite layout, with the member name last.
+        let (text, _) = diagnostic.split_once(" : ").unwrap_or((diagnostic, ""));
+        let text = text.to_ascii_lowercase();
+        matches!(
+            text.as_str(),
+            "enter password:"
+                | "enter password (will not be echoed):"
+                | "wrong password"
+                | "wrong password?"
+                | "password is incorrect"
+                | "incorrect password"
+                | "data error in encrypted file. wrong password?"
+                | "cannot open encrypted archive. wrong password?"
+        ) || text.starts_with("incorrect password for ")
+    })
+}
+
+fn extract_password_error(file: &Path, password: &str) -> io::Error {
+    let name = crate::display_name(file);
+    let message = if password.is_empty() {
+        format!("Password required for {name}. Enter it in the Extract dialog and try again.")
+    } else {
+        format!("Incorrect password for {name}. Open Extract again and try the correct password.")
+    };
+    io::Error::new(io::ErrorKind::PermissionDenied, message)
+}
+
+fn explain_extract_error(error: io::Error, file: &Path, password: &str) -> io::Error {
+    if is_password_error(&error)
+        || password_diagnostic(&error.to_string(), file)
+        || (password.is_empty() && error.to_string() == "Break signaled")
+    {
+        extract_password_error(file, password)
+    } else {
+        error
     }
 }
 
@@ -551,6 +622,7 @@ fn read_rar_listing(text: &str) -> io::Result<Inventory> {
                     folder: kind == Some("Directory"),
                     mode,
                     crc,
+                    encrypted: false,
                 });
             } else {
                 inventory.skipped += 1;
@@ -688,6 +760,7 @@ impl Reader {
                     folder: false,
                     mode: None,
                     crc: None,
+                    encrypted: false,
                 },
                 file: inner,
             }
@@ -1203,12 +1276,23 @@ impl Worker<'_> {
         for source in sources {
             self.update(&source.file, 0);
             let revision = FileRevision::new(&source.file.metadata()?);
-            let reader = Reader::open(&source.file, &options.password, &self.control)?;
-            let inventory = reader.list(&options.password, &self.control)?;
+            let explain = |error| explain_extract_error(error, &source.file, &options.password);
+            let reader =
+                Reader::open(&source.file, &options.password, &self.control).map_err(explain)?;
+            let inventory = reader
+                .list(&options.password, &self.control)
+                .map_err(explain)?;
             let (members, skipped) = select(inventory, &source, mask.as_ref(), options.flatten)?;
             skipped_members += skipped;
             if members.is_empty() {
                 continue;
+            }
+            if options.password.is_empty()
+                && members
+                    .iter()
+                    .any(|member| member.encrypted && !member.folder)
+            {
+                return Err(extract_password_error(&source.file, ""));
             }
             let top_level = members
                 .iter()
@@ -1248,8 +1332,9 @@ impl Worker<'_> {
                     files.push((member, path));
                 }
             }
-            let mut batch =
-                reader.batch_stream(&files, staging.path(), &options.password, &self.control)?;
+            let mut batch = reader
+                .batch_stream(&files, staging.path(), &options.password, &self.control)
+                .map_err(explain)?;
             for (member, path) in files {
                 self.control.check()?;
                 fs::create_dir_all(path.parent().unwrap())?;
@@ -1258,7 +1343,9 @@ impl Worker<'_> {
                 if let Some(stream) = &mut batch {
                     copy_batch_member(stream, &mut output, member, &self.control)?;
                 } else {
-                    reader.extract(member, &output, &options.password, &self.control, None)?;
+                    reader
+                        .extract(member, &output, &options.password, &self.control, None)
+                        .map_err(explain)?;
                 }
                 #[cfg(unix)]
                 if let Some(mode) = member.mode {
@@ -1730,6 +1817,8 @@ fn read_json_listing(text: &str) -> io::Result<Inventory> {
         #[serde(default)]
         link: bool,
         mode: Option<u32>,
+        #[serde(default)]
+        encrypted: bool,
     }
     let mut inventory = Inventory::default();
     for entry in serde_json::from_str::<Vec<ListedMember>>(text).map_err(io::Error::other)? {
@@ -1741,6 +1830,7 @@ fn read_json_listing(text: &str) -> io::Result<Inventory> {
                 folder: entry.folder,
                 mode: entry.mode.map(|mode| mode & 0o777),
                 crc: None,
+                encrypted: entry.encrypted,
             });
         } else {
             inventory.skipped += 1;

@@ -497,14 +497,22 @@ impl PanelUi {
         {
             actions.push(Action::Command(Command::Forward(side)));
         }
-        if icon_button(
-            &mut ui,
-            Icon::Up,
-            "Parent folder · Alt+Up",
-            tab.base().parent().is_some() || !matches!(tab.location(), Location::Directory(_)),
-        )
-        .clicked()
-        {
+        let up = if let Location::Archive { folder, .. } = tab.location() {
+            ui.small_button(if folder.as_os_str().is_empty() {
+                "Exit archive"
+            } else {
+                "Up"
+            })
+            .on_hover_text("Go up one level · Left")
+        } else {
+            icon_button(
+                &mut ui,
+                Icon::Up,
+                "Parent folder · Left",
+                tab.base().parent().is_some() || !matches!(tab.location(), Location::Directory(_)),
+            )
+        };
+        if up.clicked() {
             actions.push(Action::Command(Command::Parent(side)));
         }
         ui.add_space(4.);
@@ -1093,6 +1101,20 @@ fn gallery(
 }
 
 fn empty(ui: &mut Ui, tab: &Tab, side: Side, actions: &mut Vec<Action>) {
+    let in_archive = matches!(tab.location(), Location::Archive { .. });
+    let error_title = if tab.archive_locked {
+        "Archive locked"
+    } else if in_archive {
+        "Archive unavailable"
+    } else {
+        "Folder unavailable"
+    };
+    let up_label = if matches!(tab.location(), Location::Archive { folder, .. } if folder.as_os_str().is_empty())
+    {
+        "Exit archive"
+    } else {
+        "Go up"
+    };
     let filtering = tab.filter().is_active();
     let empty_message = if filtering {
         "No matching items"
@@ -1102,7 +1124,7 @@ fn empty(ui: &mut Ui, tab: &Tab, side: Side, actions: &mut Vec<Action>) {
     if ui.available_height() < 45. {
         ui.vertical_centered(|ui| {
             if let Some(message) = tab.error.as_deref() {
-                ui.label(label("Folder unavailable", 13., TEXT))
+                ui.label(label(error_title, 13., TEXT))
                     .on_hover_text(message);
             } else if tab.loading && tab.entry_count() == 0 {
                 ui.label(label("Loading files…", 13., SUB));
@@ -1116,16 +1138,21 @@ fn empty(ui: &mut Ui, tab: &Tab, side: Side, actions: &mut Vec<Action>) {
     ui.add_space(offset);
     ui.vertical_centered(|ui| {
         if let Some(message) = tab.error.as_deref() {
-            ui.label(label("Folder unavailable", 15., TEXT).strong());
+            ui.label(label(error_title, 15., TEXT).strong());
             ui.label(label(message, 12., SUB));
-            if ui.small_button("Retry").clicked() {
-                actions.push(Action::Command(Command::Refresh));
-            }
-            if matches!(tab.location(), Location::Archive { .. })
-                && ui.small_button("Unlock archive…").clicked()
-            {
-                actions.push(Action::Tool(side, Tool::UnlockArchive));
-            }
+            ui.add_space(5.);
+            ui.horizontal(|ui| {
+                if tab.archive_locked {
+                    if ui.button("Unlock archive…").clicked() {
+                        actions.push(Action::Tool(side, Tool::UnlockArchive));
+                    }
+                } else if ui.button("Retry").clicked() {
+                    actions.push(Action::Command(Command::Refresh));
+                }
+                if ui.button(up_label).clicked() {
+                    actions.push(Action::Command(Command::Parent(side)));
+                }
+            });
         } else if tab.loading && tab.entry_count() == 0 {
             ui.spinner();
             ui.label(label("Loading files…", 13., SUB));

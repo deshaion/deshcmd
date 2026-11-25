@@ -43,6 +43,7 @@ enum Page {
     Interface,
     Panels,
     Navigation,
+    Confirmations,
     Visibility,
     Sorting,
     Columns,
@@ -54,6 +55,7 @@ impl Page {
             Self::Interface => "Interface",
             Self::Panels => "Panels",
             Self::Navigation => "Navigation",
+            Self::Confirmations => "Confirmations",
             Self::Visibility => "Visibility",
             Self::Sorting => "Sorting",
             Self::Columns => "Columns",
@@ -80,6 +82,7 @@ impl Preferences {
         for (group, pages) in [
             ("Appearance", &[Page::Interface, Page::Panels][..]),
             ("Workspace", &[Page::Navigation][..]),
+            ("File operations", &[Page::Confirmations][..]),
             (
                 "File lists",
                 &[Page::Visibility, Page::Sorting, Page::Columns][..],
@@ -154,6 +157,16 @@ impl Preferences {
                 ui.checkbox(
                     &mut self.workspace.auto_refresh,
                     "Refresh active folders automatically",
+                );
+            }
+            Page::Confirmations => {
+                ui.checkbox(
+                    &mut self.workspace.confirm_trash,
+                    "Confirm before moving items to Trash",
+                );
+                ui.checkbox(
+                    &mut self.workspace.confirm_delete,
+                    "Confirm before permanently deleting items",
                 );
             }
             Page::Visibility => {
@@ -323,6 +336,8 @@ impl App {
         settings.split = draft.split;
         settings.linked = draft.linked;
         settings.auto_refresh = draft.auto_refresh;
+        settings.confirm_trash = draft.confirm_trash;
+        settings.confirm_delete = draft.confirm_delete;
         settings.natural_sort = draft.natural_sort;
         settings.directories_first = draft.directories_first;
         settings.show_modified_time = draft.show_modified_time;
@@ -352,6 +367,33 @@ impl App {
 mod tests {
     use super::*;
     use crate::tests::TestDesktop;
+
+    #[test]
+    fn deletion_confirmations_default_on_and_can_be_saved_independently() {
+        let fixture = tempfile::tempdir().unwrap();
+        let path = fixture.path().to_owned();
+        let ctx = egui::Context::default();
+        let creation = eframe::CreationContext::_new_kittest(ctx.clone());
+        let mut app = App::new(
+            &creation,
+            Box::new(TestDesktop::default()),
+            path.clone(),
+            [path.clone(), path],
+            true,
+        );
+        let older_settings: Settings = serde_json::from_str("{}").unwrap();
+        assert!(older_settings.confirm_trash && older_settings.confirm_delete);
+        app.engine.settings.confirm_delete = false;
+        app.open_settings(&ctx);
+        let mut draft = app.preferences.take().unwrap();
+        draft.workspace.confirm_trash = false;
+        draft.workspace.confirm_delete = true;
+        app.save_settings(&draft, &ctx).unwrap();
+
+        let restored: Settings =
+            serde_json::from_str(&serde_json::to_string(&app.engine.snapshot()).unwrap()).unwrap();
+        assert!(!restored.confirm_trash && restored.confirm_delete);
+    }
 
     #[test]
     fn modified_time_preference_is_enabled_by_default_and_can_be_saved_off() {

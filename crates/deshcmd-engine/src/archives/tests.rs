@@ -83,6 +83,36 @@ fn listing_skips_traversal_links_and_special_files() {
 }
 
 #[test]
+fn extraction_diagnostics_distinguish_password_errors_from_member_names() {
+    let file = Path::new("folder : with spaces/archive.zip");
+    for name in [
+        "wrong password.txt",
+        "incorrect password",
+        "Cannot open encrypted archive. Wrong password?",
+    ] {
+        let original = format!("ERROR: CRC Failed : {name}");
+        for password in ["", "supplied"] {
+            let explained =
+                explain_extract_error(io::Error::other(original.clone()), file, password);
+            assert_eq!(explained.to_string(), original);
+        }
+    }
+    let header = format!(
+        "ERROR: {} : Cannot open encrypted archive. Wrong password?",
+        file.display()
+    );
+    assert!(password_diagnostic(&header, file));
+    assert!(password_diagnostic(
+        "ERROR: Wrong password : docs/note.txt",
+        file
+    ));
+    assert!(password_diagnostic(
+        "Enter password (will not be echoed):",
+        file
+    ));
+}
+
+#[test]
 fn archive_queue_round_trip() {
     if !archiver_available() {
         eprintln!("Archive integration test requires 7-Zip");
