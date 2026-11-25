@@ -206,7 +206,7 @@ fn cmd(ui: &mut Ui, text: &str, command: Command, actions: &mut Vec<Action>) {
 pub(crate) fn file_menu(ui: &mut Ui, side: Side, actions: &mut Vec<Action>) {
     for (name, tool) in [
         ("New folder · F7", Tool::NewFolder),
-        ("New text file", Tool::NewFile),
+        ("New text file · Shift+F4", Tool::NewFile),
         ("Go to folder…", Tool::FolderPicker),
         ("Rename · F2", Tool::Rename),
         ("Copy to other panel · F5", Tool::Copy),
@@ -770,7 +770,7 @@ impl App {
                 match tool {
                     Tool::NewFolder => dialog.description = base.display().to_string(),
                     Tool::NewFile => {
-                        dialog.primary = "untitled.txt".into();
+                        dialog.primary = default_text_filename(&base);
                         dialog.description = base.display().to_string();
                     }
                     Tool::Rename => {
@@ -1655,7 +1655,11 @@ impl App {
                     }
                     queue(Operation::Mkdir(base.join(relative)))
                 }
-                Tool::NewFile => queue(Operation::Create(base.join(filename(primary)?))),
+                Tool::NewFile => Action::Command(Command::CreateFile {
+                    side,
+                    path: base.join(filename(primary)?),
+                    hold: held,
+                }),
                 Tool::Rename => {
                     let source = item()?;
                     let target = source.with_file_name(filename(primary)?);
@@ -2334,6 +2338,16 @@ fn absolute_input(base: &Path, home: &Path, input: &str) -> Result<PathBuf, Stri
         base.join(path)
     })
 }
+fn default_text_filename(base: &Path) -> String {
+    let mut name = String::from("untitled.txt");
+    let mut suffix = 1;
+    while base.join(&name).symlink_metadata().is_ok() {
+        name = format!("untitled{suffix}.txt");
+        suffix += 1;
+    }
+    name
+}
+
 fn filename(input: &str) -> Result<&Path, String> {
     let path = Path::new(input);
     if input.trim().is_empty()

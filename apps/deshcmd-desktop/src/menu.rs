@@ -22,7 +22,16 @@ pub fn install() -> io::Result<PathBuf> {
         dirs::data_dir().ok_or_else(|| io::Error::other("User data directory unavailable"))?;
     let entry = data.join("applications/deshcmd.desktop");
     let icon = data.join("icons/hicolor/scalable/apps/deshcmd.svg");
-    let contents = DESKTOP_ENTRY.replace("Exec=deshcmd\n", &format!("Exec={exec}\n"));
+    let icon_path = icon
+        .to_str()
+        .ok_or_else(|| io::Error::other("The icon path cannot be written to a desktop entry"))?
+        .replace('\\', r"\\")
+        .replace('\n', r"\n")
+        .replace('\r', r"\r")
+        .replace('\t', r"\t");
+    let contents = DESKTOP_ENTRY
+        .replace("Exec=deshcmd\n", &format!("Exec={exec}\n"))
+        .replace("Icon=deshcmd\n", &format!("Icon={icon_path}\n"));
     install_file(&icon, ICON)?;
     install_file(&entry, contents.as_bytes())?;
     Ok(entry)

@@ -890,7 +890,7 @@ fn cursor_and_mark_totals_follow_the_visible_view() {
     fs::remove_file(file("file10.txt")).unwrap();
     engine.dispatch(Command::Refresh);
     pump(&mut engine, |engine| !engine.tab(side).busy());
-    check(engine.tab(side), Some("sub"), 11, 1);
+    check(engine.tab(side), Some("report.csv"), 11, 1);
     engine.dispatch(Command::Step(side, Step::Last, false));
     check(engine.tab(side), Some("file2.txt"), 11, 1);
     engine.dispatch(Command::UnmarkAll(side));

@@ -143,7 +143,6 @@ pub enum Icon {
     Trash,
     Eye,
     Queue,
-    More,
     Settings,
     Link,
     Pin,
@@ -384,11 +383,6 @@ impl Icon {
                 for y in [4., 8., 12.] {
                     line(&[(6., y), (14., y)]);
                     painter.circle_filled(point(2.5, y), size / 13., color);
-                }
-            }
-            Self::More => {
-                for x in [3., 8., 13.] {
-                    painter.circle_filled(point(x, 8.), size / 12., color);
                 }
             }
             Self::Settings => {

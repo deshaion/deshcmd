@@ -56,6 +56,9 @@ impl PanelUi {
     }
 
     pub fn start_path(&mut self) {
+        if !self.editing_path {
+            self.path_draft = self.base.display().to_string();
+        }
         self.editing_path = true;
         self.request_path = true;
     }
@@ -548,7 +551,7 @@ impl PanelUi {
             actions.push(Action::Command(Command::Parent(side)));
         }
         ui.add_space(4.);
-        let width = (ui.available_width() - 32.).max(40.);
+        let width = ui.available_width().max(0.);
         let (path_rect, path_response) = ui.allocate_exact_size(vec2(width, 29.), Sense::click());
         ui.painter().rect(
             path_rect,
@@ -571,22 +574,25 @@ impl PanelUi {
                 egui::TextEdit::singleline(&mut self.path_draft)
                     .id(path_id(side))
                     .frame(egui::Frame::NONE)
+                    .align(Align2::LEFT_CENTER)
                     .font(egui::TextStyle::Monospace),
             );
             if self.request_path {
                 edit.request_focus();
                 self.request_path = false;
-            }
-            if (edit.has_focus() || edit.lost_focus())
+            } else if (edit.has_focus() || edit.lost_focus())
                 && root.input(|input| input.key_pressed(egui::Key::Enter))
             {
                 if !self.path_draft.trim().is_empty() {
                     actions.push(Action::Path(side, PathBuf::from(self.path_draft.trim())));
                 }
+                edit.surrender_focus();
                 self.editing_path = false;
-            }
-            if root.input(|input| input.key_pressed(egui::Key::Escape)) {
-                self.path_draft = tab.location().display_path().display().to_string();
+            } else if !edit.has_focus()
+                || edit.clicked_elsewhere()
+                || root.input(|input| input.key_pressed(egui::Key::Escape))
+            {
+                edit.surrender_focus();
                 self.editing_path = false;
             }
         } else {
@@ -608,15 +614,6 @@ impl PanelUi {
                     break;
                 }
                 start -= 1;
-            }
-            if start != 0
-                && width > 108.
-                && path_ui
-                    .add(egui::Button::new(label("…", 13., MUTED)).frame(false))
-                    .on_hover_text("Edit the full path")
-                    .clicked()
-            {
-                self.start_path();
             }
             for (idx, (text, path)) in crumbs.iter().enumerate().skip(start) {
                 if idx > start {
@@ -646,9 +643,6 @@ impl PanelUi {
                 self.start_path();
             }
             path_response.on_hover_text(display_path.display().to_string());
-        }
-        if icon_button(&mut ui, Icon::More, "Location and view options", true).clicked() {
-            self.start_path();
         }
     }
 

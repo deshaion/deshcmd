@@ -1356,3 +1356,48 @@ fn review_multivolume_archive_effects_include_virtual_members() {
         false
     ));
 }
+
+#[test]
+fn deleting_focused_rows_prefers_the_next_survivor_then_the_previous_one() {
+    let fixture = tempfile::tempdir().unwrap();
+    let root = fixture.path().canonicalize().unwrap();
+    let [a, b, c, d, e] = ["a", "b", "c", "d", "e"].map(|name| root.join(name));
+    for path in [&a, &b, &c, &d, &e] {
+        std::fs::write(path, "").unwrap();
+    }
+    let mut engine = Engine::new(
+        root.clone(),
+        [root.clone(), root],
+        Settings {
+            auto_refresh: false,
+            ..Default::default()
+        },
+        || {},
+    );
+    let side = Side::Left;
+    settle_views(&mut engine, |engine| !engine.tab(side).busy());
+
+    for (focused, removed, expected) in [
+        (&b, vec![b.clone(), c], Some(&d)),
+        (&e, vec![e.clone()], Some(&d)),
+        (&d, vec![a.clone(), d.clone()], None),
+    ] {
+        engine.dispatch(Command::Select(side, focused.clone(), Select::Focus));
+        engine.dispatch(Command::Queue(
+            Operation::Delete {
+                paths: removed,
+                trash: false,
+            },
+            false,
+        ));
+        settle_views(&mut engine, |engine| {
+            engine.jobs.last().unwrap().state.finished() && !engine.tab(side).busy()
+        });
+        assert_eq!(engine.jobs.last().unwrap().state, JobState::Done);
+        assert_eq!(
+            engine.tab(side).current().map(|entry| &entry.path),
+            expected
+        );
+        assert_eq!(engine.take_cursor_restored(side), expected.is_some());
+    }
+}
