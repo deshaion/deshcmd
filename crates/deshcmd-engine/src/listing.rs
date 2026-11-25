@@ -1,3 +1,4 @@
+use crate::read_pool::Cancellation;
 use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
@@ -58,18 +59,24 @@ impl Entry {
         self.kind == Kind::Folder
     }
 
-    fn from_path(path: PathBuf, comments: &HashMap<String, String>) -> io::Result<Self> {
+    fn from_path(
+        path: PathBuf,
+        comments: &HashMap<String, String>,
+        cancel: &Cancellation,
+    ) -> io::Result<Self> {
         let metadata = path.symlink_metadata()?;
-        Ok(Self::from_metadata(path, metadata, comments))
+        Self::from_metadata(path, metadata, comments, cancel)
     }
 
     fn from_metadata(
         path: PathBuf,
         link_meta: Metadata,
         comments: &HashMap<String, String>,
-    ) -> Self {
+        cancel: &Cancellation,
+    ) -> io::Result<Self> {
         let link = link_meta.is_symlink();
         let meta = if link {
+            cancel.check()?;
             path.metadata().unwrap_or(link_meta)
         } else {
             link_meta
@@ -103,7 +110,7 @@ impl Entry {
         };
         #[cfg(not(windows))]
         let system_hidden = false;
-        Self {
+        Ok(Self {
             path,
             archive: None,
             extension,
@@ -118,7 +125,7 @@ impl Entry {
             comment: comments.get(&name).cloned().unwrap_or_default(),
             name,
             attributes,
-        }
+        })
     }
     pub(crate) fn archive(
         source: &Arc<crate::ArchiveSource>,
@@ -243,7 +250,7 @@ pub struct Sort {
     pub descending: bool,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct MatchOptions {
     pub text: String,
     pub case_sensitive: bool,
@@ -371,9 +378,42 @@ pub(crate) fn compile_mask(
     builder.build().map(Some).map_err(io::Error::other)
 }
 
+// A value snapshot avoids holding a mount open after navigation.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DirectoryIdentity(u64, u64);
+
+pub(crate) fn directory_identity(path: &Path) -> Option<DirectoryIdentity> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let meta = path.metadata().ok()?;
+        meta.is_dir()
+            .then(|| DirectoryIdentity(meta.dev(), meta.ino()))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        None
+    }
+}
+
+fn has_hard_links(metadata: &Metadata) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        metadata.is_file() && metadata.nlink() > 1
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = metadata;
+        false
+    }
+}
+
 pub(crate) struct Scan {
     pub entries: Vec<Entry>,
     pub skipped: usize,
+    pub has_hard_links: bool,
 }
 impl Scan {
     fn push(&mut self, result: io::Result<Entry>) {
@@ -384,20 +424,36 @@ impl Scan {
     }
 }
 
-pub(crate) fn scan(location: &Location, recursive: bool) -> io::Result<Scan> {
+#[cfg(test)]
+fn scan(location: &Location, recursive: bool) -> io::Result<Scan> {
+    scan_cancellable(location, recursive, &Default::default(), |_| {})
+}
+
+pub(crate) fn scan_cancellable(
+    location: &Location,
+    recursive: bool,
+    cancel: &Cancellation,
+    mut observe: impl FnMut(&Entry),
+) -> io::Result<Scan> {
+    cancel.check()?;
     #[cfg(feature = "perf")]
     let mut timing = crate::perf::ScanTiming::new();
     let mut scan = Scan {
         entries: Vec::new(),
         skipped: 0,
+        has_hard_links: false,
     };
 
     if let Location::Directory(path) = location
         && !recursive
     {
-        let directory = fs::read_dir(path)?;
+        let mut directory = fs::read_dir(path)?;
         let mut comments = None;
-        for item in directory {
+        while let Some(item) = {
+            cancel.check()?;
+            directory.next()
+        } {
+            cancel.check()?;
             let item = match item {
                 Ok(item) => item,
                 Err(_) => {
@@ -410,15 +466,25 @@ pub(crate) fn scan(location: &Location, recursive: bool) -> io::Result<Scan> {
                 timing.comment_read();
                 crate::operations::read_comments(path)
             });
+            cancel.check()?;
+            let mut found_hard_links = false;
             let load = || {
                 // DirEntry metadata describes the link itself, as symlink_metadata does.
                 let metadata = item.metadata()?;
-                Ok(Entry::from_metadata(item.path(), metadata, comments))
+                found_hard_links = has_hard_links(&metadata);
+                Entry::from_metadata(item.path(), metadata, comments, cancel)
             };
             #[cfg(feature = "perf")]
             let result = timing.entry(load);
             #[cfg(not(feature = "perf"))]
-            let result = load();
+            let result = {
+                let mut load = load;
+                load()
+            };
+            if let Ok(entry) = &result {
+                observe(entry);
+            }
+            scan.has_hard_links |= found_hard_links;
             scan.push(result);
         }
         #[cfg(feature = "perf")]
@@ -429,7 +495,11 @@ pub(crate) fn scan(location: &Location, recursive: bool) -> io::Result<Scan> {
     let mut paths = Vec::new();
     match location {
         Location::Directory(path) => {
-            for entry in walkdir::WalkDir::new(path).min_depth(1) {
+            let mut walker = walkdir::WalkDir::new(path).min_depth(1).into_iter();
+            while let Some(entry) = {
+                cancel.check()?;
+                walker.next()
+            } {
                 match entry {
                     Ok(entry) => paths.push(entry.into_path()),
                     Err(error) if error.depth() == 0 => return Err(error.into()),
@@ -440,7 +510,12 @@ pub(crate) fn scan(location: &Location, recursive: bool) -> io::Result<Scan> {
         Location::Flat { roots, .. } => {
             let mut seen = HashSet::new();
             for root in roots {
-                for entry in walkdir::WalkDir::new(root) {
+                cancel.check()?;
+                let mut walker = walkdir::WalkDir::new(root).into_iter();
+                while let Some(entry) = {
+                    cancel.check()?;
+                    walker.next()
+                } {
                     match entry {
                         Ok(entry) if !entry.file_type().is_dir() => {
                             let path = entry.into_path();
@@ -459,17 +534,19 @@ pub(crate) fn scan(location: &Location, recursive: bool) -> io::Result<Scan> {
         }
         Location::List { paths: list, .. } => {
             let mut seen = HashSet::new();
-            paths.extend(
-                list.iter()
-                    .filter(|path| seen.insert(path.as_path()))
-                    .cloned(),
-            );
+            for path in list {
+                cancel.check()?;
+                if seen.insert(path.as_path()) {
+                    paths.push(path.clone());
+                }
+            }
         }
         Location::Archive { .. } => unreachable!(),
     }
     scan.entries.reserve_exact(paths.len());
     let mut cache = HashMap::new();
     for path in paths {
+        cancel.check()?;
         let folder = path.parent().unwrap_or(location.base());
         let comments = if let Some(comments) = cache.get(folder) {
             comments
@@ -480,7 +557,8 @@ pub(crate) fn scan(location: &Location, recursive: bool) -> io::Result<Scan> {
             let comments = crate::operations::read_comments(folder);
             cache.entry(key).or_insert(comments)
         };
-        let load = || Entry::from_path(path, comments);
+        cancel.check()?;
+        let load = || Entry::from_path(path, comments, cancel);
         #[cfg(feature = "perf")]
         let result = timing.entry(load);
         #[cfg(not(feature = "perf"))]
@@ -492,15 +570,84 @@ pub(crate) fn scan(location: &Location, recursive: bool) -> io::Result<Scan> {
     Ok(scan)
 }
 
-pub(crate) fn sort(entries: &mut [Entry], columns: &[Sort], dirs_first: bool, natural: bool) {
+pub(crate) fn patch_directory(
+    directory: &Path,
+    base: &crate::views::Raw,
+    paths: &[PathBuf],
+    cancel: &Cancellation,
+) -> io::Result<Scan> {
+    let check_directory = || -> io::Result<()> {
+        cancel.check()?;
+        let identity = directory_identity(directory);
+        if identity.is_some() && base.directory == identity {
+            Ok(())
+        } else {
+            Err(io::Error::other("The directory was replaced"))
+        }
+    };
+    check_directory()?;
+    let mut touched: HashSet<_> = paths.iter().map(PathBuf::as_path).collect();
+    let mut entries = Vec::with_capacity(base.entries.len().saturating_add(paths.len()));
+    for entry in &base.entries {
+        cancel.check()?;
+        if entry.link {
+            // A same-directory change can also change what a link resolves to.
+            touched.insert(&entry.path);
+        } else if !touched.contains(entry.path.as_path()) {
+            entries.push(entry.clone());
+        }
+    }
+
+    let comments = crate::operations::read_comments(directory);
+    let mut metadata_reads = 0;
+    for path in touched {
+        cancel.check()?;
+        metadata_reads += 1;
+        match path.symlink_metadata() {
+            Ok(metadata) if has_hard_links(&metadata) => {
+                return Err(io::Error::other(
+                    "A file can have other names in the listing",
+                ));
+            }
+            Ok(metadata) => entries.push(Entry::from_metadata(
+                path.to_owned(),
+                metadata,
+                &comments,
+                cancel,
+            )?),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    check_directory()?;
+    #[cfg(feature = "perf")]
+    crate::perf::patch_reads(metadata_reads);
+    #[cfg(not(feature = "perf"))]
+    let _ = metadata_reads;
+    Ok(Scan {
+        entries,
+        skipped: 0,
+        has_hard_links: false,
+    })
+}
+
+pub(crate) fn sorted_order_from(
+    entries: &[Entry],
+    columns: &[Sort],
+    dirs_first: bool,
+    natural: bool,
+    previous: Option<&[usize]>,
+    cancel: &Cancellation,
+) -> io::Result<Vec<usize>> {
     #[cfg(feature = "perf")]
     let started = crate::perf::timestamp();
-    let names: Vec<_> = entries
-        .iter()
-        .map(|entry| fold(&entry.name, false))
-        .collect();
-    let mut order: Vec<_> = (0..entries.len()).collect();
-    order.sort_by(|&left, &right| {
+    let mut names = Vec::with_capacity(entries.len());
+    for entry in entries {
+        cancel.check()?;
+        names.push(fold(&entry.name, false));
+    }
+    let mut order = previous.map_or_else(|| (0..entries.len()).collect(), <[usize]>::to_vec);
+    let compare = |&left: &usize, &right: &usize| {
         let (a, b) = (&entries[left], &entries[right]);
         let by_name = || compare_names(&names[left], &names[right], natural);
         if dirs_first && a.is_dir() != b.is_dir() {
@@ -526,8 +673,54 @@ pub(crate) fn sort(entries: &mut [Entry], columns: &[Sort], dirs_first: bool, na
             }
         }
         by_name().then_with(|| a.path.cmp(&b.path))
-    });
-    drop(names);
+    };
+    const RUN: usize = 8192;
+    for run in order.chunks_mut(RUN) {
+        cancel.check()?;
+        run.sort_by(compare);
+    }
+    if order.len() > RUN {
+        let mut merged = Vec::with_capacity(order.len());
+        let mut width = RUN;
+        while width < order.len() {
+            merged.clear();
+            for pair in order.chunks(width * 2) {
+                let (left, right) = pair.split_at(width.min(pair.len()));
+                let (mut a, mut b) = (0, 0);
+                while a < left.len() && b < right.len() {
+                    cancel.check()?;
+                    if compare(&left[a], &right[b]).is_gt() {
+                        merged.push(right[b]);
+                        b += 1;
+                    } else {
+                        merged.push(left[a]);
+                        a += 1;
+                    }
+                }
+                merged.extend_from_slice(&left[a..]);
+                merged.extend_from_slice(&right[b..]);
+            }
+            std::mem::swap(&mut order, &mut merged);
+            width *= 2;
+        }
+    }
+    cancel.check()?;
+    #[cfg(feature = "perf")]
+    crate::perf::elapsed("sort", started);
+    Ok(order)
+}
+
+#[cfg(test)]
+fn sort(entries: &mut [Entry], columns: &[Sort], dirs_first: bool, natural: bool) {
+    let mut order = sorted_order_from(
+        entries,
+        columns,
+        dirs_first,
+        natural,
+        None,
+        &Default::default(),
+    )
+    .unwrap();
     // Each cycle moves entries into their final positions without a second row buffer.
     for start in 0..order.len() {
         let mut position = start;
@@ -539,8 +732,6 @@ pub(crate) fn sort(entries: &mut [Entry], columns: &[Sort], dirs_first: bool, na
         }
         order[position] = position;
     }
-    #[cfg(feature = "perf")]
-    crate::perf::elapsed("sort", started);
 }
 
 fn compare_names(a: &str, b: &str, natural: bool) -> Ordering {

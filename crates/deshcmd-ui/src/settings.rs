@@ -345,8 +345,6 @@ impl App {
         }
 
         let settings = &mut self.engine.settings;
-        let refresh = settings.directories_first != draft.directories_first
-            || settings.natural_sort != draft.natural_sort;
         let toggle_hidden = settings.show_hidden != draft.show_hidden;
         settings.stacked = draft.stacked;
         settings.split = draft.split;
@@ -354,8 +352,6 @@ impl App {
         settings.auto_refresh = draft.auto_refresh;
         settings.confirm_trash = draft.confirm_trash;
         settings.confirm_delete = draft.confirm_delete;
-        settings.natural_sort = draft.natural_sort;
-        settings.directories_first = draft.directories_first;
         settings.show_modified_time = draft.show_modified_time;
         settings.columns.clone_from(&draft.columns);
         settings
@@ -375,9 +371,8 @@ impl App {
         if toggle_hidden {
             self.engine.dispatch(Command::ToggleHidden);
         }
-        if refresh {
-            self.engine.dispatch(Command::Refresh);
-        }
+        self.engine
+            .set_sort_preferences(draft.natural_sort, draft.directories_first);
         ctx.request_repaint();
         Ok(())
     }

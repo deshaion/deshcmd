@@ -122,6 +122,7 @@ pub(crate) struct Dialog {
     focus: bool,
     focus_footer: bool,
     error: Option<String>,
+    validating: Option<(u64, u64)>,
 }
 
 impl Dialog {
@@ -152,6 +153,7 @@ impl Dialog {
                 Kind::Delete | Kind::DeleteArchiveMembers | Kind::Unpack
             ),
             error: None,
+            validating: None,
         }
     }
     pub fn transfer(side: Side, paths: Vec<PathBuf>, destination: PathBuf, moving: bool) -> Self {
@@ -476,11 +478,19 @@ fn details_text(
 
 impl App {
     pub(crate) fn invoke(&mut self, side: Side, tool: Tool, ctx: &egui::Context) {
+        self.cancel_dialog_read();
         if matches!(tool, Tool::Settings) {
             self.open_settings(ctx);
             return;
         }
         let tab = self.engine.tab(side);
+        if matches!(tool, Tool::ExportDetails)
+            && tab.marked_count() == 0
+            && tab.incomplete_listing()
+        {
+            self.notice("Wait for the directory to finish loading before exporting all details");
+            return;
+        }
         let base = tab.base().to_owned();
         let other_tab = self.engine.tab(side.other());
         let other = other_tab.base().to_owned();
@@ -847,6 +857,22 @@ impl App {
                         vec![entry.path.clone()],
                     );
                     dialog.description = describe(entry);
+                    if entry.archive.is_none() {
+                        let path = entry.path.clone();
+                        self.read_for_tab(
+                            side,
+                            move || engine::local_properties(&path),
+                            move |app, _, extra| {
+                                if let (Some(dialog), Some(extra)) = (&mut app.dialog, extra)
+                                    && dialog.kind == Kind::Inspect
+                                    && dialog.side == side
+                                {
+                                    dialog.description.push('\n');
+                                    dialog.description.push_str(&extra);
+                                }
+                            },
+                        );
+                    }
                     Some(dialog)
                 } else {
                     self.notice(empty());
@@ -892,18 +918,21 @@ impl App {
                 None
             }
             Tool::Combine if tab.has_operands() => {
-                let parts = match tab.single_operand() {
-                    Some(entry) => engine::numbered_parts(&entry.path),
-                    None => tab.operands(),
-                };
-                let filename = parts[0].file_stem().unwrap_or_default().to_string_lossy();
-                let mut dialog =
-                    Dialog::new(Kind::Combine, tool, side, "Combine files", parts.clone());
-                dialog.primary = other
-                    .join(format!("{filename}.joined"))
-                    .display()
-                    .to_string();
-                Some(dialog)
+                if let Some(entry) = tab.single_operand() {
+                    let path = entry.path.clone();
+                    self.read_for_tab(
+                        side,
+                        move || engine::numbered_parts(&path),
+                        move |app, _, parts| {
+                            if app.dialog.is_none() {
+                                app.dialog = Some(combine_dialog(side, &other, parts));
+                            }
+                        },
+                    );
+                    None
+                } else {
+                    Some(combine_dialog(side, &other, tab.operands()))
+                }
             }
             Tool::Combine => {
                 self.notice("Select the numbered parts or their first file");
@@ -1064,14 +1093,18 @@ impl App {
             }
             Tool::MarksFile | Tool::ListFile => {
                 if let Some(path) = self.desktop.pick_file(&base, "Open text file with paths") {
-                    match engine::read_list(&path) {
-                        Ok(text) => self.engine.dispatch(if matches!(tool, Tool::MarksFile) {
-                            Command::LoadMarks(side, text)
-                        } else {
-                            Command::LoadList(side, text)
-                        }),
-                        Err(error) => self.notice(error.to_string()),
-                    }
+                    self.read_for_tab(
+                        side,
+                        move || engine::read_list(&path),
+                        move |app, _, result| match result {
+                            Ok(text) => app.engine.dispatch(if matches!(tool, Tool::MarksFile) {
+                                Command::LoadMarks(side, text)
+                            } else {
+                                Command::LoadList(side, text)
+                            }),
+                            Err(error) => app.notice(error.to_string()),
+                        },
+                    );
                 }
                 None
             }
@@ -1185,18 +1218,22 @@ impl App {
             }
             Tool::ImportTabs | Tool::ImportBookmarks => {
                 if let Some(file) = self.desktop.pick_file(&base, "Import workspace data") {
-                    let result = engine::read_list(&file).and_then(|text| {
-                        let command = if matches!(tool, Tool::ImportTabs) {
-                            Command::RestoreTabs(serde_json::from_str(&text)?)
-                        } else {
-                            Command::ImportBookmarks(serde_json::from_str(&text)?)
-                        };
-                        self.engine.dispatch(command);
-                        Ok(())
-                    });
-                    if let Err(error) = result {
-                        self.notice(error.to_string());
-                    }
+                    self.read_for_tab(
+                        side,
+                        move || {
+                            engine::read_list(&file).and_then(|text| {
+                                Ok(if matches!(tool, Tool::ImportTabs) {
+                                    Command::RestoreTabs(serde_json::from_str(&text)?)
+                                } else {
+                                    Command::ImportBookmarks(serde_json::from_str(&text)?)
+                                })
+                            })
+                        },
+                        |app, _, result| match result {
+                            Ok(command) => app.engine.dispatch(command),
+                            Err(error) => app.notice(error.to_string()),
+                        },
+                    );
                 }
                 None
             }
@@ -1224,6 +1261,14 @@ impl App {
             return;
         }
         let mut dialog = self.dialog.take().unwrap();
+        if dialog
+            .validating
+            .is_some_and(|origin| origin != self.engine.tab(dialog.side).navigation_stamp())
+        {
+            self.cancel_dialog_read();
+            return;
+        }
+        let validating = dialog.validating.is_some();
         let mut outcome = Outcome::None;
         let title = dialog.title.clone();
         let response = egui::Modal::new(Id::unique("deshcmd-operation-modal")).show(ctx, |ui| {
@@ -1245,7 +1290,13 @@ impl App {
                     &mut outcome,
                 );
             } else {
-                draw_fields(ui, &mut dialog, &mut outcome);
+                ui.add_enabled_ui(!validating, |ui| draw_fields(ui, &mut dialog, &mut outcome));
+                if validating {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label(label("Checking destination…", 12., SUB));
+                    });
+                }
             }
             if let Some(error) = dialog.error.as_deref() {
                 ui.label(label(error, 12., RED));
@@ -1339,9 +1390,13 @@ impl App {
         if response.should_close() && matches!(outcome, Outcome::None) {
             outcome = Outcome::Close;
         }
+        if validating && !matches!(outcome, Outcome::Close) {
+            self.dialog = Some(dialog);
+            return;
+        }
         match outcome {
             Outcome::None => self.dialog = Some(dialog),
-            Outcome::Close => {}
+            Outcome::Close => self.cancel_dialog_read(),
             Outcome::Browse => {
                 let initial = self.engine.tab(dialog.side).base();
                 if let Some(path) = self.desktop.pick_directory(initial, "Choose destination") {
@@ -1359,6 +1414,18 @@ impl App {
                 }
             }
             Outcome::Submit(held) => {
+                match self.probe_dialog_destination(&mut dialog, held) {
+                    Ok(true) => {
+                        self.dialog = Some(dialog);
+                        return;
+                    }
+                    Ok(false) => {}
+                    Err(error) => {
+                        dialog.error = Some(error);
+                        self.dialog = Some(dialog);
+                        return;
+                    }
+                }
                 if let Err(error) = self.submit(&dialog, held, ctx) {
                     dialog.error = Some(error);
                     self.dialog = Some(dialog);
@@ -1457,6 +1524,58 @@ impl App {
         } else {
             ctx.data_mut(|data| data.insert_temp(checkbox, all));
         }
+    }
+
+    fn probe_dialog_destination(
+        &mut self,
+        dialog: &mut Dialog,
+        held: bool,
+    ) -> Result<bool, String> {
+        let side = dialog.side;
+        let tab = self.engine.tab(side);
+        let path = |text: &str| absolute_input(tab.base(), &self.engine.home, text);
+        let (paths, message) = match dialog.kind {
+            Kind::Transfer | Kind::Split => (
+                vec![path(&dialog.primary)?],
+                "Choose an existing destination folder",
+            ),
+            Kind::Bookmark => {
+                if dialog.primary.trim().is_empty() {
+                    return Err("Enter a bookmark name".into());
+                }
+                let mut paths = vec![path(&dialog.secondary)?];
+                if dialog.flags[0] {
+                    paths.push(path(&dialog.description)?);
+                }
+                (paths, "Choose existing bookmark folders")
+            }
+            _ => return Ok(false),
+        };
+        dialog.validating = Some(tab.navigation_stamp());
+        dialog.error = None;
+        self.read_for_tab(
+            side,
+            move || paths.iter().all(|path| path.is_dir()),
+            move |app, ctx, valid| {
+                let Some(mut dialog) = app.dialog.take() else {
+                    return;
+                };
+                if dialog.validating.take().is_none() {
+                    app.dialog = Some(dialog);
+                    return;
+                }
+                let result = if valid {
+                    app.submit(&dialog, held, ctx)
+                } else {
+                    Err(message.into())
+                };
+                if let Err(error) = result {
+                    dialog.error = Some(error);
+                    app.dialog = Some(dialog);
+                }
+            },
+        );
+        Ok(true)
     }
 
     fn submit(&mut self, dialog: &Dialog, held: bool, ctx: &egui::Context) -> Result<(), String> {
@@ -1573,9 +1692,6 @@ impl App {
             },
             Kind::Transfer => {
                 let destination = path_input(primary)?;
-                if !destination.is_dir() {
-                    return Err("Choose an existing destination folder".into());
-                }
                 queue(Operation::Transfer {
                     paths: paths.clone(),
                     destination,
@@ -1636,9 +1752,6 @@ impl App {
                     .filter(|value| *value > 0)
                     .ok_or("Enter a positive part size or count")?;
                 let destination = path_input(primary)?;
-                if !destination.is_dir() {
-                    return Err("Choose an existing destination folder".into());
-                }
                 queue(Operation::Split {
                     source: item()?,
                     destination,
@@ -1698,9 +1811,6 @@ impl App {
                 let other = flags[0]
                     .then(|| path_input(&dialog.description))
                     .transpose()?;
-                if !path.is_dir() || other.as_ref().is_some_and(|folder| !folder.is_dir()) {
-                    return Err("Choose existing bookmark folders".into());
-                }
                 let bookmark = Bookmark {
                     name: primary.trim().to_owned(),
                     path,
@@ -1715,7 +1825,7 @@ impl App {
             }
             Kind::Eject => {
                 self.desktop.eject(&item()?)?;
-                self.places = self.desktop.places();
+                self.places_cache.expire(&());
                 self.engine.dispatch(Command::Refresh);
                 self.notice("Volume unmounted");
                 return Ok(());
@@ -2234,6 +2344,17 @@ fn filename(input: &str) -> Result<&Path, String> {
     }
     Ok(path)
 }
+fn combine_dialog(side: Side, other: &Path, parts: Vec<PathBuf>) -> Dialog {
+    let filename = parts[0].file_stem().unwrap_or_default().to_string_lossy();
+    let output = other
+        .join(format!("{filename}.joined"))
+        .display()
+        .to_string();
+    let mut dialog = Dialog::new(Kind::Combine, Tool::Combine, side, "Combine files", parts);
+    dialog.primary = output;
+    dialog
+}
+
 fn describe(entry: &Entry) -> String {
     use std::fmt::Write;
     let fmt = |time: Option<std::time::SystemTime>| {
@@ -2259,9 +2380,6 @@ fn describe(entry: &Entry) -> String {
         fmt(entry.created),
         fmt(entry.accessed)
     );
-    if let Some(extra) = engine::local_properties(&entry.path) {
-        let _ = write!(output, "\n{extra}");
-    }
     if !entry.comment.is_empty() {
         let _ = write!(output, "\nComment  {}", entry.comment);
     }
@@ -2317,7 +2435,7 @@ mod tests {
             true,
         );
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while app.engine.tab(Side::Left).loading {
+        while app.engine.tab(Side::Left).busy() {
             app.engine.poll();
             assert!(std::time::Instant::now() < deadline);
             std::thread::sleep(std::time::Duration::from_millis(5));
@@ -2379,7 +2497,7 @@ mod tests {
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
             loop {
                 app.engine.poll();
-                if !app.engine.tab(Side::Left).loading
+                if !app.engine.tab(Side::Left).busy()
                     && (!job
                         || app
                             .engine
@@ -2483,13 +2601,21 @@ mod tests {
                 let _ = send.send(());
             },
         );
-        while engine.tab(Side::Left).loading {
+        while engine.tab(Side::Left).busy() {
             wake.recv_timeout(std::time::Duration::from_secs(5))
                 .unwrap();
             engine.poll();
         }
+        let settle = |engine: &mut engine::Engine| {
+            while engine.tab(Side::Left).busy() {
+                wake.recv_timeout(std::time::Duration::from_secs(5))
+                    .unwrap();
+                engine.poll();
+            }
+        };
         let side = Side::Left;
         engine.dispatch(Command::Filter(side, MatchOptions::filename("file")));
+        settle(&mut engine);
         let columns = &[Column::Name, Column::Comment];
         assert_eq!(
             details_text(engine.tab(side), columns, true, true),
@@ -2530,6 +2656,7 @@ mod tests {
             "file2.txt\tone two\nfile10.txt\t"
         );
         engine.dispatch(Command::Sort(side, Column::Name, false));
+        settle(&mut engine);
         assert_eq!(
             details_text(engine.tab(side), columns, true, true),
             "file10.txt\t\nfile2.txt\tone two"

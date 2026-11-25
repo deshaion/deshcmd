@@ -449,3 +449,32 @@ fn listing_labels_and_archive_display_paths_distinguish_entry_kinds() {
         assert_eq!(location.display_path(), display_path);
     }
 }
+
+#[test]
+fn bounded_sort_runs_merge_to_the_frozen_global_order() {
+    let names = [
+        "part2.txt",
+        "part02.txt",
+        "part10.txt",
+        "café.txt",
+        "CAFE.txt",
+        "Σ.txt",
+    ];
+    let mut actual: Vec<_> = (0..20_005)
+        .rev()
+        .map(|index| entry(names[(index * 17) % names.len()], index))
+        .collect();
+    let mut expected = actual.clone();
+    let columns = [Sort {
+        column: Column::Name,
+        descending: true,
+    }];
+    reference_sort(&mut expected, &columns, true, true);
+    sort(&mut actual, &columns, true, true);
+    assert!(
+        actual
+            .iter()
+            .zip(expected)
+            .all(|(actual, expected)| actual.path == expected.path)
+    );
+}

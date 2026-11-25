@@ -1000,7 +1000,21 @@ impl std::fmt::Debug for ArchiveSource {
 }
 
 #[derive(Default)]
-pub(crate) struct ArchiveCache(Mutex<ArchiveCacheState>);
+pub(crate) struct ArchiveCache {
+    state: Mutex<ArchiveCacheState>,
+    listing_files: Mutex<HashSet<PathBuf>>,
+}
+
+pub(crate) struct ListingReservation {
+    cache: Arc<ArchiveCache>,
+    file: PathBuf,
+}
+
+impl Drop for ListingReservation {
+    fn drop(&mut self) {
+        self.cache.listing_files.lock().unwrap().remove(&self.file);
+    }
+}
 
 #[derive(Default)]
 struct ArchiveCacheState {
@@ -1010,9 +1024,21 @@ struct ArchiveCacheState {
 }
 
 impl ArchiveCache {
+    pub(crate) fn reserve_listing(self: &Arc<Self>, file: &Path) -> Option<ListingReservation> {
+        let mut listings = self.listing_files.lock().unwrap();
+        if listings.contains(file) {
+            return None;
+        }
+        listings.insert(file.to_owned());
+        Some(ListingReservation {
+            cache: self.clone(),
+            file: file.to_owned(),
+        })
+    }
+
     fn source(&self, file: &Path) -> io::Result<Arc<ArchiveSource>> {
         let stamp = FileRevision::new(&file.metadata()?);
-        let mut state = self.0.lock().unwrap();
+        let mut state = self.state.lock().unwrap();
         if let Some(index) = state.sources.iter().position(|source| source.file == file) {
             let source = state.sources.remove(index).unwrap();
             if source.stamp == stamp {
@@ -1036,7 +1062,7 @@ impl ArchiveCache {
     }
 
     pub(crate) fn set_password(&self, file: &Path, password: String) {
-        let mut state = self.0.lock().unwrap();
+        let mut state = self.state.lock().unwrap();
         if password.is_empty() {
             state.passwords.remove(file);
         } else {
@@ -1046,17 +1072,26 @@ impl ArchiveCache {
     }
 
     pub(crate) fn password(&self, file: &Path) -> Option<Arc<str>> {
-        self.0.lock().unwrap().passwords.get(file).cloned()
+        self.state.lock().unwrap().passwords.get(file).cloned()
+    }
+
+    pub(crate) fn invalidate_inventories(&self, affected: impl Fn(&Path) -> bool) {
+        self.state
+            .lock()
+            .unwrap()
+            .sources
+            .retain(|source| !affected(&source.file));
     }
 
     pub(crate) fn clear_inventories(&self) {
-        self.0.lock().unwrap().sources.clear();
+        self.state.lock().unwrap().sources.clear();
     }
 }
 
 impl ArchiveSource {
     fn inventory(&self, control: &Control) -> io::Result<Arc<Inventory>> {
         let mut cached = self.inventory.lock().unwrap();
+        control.check()?;
         if let Some(inventory) = cached.as_ref() {
             return Ok(inventory.clone());
         }
@@ -1114,12 +1149,16 @@ pub(crate) fn scan(
     file: &Path,
     folder: &Path,
     recursive: bool,
+    cancel: &crate::read_pool::Cancellation,
 ) -> io::Result<Scan> {
+    cancel.check()?;
     let source = cache.source(file)?;
-    let inventory = source.inventory(&Control::default())?;
+    let inventory = source.inventory(&Control::for_read(cancel))?;
+    cancel.check()?;
     let mut rows = BTreeMap::new();
     let mut folder_exists = folder.as_os_str().is_empty();
     for member in &inventory.members {
+        cancel.check()?;
         let Ok(relative) = member.path.strip_prefix(folder) else {
             continue;
         };
@@ -1157,6 +1196,7 @@ pub(crate) fn scan(
             .map(|(path, (folder, size))| Entry::archive(&source, path, folder, size))
             .collect(),
         skipped: inventory.skipped,
+        has_hard_links: false,
     })
 }
 

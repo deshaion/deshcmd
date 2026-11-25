@@ -62,6 +62,8 @@ impl eframe::App for App {
 
 ## Workflow and verification
 
+For every bug fix or review finding, start by writing a focused unit test that reproduces the reported behavior. Run it against the existing implementation and confirm it fails for the expected reason. Then fix the issue, rerun the same test to confirm it passes, and run the relevant broader checks. Keep the test as regression coverage.
+
 Exercise the full workflow when changing behavior. Open an audio file with the native dialog, play and seek, capture the playhead into a marker, edit its metadata, and export from the marker list. Verify seeking against an audio device on the target desktop. Include CUE import and export when changing timestamps or marker metadata. [Feature behavior](FEATURES.md) · [Build and integration checks](README.md)
 
 Make the export plan independently testable. Validate segment bounds and output names before starting FFmpeg. Pass an argument list directly to `std::process::Command`, capture failures per segment, and show progress from the worker. Exercise open, seek boundaries, marker edits, and export planning headlessly. Use an egui test harness for focus, shortcut routing, and table interactions, then smoke-test native dialogs, playback, and export with a known audio fixture on the target desktop. [Engine tests](crates/audio-markup-engine/tests/workflow.rs) · [UI tests](crates/audio-markup-ui/src/tests.rs) · [Desktop integration checks](apps/audio-markup-desktop/src/tests.rs)

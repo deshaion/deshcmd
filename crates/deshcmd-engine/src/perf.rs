@@ -72,8 +72,8 @@ impl ScanTiming {
         self.dedup_paths += 1;
     }
 
-    pub(crate) fn finish(self, capacity: usize) {
-        let Some(start) = self.start else {
+    pub(crate) fn finish(mut self, capacity: usize) {
+        let Some(start) = self.start.take() else {
             return;
         };
         let total = start.elapsed();
@@ -98,6 +98,61 @@ impl ScanTiming {
             self.comment_reads,
             self.dedup_paths,
             capacity * std::mem::size_of::<super::Entry>()
+        );
+    }
+}
+
+impl Drop for ScanTiming {
+    fn drop(&mut self) {
+        if self.start.is_some() {
+            eprintln!("counts,incomplete_metadata_attempts={}", self.attempts);
+        }
+    }
+}
+
+static SNAPSHOT_BYTES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+pub(crate) fn snapshot_created(capacity: usize) -> usize {
+    if !enabled() {
+        return 0;
+    }
+    let bytes = capacity * std::mem::size_of::<super::Entry>();
+    let previous = SNAPSHOT_BYTES.fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
+    eprintln!("snapshot,inline_bytes_live,{}", previous + bytes);
+    bytes
+}
+
+pub(crate) fn snapshot_dropped(bytes: usize) {
+    if bytes != 0 {
+        SNAPSHOT_BYTES.fetch_sub(bytes, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+pub(crate) fn view_sort(partial: bool, rows: usize) {
+    if enabled() {
+        eprintln!(
+            "view_sort,{},{rows}",
+            if partial { "partial" } else { "full" }
+        );
+    }
+}
+
+pub(crate) fn patch_reads(paths: usize) {
+    if enabled() {
+        eprintln!("patch,metadata_paths,{paths}");
+    }
+}
+
+pub(crate) fn cache_stats(stats: crate::ListingStats) {
+    if enabled() {
+        eprintln!(
+            "cache,hits={},misses={},scans={},patches={},bytes={},directories={}",
+            stats.cache_hits,
+            stats.cache_misses,
+            stats.full_scans,
+            stats.patches,
+            stats.retained_bytes,
+            stats.retained_directories
         );
     }
 }
