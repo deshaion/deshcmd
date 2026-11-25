@@ -147,6 +147,10 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
       - uses: actions/download-artifact@v8
         with:
           pattern: deshcmd-*
@@ -165,4 +169,4 @@ jobs:
             echo "Expected four packages, found ${#assets[@]}." >&2
             exit 1
           fi
-          gh release upload --repo "$GITHUB_REPOSITORY" -- "$RELEASE_TAG" "${assets[@]}"
+          gh release upload --repo "$GITHUB_REPOSITORY" -- "$RELEASE_TAG" "${assets[@]}" LICENSE

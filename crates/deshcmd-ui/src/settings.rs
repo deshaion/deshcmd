@@ -69,6 +69,7 @@ pub(crate) struct Preferences {
     show_inline_filter: bool,
     show_places: bool,
     show_bottom_bar: bool,
+    ui_font: UiFont,
     alternate_columns: [bool; 2],
     zoom: u32,
     page: Page,
@@ -121,6 +122,15 @@ impl Preferences {
                     {
                         self.zoom = 100;
                     }
+                });
+                ui.label("Interface font");
+                ui.horizontal_wrapped(|ui| {
+                    ui.selectable_value(&mut self.ui_font, UiFont::UbuntuLight, "Ubuntu Light");
+                    ui.selectable_value(
+                        &mut self.ui_font,
+                        UiFont::DejaVuSansMono,
+                        "DejaVu Sans Mono",
+                    );
                 });
             }
             Page::Panels => {
@@ -236,6 +246,7 @@ impl App {
             show_inline_filter: self.interface.show_inline_filter,
             show_places: self.interface.show_places,
             show_bottom_bar: self.interface.show_bottom_bar,
+            ui_font: self.interface.ui_font,
             alternate_columns: self.interface.alternate_columns,
             zoom: zoom_percent(ctx.zoom_factor()),
             page: Page::Interface,
@@ -250,6 +261,11 @@ impl App {
         let viewport = ctx.content_rect().size();
         let width = (viewport.x - 36.).min(620.);
         let height = (viewport.y - 154.).min(330.);
+        let tree_width = if self.interface.ui_font == UiFont::DejaVuSansMono {
+            168.
+        } else {
+            146.
+        };
         let mut cancel = false;
         let mut save = false;
 
@@ -268,10 +284,10 @@ impl App {
                 |ui| {
                     ui.set_height(height);
                     ui.allocate_ui_with_layout(
-                        vec2(146., height),
+                        vec2(tree_width, height),
                         Layout::top_down(Align::Min),
                         |ui| {
-                            ui.set_width(146.);
+                            ui.set_width(tree_width);
                             egui::ScrollArea::vertical()
                                 .id_salt("settings-tree")
                                 .max_height(height)
@@ -351,6 +367,10 @@ impl App {
         self.interface.show_bottom_bar = preferences.show_bottom_bar;
         self.interface.alternate_columns = preferences.alternate_columns;
         ctx.set_zoom_factor(zoom_factor(preferences.zoom));
+        if self.interface.ui_font != preferences.ui_font {
+            self.interface.ui_font = preferences.ui_font;
+            set_ui_font(ctx, preferences.ui_font);
+        }
 
         if toggle_hidden {
             self.engine.dispatch(Command::ToggleHidden);

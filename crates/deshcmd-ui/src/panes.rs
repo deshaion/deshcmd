@@ -897,7 +897,7 @@ fn rows(
                         pos2(x + 41., rect.center().y),
                         Align2::LEFT_CENTER,
                         &entry.name,
-                        FontId::proportional(13.),
+                        FontId::proportional(14.),
                         if marked {
                             TEXT
                         } else if entry.hidden {

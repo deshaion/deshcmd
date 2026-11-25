@@ -1778,7 +1778,7 @@ fn draw_fields(ui: &mut Ui, dialog: &mut Dialog, outcome: &mut Outcome) {
     } = dialog;
     if !description.is_empty() && !matches!(kind, Kind::Bookmark | Kind::HelpDetail | Kind::Inspect)
     {
-        ui.add(egui::Label::new(mono(description.as_str(), 11., SUB)).truncate())
+        ui.add(egui::Label::new(mono(description.as_str(), 12., SUB)).truncate())
             .on_hover_text(description.as_str());
     }
     match kind {

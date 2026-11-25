@@ -857,6 +857,7 @@ dependencies = [
  "deshcmd-engine",
  "eframe",
  "egui_extras",
+ "serde",
  "serde_json",
  "tempfile",
 ]

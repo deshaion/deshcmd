@@ -77,6 +77,7 @@ struct Interface {
     show_inline_filter: bool,
     show_places: bool,
     show_bottom_bar: bool,
+    ui_font: UiFont,
     alternate_columns: [bool; 2],
     quick: Option<Side>,
     clipboard: Option<FileClipboard>,
@@ -106,7 +107,11 @@ impl App {
         initial: [PathBuf; 2],
         fresh: bool,
     ) -> Self {
-        theme::install(&context.egui_ctx);
+        let ui_font = context
+            .storage
+            .and_then(|storage| eframe::get_value(storage, "ui_font"))
+            .unwrap_or_default();
+        theme::install(&context.egui_ctx, ui_font);
         settings::install_zoom(&context.egui_ctx);
         #[cfg(not(target_os = "macos"))]
         context.egui_ctx.options_mut(|options| {
@@ -135,6 +140,7 @@ impl App {
             interface: Interface {
                 tree,
                 alternate_columns,
+                ui_font,
                 show_inline_filter: context
                     .storage
                     .and_then(|storage| eframe::get_value(storage, "show_inline_filter"))
@@ -505,7 +511,7 @@ impl App {
                     && place(
                         ui,
                         Icon::Star,
-                        "Add current folder",
+                        "Bookmark here",
                         "Bookmark the active location",
                         false,
                     )
@@ -1164,6 +1170,8 @@ impl App {
             0.
         } else if root.width() > 1050. {
             184.
+        } else if self.interface.ui_font == UiFont::DejaVuSansMono {
+            176.
         } else {
             158.
         };
@@ -1425,6 +1433,7 @@ impl eframe::App for App {
         );
         eframe::set_value(storage, "show_places", &self.interface.show_places);
         eframe::set_value(storage, "show_bottom_bar", &self.interface.show_bottom_bar);
+        eframe::set_value(storage, "ui_font", &self.interface.ui_font);
         eframe::set_value(
             storage,
             "panel_display",
