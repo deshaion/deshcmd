@@ -1,5 +1,6 @@
 mod dialogs;
 mod panes;
+mod probes;
 mod settings;
 mod text_preview;
 mod theme;
@@ -21,6 +22,11 @@ use dialogs::{Dialog, Tool};
 use panes::PanelUi;
 use theme::*;
 pub use updates::{DesktopUpdate, UpdateCheck};
+
+const COPY_PATH_SHORTCUT: egui::KeyboardShortcut = egui::KeyboardShortcut::new(
+    egui::Modifiers::COMMAND.plus(egui::Modifiers::SHIFT),
+    Key::C,
+);
 
 #[derive(Clone)]
 pub struct Place {
@@ -50,7 +56,9 @@ pub trait Desktop {
     fn clipboard_files(&mut self) -> Vec<PathBuf>;
     fn clipboard_text(&mut self) -> Option<String>;
     fn copy_text(&mut self, text: &str) -> Result<(), String>;
-    fn places(&mut self) -> Vec<Place>;
+    fn places_reader(&self) -> fn() -> Vec<Place> {
+        Vec::new
+    }
     fn eject(&mut self, path: &Path) -> Result<(), String>;
     fn shortcut(&mut self, target: &Path, source: &Path) -> Result<(), String>;
 }
@@ -97,15 +105,28 @@ struct Interface {
     show_help: bool,
 }
 
+type DialogRead = Box<dyn FnOnce(&mut App, &egui::Context) + Send>;
+
+struct StartupHome {
+    read: Option<engine::read_pool::ReadPool<(), PathBuf>>,
+    right_stamp: Option<(u64, u64)>,
+}
+
 pub struct App {
     pub(crate) engine: Engine,
     desktop: Box<dyn Desktop>,
     interface: Interface,
     dialog: Option<Dialog>,
     preferences: Option<settings::Preferences>,
-    places: Vec<Place>,
-    spaces: HashMap<PathBuf, (u64, u64)>,
-    last_places: Instant,
+    places: std::sync::Arc<Vec<Place>>,
+    read_places: fn() -> Vec<Place>,
+    places_cache: probes::ReadCache<(), Vec<Place>>,
+    spaces: probes::ReadCache<PathBuf, (u64, u64)>,
+    tree_folders: probes::ReadCache<PathBuf, Vec<PathBuf>>,
+    dialog_reads: engine::read_pool::ReadPool<(), DialogRead>,
+    dialog_revision: u64,
+    startup_defaults: Option<(PathBuf, bool)>,
+    startup_home: Option<StartupHome>,
     previews: Previews,
     update: Option<updates::UpdateDialog>,
 }
@@ -113,7 +134,7 @@ pub struct App {
 impl App {
     pub fn new(
         context: &eframe::CreationContext<'_>,
-        mut desktop: Box<dyn Desktop>,
+        desktop: Box<dyn Desktop>,
         home: PathBuf,
         initial: [PathBuf; 2],
         fresh: bool,
@@ -142,11 +163,16 @@ impl App {
                 .and_then(|storage| eframe::get_value(storage, "workspace"))
                 .unwrap_or_default()
         };
+        let startup_defaults = (
+            initial[0].clone(),
+            settings.panes[Side::Right.index()].tabs.is_empty(),
+        );
         let ctx = context.egui_ctx.clone();
         let engine = Engine::new(home, initial, settings, move || ctx.request_repaint());
         Self {
             engine,
-            places: desktop.places(),
+            places: Default::default(),
+            read_places: desktop.places_reader(),
             desktop,
             interface: Interface {
                 tree,
@@ -168,11 +194,104 @@ impl App {
             },
             dialog: None,
             preferences: None,
-            spaces: HashMap::new(),
-            last_places: Instant::now(),
+            places_cache: probes::ReadCache::new(&context.egui_ctx, 1, Duration::from_secs(10), 1),
+            spaces: probes::ReadCache::new(&context.egui_ctx, 2, Duration::from_secs(10), 32),
+            tree_folders: probes::ReadCache::new(&context.egui_ctx, 2, Duration::from_secs(5), 192),
+            dialog_reads: engine::read_pool::ReadPool::new(
+                1,
+                1,
+                probes::repaint(&context.egui_ctx),
+            ),
+            dialog_revision: 0,
+            startup_defaults: Some(startup_defaults),
+            startup_home: None,
             previews: Previews::new(context.egui_ctx.clone()),
             update: None,
         }
+    }
+
+    pub fn open_initial_directories(
+        &mut self,
+        ctx: &egui::Context,
+        locations: [Option<PathBuf>; 2],
+    ) {
+        let Some((cwd, default_right)) = self.startup_defaults.take() else {
+            return;
+        };
+        let configured_home = std::mem::replace(&mut self.engine.home, cwd.clone());
+        for (side, path) in Side::ALL.into_iter().zip(locations) {
+            if let Some(path) = path {
+                self.engine.request_initial_directory(side, path);
+            }
+        }
+        let right_stamp = default_right.then(|| self.engine.tab(Side::Right).navigation_stamp());
+        let read = engine::read_pool::ReadPool::new(1, 1, probes::repaint(ctx));
+        read.submit((), move |_| {
+            configured_home
+                .canonicalize()
+                .ok()
+                .filter(|path| path.is_dir())
+                .unwrap_or(cwd)
+        });
+        self.startup_home = Some(StartupHome {
+            read: Some(read),
+            right_stamp,
+        });
+    }
+
+    fn poll_startup_home(&mut self) {
+        let Some(startup) = &mut self.startup_home else {
+            return;
+        };
+        if let Some(read) = &startup.read {
+            let Some(((), home)) = read.drain().pop() else {
+                return;
+            };
+            self.engine.home = home;
+            startup.read = None;
+        }
+        let right = self.engine.tab(Side::Right);
+        if startup.right_stamp == Some(right.navigation_stamp()) {
+            if right.pending_navigation().is_some() {
+                return;
+            }
+            if right.base() != self.engine.home {
+                self.engine
+                    .apply_initial_directory(Side::Right, self.engine.home.clone());
+            }
+        }
+        self.startup_home = None;
+    }
+
+    fn poll_dialog_reads(&mut self, ctx: &egui::Context) {
+        for (_, apply) in self.dialog_reads.drain() {
+            apply(self, ctx);
+        }
+    }
+
+    fn cancel_dialog_read(&mut self) {
+        self.dialog_revision += 1;
+        self.dialog_reads.retain(|()| false);
+    }
+
+    fn read_for_tab<R: Send + 'static>(
+        &self,
+        side: Side,
+        read: impl FnOnce() -> R + Send + 'static,
+        apply: impl FnOnce(&mut Self, &egui::Context, R) + Send + 'static,
+    ) {
+        let revision = self.dialog_revision;
+        let origin = self.engine.tab(side).navigation_stamp();
+        self.dialog_reads.submit((), move |_| {
+            let result = read();
+            Box::new(move |app, ctx| {
+                if app.dialog_revision == revision
+                    && app.engine.tab(side).navigation_stamp() == origin
+                {
+                    apply(app, ctx, result);
+                }
+            })
+        });
     }
 
     fn apply(&mut self, action: Action, ctx: &egui::Context) {
@@ -182,13 +301,11 @@ impl App {
                     self.interface.focus_scroll = Some(side);
                     ctx.request_repaint();
                 }
-                if matches!(command, Command::Queue(..)) {
-                    self.interface.queue = true;
-                }
                 self.engine.dispatch(command);
             }
             Action::Tool(side, tool) => self.invoke(side, tool, ctx),
             Action::Open(side, entry, background) => {
+                self.engine.keep_provisional_focus(side);
                 if entry.archive.is_some() && !entry.is_dir() {
                     self.interface.quick = Some(side);
                 } else if entry.is_dir() || entry.kind == engine::Kind::Archive {
@@ -234,6 +351,7 @@ impl App {
                 self.interface.quick = if self.interface.quick == Some(side) {
                     None
                 } else {
+                    self.engine.keep_provisional_focus(side);
                     Some(side)
                 }
             }
@@ -604,7 +722,7 @@ impl App {
                 }
                 if self.interface.tree {
                     let root = current.ancestors().last().unwrap_or(current).to_path_buf();
-                    panes::tree(ui, side, &root, current, 0, actions);
+                    panes::tree(ui, side, &root, current, 0, &mut self.tree_folders, actions);
                 }
             });
     }
@@ -829,13 +947,27 @@ impl App {
 
     fn clipboard_shortcuts(&mut self, ctx: &egui::Context, actions: &mut Vec<Action>) {
         let (copy, cut, paste) = ctx.input_mut(|input| {
+            let copy_paths = input.events.iter().any(|event| {
+                matches!(
+                    event,
+                    egui::Event::Key { key, modifiers, pressed: true, .. }
+                        if *key == COPY_PATH_SHORTCUT.logical_key
+                            && modifiers.matches_exact(COPY_PATH_SHORTCUT.modifiers)
+                )
+            });
             (
-                input.consume_key(egui::Modifiers::COMMAND, Key::C),
+                input
+                    .consume_key(egui::Modifiers::COMMAND, Key::C)
+                    .then_some(if copy_paths {
+                        Tool::CopyPaths
+                    } else {
+                        Tool::CopyClipboard
+                    }),
                 input.consume_key(egui::Modifiers::COMMAND, Key::X),
                 input.consume_key(egui::Modifiers::COMMAND, Key::V),
             )
         });
-        if !(copy || cut || paste) {
+        if !(copy.is_some() || cut || paste) {
             return;
         }
         let text_context = self.text_field_focused(ctx)
@@ -845,7 +977,7 @@ impl App {
             || self.interface.show_help
             || self.engine.jobs.iter().any(|job| job.conflict.is_some());
         if text_context {
-            let event = if copy {
+            let event = if copy.is_some() {
                 Some(egui::Event::Copy)
             } else if cut {
                 Some(egui::Event::Cut)
@@ -858,8 +990,8 @@ impl App {
                 ctx.input_mut(|input| input.events.push(event));
             }
         } else {
-            let tool = if copy {
-                Tool::CopyClipboard
+            let tool = if let Some(tool) = copy {
+                tool
             } else if cut {
                 Tool::CutClipboard
             } else {
@@ -961,6 +1093,20 @@ impl App {
         if just(Key::Tab) {
             actions.push(Action::Command(Command::Focus(side.other())));
         }
+        let pane = self.engine.pane(side);
+        let tab_count = pane.tabs.len();
+        for (modifiers, offset) in [
+            (egui::Modifiers::CTRL, 1),
+            (
+                egui::Modifiers::CTRL | egui::Modifiers::SHIFT,
+                tab_count - 1,
+            ),
+        ] {
+            if exact(modifiers, Key::Tab) && tab_count > 1 {
+                let index = (pane.active + offset) % tab_count;
+                actions.push(Action::Command(Command::Tab(side, index)));
+            }
+        }
         let initial_press = |modifiers, key| {
             ctx.input_mut(|input| {
                 let mut pressed = false;
@@ -1048,6 +1194,10 @@ impl App {
             actions.push(Action::Command(Command::Invert(side)));
         }
         if just(Key::Escape) {
+            if self.engine.tab(side).pending_navigation().is_some() {
+                actions.push(Action::Command(Command::CancelNavigation(side)));
+                return;
+            }
             actions.push(Action::Command(Command::UnmarkAll(side)));
             self.interface.quick = None;
         }
@@ -1120,6 +1270,7 @@ impl App {
     }
 
     fn shortcuts(&mut self, ctx: &egui::Context) {
+        let copy_path = ctx.format_shortcut(&COPY_PATH_SHORTCUT);
         egui::Window::new("Keyboard shortcuts")
             .open(&mut self.interface.show_help)
             .collapsible(false)
@@ -1135,6 +1286,8 @@ impl App {
                     .body(|mut body| {
                         for (keys, purpose) in [
                             ("Tab", "Switch active panel"),
+                            ("Ctrl + Tab", "Switch to next tab"),
+                            ("Ctrl + Shift + Tab", "Switch to previous tab"),
                             ("Alt + Left / Right", "Go back or forward"),
                             ("Left / Alt + Up", "Go to parent"),
                             ("Right", "Open focused directory"),
@@ -1160,6 +1313,7 @@ impl App {
                             ("F9", "Open terminal in active folder"),
                             ("Shift + Delete", "Delete permanently"),
                             ("Ctrl + C / X / V", "Copy, cut, or paste files"),
+                            (&copy_path, "Copy full paths"),
                         ] {
                             body.row(26., |mut row| {
                                 row.col(|ui| {
@@ -1303,18 +1457,14 @@ impl App {
 
         for (side, rect) in Side::ALL.into_iter().zip([panel1, panel2]) {
             let quick = self.interface.quick.filter(|source| source.other() == side);
-            let parent_focus_restored =
-                quick.is_none() && self.engine.take_parent_focus_restored(side);
+            let cursor_restored = quick.is_none() && self.engine.take_cursor_restored(side);
             let pane = self.engine.pane(side);
             let root = pane.tab().base();
             let space = self
                 .spaces
-                .get(root)
-                .copied()
-                .or_else(|| engine::space(root));
-            if let Some(space) = space {
-                self.spaces.insert(root.to_owned(), space);
-            }
+                .request(root.to_owned(), |path| engine::space(path))
+                .as_deref()
+                .copied();
             let column_set = if self.interface.alternate_columns[side.index()] {
                 &self.engine.settings.alternate_columns
             } else {
@@ -1329,7 +1479,8 @@ impl App {
                 columns: column_set,
                 show_modified_time: self.engine.settings.show_modified_time,
                 show_inline_filter: self.interface.show_inline_filter,
-                reveal_cursor: self.interface.focus_scroll == Some(side) || parent_focus_restored,
+                reveal_cursor: self.interface.focus_scroll == Some(side) || cursor_restored,
+                history_preview: self.engine.history_preview(side),
                 preview: quick.map(|source| (source, self.engine.tab(source).current())),
             };
             self.interface.panes[side.index()].show(
@@ -1375,14 +1526,21 @@ impl App {
 impl eframe::App for App {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.engine.poll();
+        if let Some(delay) = self.engine.listing_wake_after() {
+            ctx.request_repaint_after(delay);
+        }
+        self.poll_startup_home();
         self.poll_update();
         self.record_notice();
         self.previews.poll();
-        if self.last_places.elapsed() >= Duration::from_secs(10) {
-            self.places = self.desktop.places();
-            self.spaces.clear();
-            self.last_places = Instant::now();
+        self.places_cache.poll();
+        let read_places = self.read_places;
+        if let Some(places) = self.places_cache.request((), move |()| Some(read_places())) {
+            self.places = places;
         }
+        self.spaces.poll();
+        self.tree_folders.poll();
+        self.poll_dialog_reads(ctx);
         if self
             .interface
             .notice
@@ -1402,6 +1560,8 @@ impl eframe::App for App {
 
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        self.tree_folders
+            .begin_render_pass(ctx.cumulative_pass_nr());
         #[cfg(target_os = "macos")]
         _frame.set_traffic_lights_position(
             &ctx,

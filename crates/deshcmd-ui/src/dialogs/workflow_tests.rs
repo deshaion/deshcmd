@@ -110,10 +110,17 @@ fn create_rename_link_and_comment_dialogs_validate_and_apply() {
     let renamed = session.left.join("renamed.txt");
     assert!(!created.exists());
     assert_eq!(std::fs::read_to_string(&renamed).unwrap(), "new content");
-    session.focus(&renamed);
+    assert_eq!(
+        session.app.engine.tab(Side::Left).current().unwrap().path,
+        renamed
+    );
+    assert!(session.app.engine.take_cursor_restored(Side::Left));
+    assert!(!session.app.interface.queue);
 
+    session.app.interface.queue = true;
     let hardlink = session.dialog(Tool::Hardlink);
     session.submit(&hardlink);
+    assert!(session.app.interface.queue);
     assert_eq!(
         std::fs::read(session.right.join("renamed.txt")).unwrap(),
         b"new content"
@@ -145,7 +152,23 @@ fn transfer_split_and_checksum_forms_queue_expected_work() {
     let mut copy = session.dialog(Tool::Copy);
     assert_eq!(copy.primary, session.right.display().to_string());
     copy.primary = "missing".into();
-    session.invalid(&copy, "existing destination");
+    assert!(
+        session
+            .app
+            .probe_dialog_destination(&mut copy, false)
+            .unwrap()
+    );
+    session.app.dialog = Some(copy);
+    crate::tests::wait_for_dialog_read(&mut session.app, &session.ctx, |app| {
+        app.dialog.as_ref().is_some_and(|dialog| {
+            dialog
+                .error
+                .as_ref()
+                .is_some_and(|error| error.contains("existing destination"))
+        })
+    });
+    let mut copy = session.app.dialog.take().unwrap();
+    assert!(session.app.engine.jobs.is_empty());
     copy.primary = "~/right".into();
     session.submit(&copy);
     assert_eq!(
@@ -383,7 +406,9 @@ fn named_workspaces_and_numbered_parts_use_dialog_defaults() {
     session.app.engine.dispatch(Command::Refresh);
     session.settle();
     session.focus(&first);
-    let combine = session.dialog(Tool::Combine);
+    session.app.invoke(Side::Left, Tool::Combine, &session.ctx);
+    crate::tests::wait_for_dialog_read(&mut session.app, &session.ctx, |app| app.dialog.is_some());
+    let combine = session.app.dialog.take().unwrap();
     assert_eq!(combine.paths, [first, session.left.join("parts.002")]);
     session.submit(&combine);
     assert_eq!(

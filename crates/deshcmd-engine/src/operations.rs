@@ -299,9 +299,17 @@ struct ControlState {
 }
 
 #[derive(Default)]
-pub(crate) struct Control(Mutex<ControlState>, Condvar);
+pub(crate) struct Control(
+    Mutex<ControlState>,
+    Condvar,
+    Option<crate::read_pool::Cancellation>,
+);
 
 impl Control {
+    pub(crate) fn for_read(cancel: &crate::read_pool::Cancellation) -> Self {
+        Self(Default::default(), Condvar::new(), Some(cancel.clone()))
+    }
+
     pub fn pause(&self, pause: bool) {
         self.0.lock().unwrap().paused = pause;
         self.1.notify_all();
@@ -319,14 +327,14 @@ impl Control {
             .1
             .wait_while(self.0.lock().unwrap(), |s| s.paused && !s.cancelled)
             .unwrap();
-        if state.cancelled {
+        if state.cancelled || self.2.as_ref().is_some_and(|token| token.cancelled()) {
             Err(io::Error::other("Cancelled"))
         } else {
             Ok(())
         }
     }
     fn cancelled(&self) -> bool {
-        self.0.lock().unwrap().cancelled
+        self.2.as_ref().is_some_and(|token| token.cancelled()) || self.0.lock().unwrap().cancelled
     }
     pub fn is_cancelled(&self) -> bool {
         self.cancelled()

@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 
 use deshcmd_engine::{
     Algorithm, Collision, Command, Engine, JobState, Location, ManifestMode, MatchOptions,
-    Operation, Select, Settings, Side, TabLock, TransferOptions,
+    Operation, Select, Settings, Side, Step, TabLock, TransferOptions,
 };
 
 fn pump(engine: &mut Engine, done: impl Fn(&Engine) -> bool) {
@@ -30,7 +30,7 @@ fn open(left: &Path, right: &Path) -> Engine {
         || {},
     );
     pump(&mut engine, |engine| {
-        Side::ALL.into_iter().all(|side| !engine.tab(side).loading)
+        Side::ALL.into_iter().all(|side| !engine.tab(side).busy())
     });
     engine
 }
@@ -40,6 +40,38 @@ fn run(engine: &mut Engine, operation: Operation) {
     pump(engine, |engine| {
         engine.jobs.last().unwrap().state.finished()
     });
+}
+
+#[test]
+fn rename_updates_a_file_list_and_focuses_the_renamed_item() {
+    let fixture = tempfile::tempdir().unwrap();
+    let root = fixture.path().canonicalize().unwrap();
+    let first = root.join("first.txt");
+    let source = root.join("source.txt");
+    let target = root.join("target.txt");
+    fs::write(&first, "").unwrap();
+    fs::write(&source, "").unwrap();
+    let mut engine = open(&root, &root);
+    let side = Side::Left;
+    engine.dispatch(Command::LoadList(side, "first.txt\nsource.txt".into()));
+    pump(&mut engine, |engine| !engine.tab(side).loading);
+
+    // A single marked file is the rename operand even when the cursor moves.
+    engine.dispatch(Command::Select(side, source.clone(), Select::Replace));
+    engine.dispatch(Command::Step(side, Step::First, false));
+    assert_eq!(engine.tab(side).current().unwrap().path, first);
+    run(
+        &mut engine,
+        Operation::Rename {
+            source,
+            target: target.clone(),
+        },
+    );
+    pump(&mut engine, |engine| !engine.tab(side).loading);
+    assert_eq!(engine.jobs.last().unwrap().state, JobState::Done);
+    assert_eq!(engine.tab(side).current().unwrap().path, target);
+    assert_eq!(engine.tab(Side::Right).current().unwrap().path, first);
+    assert!(engine.take_cursor_restored(side));
 }
 
 #[test]
@@ -59,6 +91,9 @@ fn removing_an_open_folder_recovers_to_its_nearest_existing_parent() {
             new_tab: false,
             background: false,
         });
+        pump(&mut engine, |engine| {
+            Side::ALL.into_iter().all(|side| !engine.tab(side).busy())
+        });
     }
     engine.dispatch(Command::Focus(Side::Right));
     run(
@@ -70,13 +105,19 @@ fn removing_an_open_folder_recovers_to_its_nearest_existing_parent() {
     );
     assert_eq!(engine.jobs.last().unwrap().state, JobState::Done);
     pump(&mut engine, |engine| {
-        !engine.tab(Side::Left).loading && engine.tab(Side::Left).base() == parent
+        !engine.tab(Side::Left).busy() && engine.tab(Side::Left).base() == parent
     });
     assert!(engine.tab(Side::Left).error.is_none());
     assert_eq!(engine.settings.active, Side::Right);
     engine.dispatch(Command::Back(Side::Left));
+    pump(&mut engine, |engine| {
+        Side::ALL.into_iter().all(|side| !engine.tab(side).busy())
+    });
     assert_eq!(engine.tab(Side::Left).base(), root);
     engine.dispatch(Command::Forward(Side::Left));
+    pump(&mut engine, |engine| {
+        Side::ALL.into_iter().all(|side| !engine.tab(side).busy())
+    });
     assert_eq!(engine.tab(Side::Left).base(), parent);
 }
 
@@ -103,12 +144,14 @@ fn pane_navigation_filters_and_restores_marks() {
     ));
     engine.dispatch(Command::RememberMarks(side));
     engine.dispatch(Command::Filter(side, MatchOptions::filename("REPORT?.TXT")));
+    pump(&mut engine, |engine| !engine.tab(side).busy());
     assert_eq!(
         engine.tab(side).visible_entries().next().unwrap().name,
         "report3.txt"
     );
     assert!(engine.tab(side).marked_count() == 0);
     engine.dispatch(Command::Filter(side, MatchOptions::filename("")));
+    pump(&mut engine, |engine| !engine.tab(side).busy());
     engine.dispatch(Command::RestoreMarks(side));
     assert!(engine.tab(side).is_marked(&root.join("café.txt")));
 
@@ -118,8 +161,14 @@ fn pane_navigation_filters_and_restores_marks() {
         new_tab: false,
         background: false,
     });
+    pump(&mut engine, |engine| {
+        Side::ALL.into_iter().all(|side| !engine.tab(side).busy())
+    });
     assert!(engine.tab(side).can_back());
     engine.dispatch(Command::Back(side));
+    pump(&mut engine, |engine| {
+        Side::ALL.into_iter().all(|side| !engine.tab(side).busy())
+    });
     assert_eq!(engine.tab(side).base(), root);
     engine.dispatch(Command::LockTab(side, 0, TabLock::NewTab));
     engine.dispatch(Command::Navigate {
@@ -127,6 +176,9 @@ fn pane_navigation_filters_and_restores_marks() {
         path: root.join("sub"),
         new_tab: false,
         background: false,
+    });
+    pump(&mut engine, |engine| {
+        Side::ALL.into_iter().all(|side| !engine.tab(side).busy())
     });
     assert_eq!(engine.pane(side).tabs.len(), 2);
     assert_eq!(engine.tab(side).base(), root.join("sub"));
@@ -152,6 +204,9 @@ fn duplicate_cleanup_keeps_pinned_tabs_and_selects_the_surviving_location() {
     engine.dispatch(Command::OpenFocusedDirectoryInTab {
         source: side,
         destination: side,
+    });
+    pump(&mut engine, |engine| {
+        Side::ALL.into_iter().all(|side| !engine.tab(side).busy())
     });
     assert_eq!(engine.tab(side).base(), folder);
     engine.dispatch(Command::ToggleTabPin(side, 1));
@@ -216,24 +271,39 @@ fn parent_navigation_restores_the_child_in_linked_panes_and_locked_tabs() {
     engine.settings.linked = true;
     engine.dispatch(Command::Parent(side));
     pump(&mut engine, |engine| {
-        Side::ALL.into_iter().all(|side| !engine.tab(side).loading)
+        Side::ALL.into_iter().all(|side| !engine.tab(side).busy())
+    });
+    pump(&mut engine, |engine| {
+        Side::ALL.into_iter().all(|side| !engine.tab(side).busy())
     });
     assert_eq!(engine.settings.active, side);
     for (pane, child) in [(Side::Left, &left_child), (Side::Right, &right_child)] {
         assert_eq!(engine.tab(pane).current().unwrap().path, *child);
-        assert!(engine.take_parent_focus_restored(pane));
-        assert!(!engine.take_parent_focus_restored(pane));
+        assert!(engine.take_cursor_restored(pane));
+        assert!(!engine.take_cursor_restored(pane));
     }
 
     engine.dispatch(Command::Back(side));
+    pump(&mut engine, |engine| {
+        Side::ALL.into_iter().all(|side| !engine.tab(side).busy())
+    });
     engine.dispatch(Command::Forward(side));
-    pump(&mut engine, |engine| !engine.tab(side).loading);
+    pump(&mut engine, |engine| {
+        Side::ALL.into_iter().all(|side| !engine.tab(side).busy())
+    });
+    pump(&mut engine, |engine| !engine.tab(side).busy());
     assert_eq!(engine.tab(side).current().unwrap().path, left_child);
 
     engine.dispatch(Command::Back(side));
+    pump(&mut engine, |engine| {
+        Side::ALL.into_iter().all(|side| !engine.tab(side).busy())
+    });
     engine.dispatch(Command::LockTab(side, 0, TabLock::NewTab));
     engine.dispatch(Command::Parent(side));
-    pump(&mut engine, |engine| !engine.tab(side).loading);
+    pump(&mut engine, |engine| {
+        Side::ALL.into_iter().all(|side| !engine.tab(side).busy())
+    });
+    pump(&mut engine, |engine| !engine.tab(side).busy());
     assert_eq!(engine.pane(side).tabs.len(), 2);
     assert_eq!(engine.tab(side).current().unwrap().path, left_child);
 }
@@ -257,14 +327,26 @@ fn navigating_back_from_a_directory_symlink_focuses_the_link() {
         new_tab: false,
         background: false,
     });
+    pump(&mut engine, |engine| {
+        Side::ALL.into_iter().all(|side| !engine.tab(side).busy())
+    });
     assert_eq!(engine.tab(side).base(), target);
     engine.dispatch(Command::Back(side));
-    pump(&mut engine, |engine| !engine.tab(side).loading);
+    pump(&mut engine, |engine| {
+        Side::ALL.into_iter().all(|side| !engine.tab(side).busy())
+    });
+    pump(&mut engine, |engine| !engine.tab(side).busy());
     assert_eq!(engine.tab(side).current().unwrap().path, link);
 
     engine.dispatch(Command::Forward(side));
+    pump(&mut engine, |engine| {
+        Side::ALL.into_iter().all(|side| !engine.tab(side).busy())
+    });
     engine.dispatch(Command::Parent(side));
-    pump(&mut engine, |engine| !engine.tab(side).loading);
+    pump(&mut engine, |engine| {
+        Side::ALL.into_iter().all(|side| !engine.tab(side).busy())
+    });
+    pump(&mut engine, |engine| !engine.tab(side).busy());
     assert_eq!(engine.tab(side).current().unwrap().path, link);
 }
 
@@ -284,7 +366,7 @@ fn recursive_filter_applies_to_nested_items_and_can_be_cleared() {
     criteria.recursive = true;
     criteria.directories = false;
     engine.dispatch(Command::Filter(side, criteria.clone()));
-    pump(&mut engine, |engine| !engine.tab(side).loading);
+    pump(&mut engine, |engine| !engine.tab(side).busy());
     let visible_paths = |engine: &Engine| {
         engine
             .tab(side)
@@ -299,10 +381,11 @@ fn recursive_filter_applies_to_nested_items_and_can_be_cleared() {
     criteria.files = false;
     criteria.directories = true;
     engine.dispatch(Command::Filter(side, criteria));
+    pump(&mut engine, |engine| !engine.tab(side).busy());
     assert_eq!(visible_paths(&engine), [root.join("sub/Match folder")]);
 
     engine.dispatch(Command::Filter(side, MatchOptions::filename("")));
-    pump(&mut engine, |engine| !engine.tab(side).loading);
+    pump(&mut engine, |engine| !engine.tab(side).busy());
     assert_eq!(visible_paths(&engine), [root.join("sub")]);
 }
 
@@ -775,6 +858,7 @@ fn cursor_and_mark_totals_follow_the_visible_view() {
     engine.dispatch(Command::Step(side, Step::Next, true));
     check(engine.tab(side), Some("file10.txt"), 7, 2);
     engine.dispatch(Command::Sort(side, Column::Size, false));
+    pump(&mut engine, |engine| !engine.tab(side).busy());
     check(engine.tab(side), Some("file10.txt"), 7, 2);
     engine.dispatch(Command::Step(side, Step::Next, true));
     check(engine.tab(side), Some("report.csv"), 14, 3);
@@ -794,8 +878,10 @@ fn cursor_and_mark_totals_follow_the_visible_view() {
     check(engine.tab(side), Some("file2.txt"), 14, 4);
     engine.dispatch(Command::RememberMarks(side));
     engine.dispatch(Command::Filter(side, MatchOptions::filename("file10")));
+    pump(&mut engine, |engine| !engine.tab(side).busy());
     check(engine.tab(side), Some("file10.txt"), 5, 1);
     engine.dispatch(Command::Filter(side, MatchOptions::filename("")));
+    pump(&mut engine, |engine| !engine.tab(side).busy());
     engine.dispatch(Command::RestoreMarks(side));
     check(engine.tab(side), Some("file10.txt"), 14, 4);
     engine.dispatch(Command::LoadMarks(side, "file2.txt\nfile10.txt".into()));
@@ -803,7 +889,7 @@ fn cursor_and_mark_totals_follow_the_visible_view() {
     fs::write(file("file2.txt"), [0; 11]).unwrap();
     fs::remove_file(file("file10.txt")).unwrap();
     engine.dispatch(Command::Refresh);
-    pump(&mut engine, |engine| !engine.tab(side).loading);
+    pump(&mut engine, |engine| !engine.tab(side).busy());
     check(engine.tab(side), Some("sub"), 11, 1);
     engine.dispatch(Command::Step(side, Step::Last, false));
     check(engine.tab(side), Some("file2.txt"), 11, 1);
@@ -811,7 +897,7 @@ fn cursor_and_mark_totals_follow_the_visible_view() {
     check(engine.tab(side), Some("file2.txt"), 0, 0);
     fs::remove_dir_all(&folder).unwrap();
     engine.dispatch(Command::Refresh);
-    pump(&mut engine, |engine| !engine.tab(side).loading);
+    pump(&mut engine, |engine| !engine.tab(side).busy());
     assert!(engine.tab(side).error.is_none());
     assert_eq!(engine.tab(side).base(), fixture.path());
     check(engine.tab(side), None, 0, 0);
@@ -835,7 +921,7 @@ fn recursive_projection_excludes_hidden_and_ignored_ancestors() {
             ..MatchOptions::filename("*.*")
         },
     ));
-    pump(&mut engine, |engine| !engine.tab(side).loading);
+    pump(&mut engine, |engine| !engine.tab(side).busy());
     let file_paths = |engine: &Engine| {
         engine
             .tab(side)
@@ -845,6 +931,7 @@ fn recursive_projection_excludes_hidden_and_ignored_ancestors() {
     };
     assert_eq!(file_paths(&engine), [Path::new("keep/item.txt")]);
     engine.dispatch(Command::ToggleHidden);
+    pump(&mut engine, |engine| !engine.tab(side).busy());
     assert_eq!(
         file_paths(&engine),
         [Path::new(".private/item.txt"), Path::new("keep/item.txt")]
@@ -868,11 +955,12 @@ fn delayed_directory_result_cannot_replace_newer_navigation() {
         fs::create_dir(path).unwrap();
     }
     fs::write(fast.join("fast.txt"), "ready").unwrap();
+    fs::write(empty.join("fast.txt"), "existing").unwrap();
     let fifo = blocked.join("descript.ion");
     let name = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
     assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
 
-    let (send, wake) = mpsc::channel();
+    let (send, _wake) = mpsc::channel();
     let mut engine = Engine::new(
         root.path().into(),
         [empty.clone(), empty],
@@ -885,10 +973,9 @@ fn delayed_directory_result_cannot_replace_newer_navigation() {
         },
     );
     let timeout = Duration::from_secs(5);
-    for _ in Side::ALL {
-        wake.recv_timeout(timeout).unwrap();
-    }
-    engine.poll();
+    pump(&mut engine, |engine| {
+        Side::ALL.into_iter().all(|side| !engine.tab(side).busy())
+    });
     let side = Side::Left;
     let navigate = |path| Command::Navigate {
         side,
@@ -896,7 +983,10 @@ fn delayed_directory_result_cannot_replace_newer_navigation() {
         new_tab: false,
         background: false,
     };
-    engine.dispatch(navigate(blocked));
+    engine.dispatch(navigate(blocked.clone()));
+    pump(&mut engine, |engine| {
+        engine.tab(side).pending_navigation().is_none()
+    });
 
     // The writer can open only when the scanner reaches the FIFO. Keeping it open
     // with no data blocks the comment read until the fast navigation has installed.
@@ -917,16 +1007,38 @@ fn delayed_directory_result_cannot_replace_newer_navigation() {
         }
     };
     engine.dispatch(navigate(fast.clone()));
-    wake.recv_timeout(timeout).unwrap();
-    engine.poll();
+    pump(&mut engine, |engine| !engine.tab(side).busy());
     assert_eq!(engine.tab(side).current().unwrap().name, "fast.txt");
 
+    engine.dispatch(Command::Queue(
+        Operation::Transfer {
+            paths: vec![fast.join("fast.txt")],
+            destination: root.path().join("empty"),
+            moving: false,
+            options: Default::default(),
+        },
+        false,
+    ));
+    pump(&mut engine, |engine| {
+        engine.jobs.last().unwrap().state == JobState::Conflict
+    });
+    let id = engine.jobs.last().unwrap().id;
+    engine.dispatch(Command::Resolve(id, Collision::Skip, false));
+    pump(&mut engine, |engine| {
+        engine.jobs.last().unwrap().state.finished()
+    });
+    assert_eq!(
+        fs::read(root.path().join("empty/fast.txt")).unwrap(),
+        b"existing"
+    );
+
+    fs::remove_file(fifo).unwrap();
+    fs::write(blocked.join("latest.txt"), "newer visit").unwrap();
     drop(writer);
-    wake.recv_timeout(timeout).unwrap();
-    engine.poll();
-    assert_eq!(engine.tab(side).base(), fast);
-    assert_eq!(engine.tab(side).current().unwrap().name, "fast.txt");
-    assert!(!engine.tab(side).loading);
+    engine.dispatch(navigate(blocked.clone()));
+    pump(&mut engine, |engine| !engine.tab(side).busy());
+    assert_eq!(engine.tab(side).base(), blocked);
+    assert_eq!(engine.tab(side).current().unwrap().name, "latest.txt");
 }
 
 #[test]
@@ -960,6 +1072,9 @@ fn workspace_tabs_and_bookmarks_round_trip_through_settings() {
         source: Side::Left,
         destination: Side::Right,
     });
+    pump(&mut engine, |engine| {
+        Side::ALL.into_iter().all(|side| !engine.tab(side).busy())
+    });
     assert_eq!(engine.tab(Side::Right).base(), child);
     engine.dispatch(Command::RenameTab(Side::Right, 1, "  Work tab  ".into()));
     engine.dispatch(Command::View(Side::Right, View::Gallery));
@@ -981,12 +1096,18 @@ fn workspace_tabs_and_bookmarks_round_trip_through_settings() {
 
     engine.dispatch(Command::Swap);
     engine.dispatch(Command::MatchPanes);
+    pump(&mut engine, |engine| {
+        Side::ALL.into_iter().all(|side| !engine.tab(side).busy())
+    });
     assert_eq!(
         engine.tab(Side::Left).base(),
         engine.tab(Side::Right).base()
     );
     engine.dispatch(Command::Focus(Side::Left));
     engine.dispatch(Command::OpenBookmark(0));
+    pump(&mut engine, |engine| {
+        Side::ALL.into_iter().all(|side| !engine.tab(side).busy())
+    });
     assert_eq!(engine.tab(Side::Left).base(), left);
     assert_eq!(engine.tab(Side::Right).base(), right);
 
@@ -1088,10 +1209,13 @@ fn find_navigation_and_mark_commands_follow_the_visible_list() {
     engine.dispatch(Command::Step(side, Step::First, true));
     assert_eq!(engine.tab(side).marked_count(), 3);
     engine.dispatch(Command::ToggleHidden);
+    pump(&mut engine, |engine| !engine.tab(side).busy());
     assert_eq!(engine.tab(side).visible_count(), 4);
     engine.dispatch(Command::Ignore("*.md".into()));
+    pump(&mut engine, |engine| !engine.tab(side).busy());
     assert_eq!(engine.tab(side).visible_count(), 3);
     engine.dispatch(Command::ToggleHidden);
+    pump(&mut engine, |engine| !engine.tab(side).busy());
     engine.dispatch(Command::MarkAll(side));
     assert_eq!(marked(&engine), ["alpha.txt", "beta.txt"]);
 }
@@ -1113,23 +1237,38 @@ fn history_skips_missing_locations_and_reset_tabs_return_home() {
             new_tab: false,
             background: false,
         });
+        pump(&mut engine, |engine| {
+            Side::ALL.into_iter().all(|side| !engine.tab(side).busy())
+        });
         assert_eq!(engine.tab(side).base(), path);
     }
     fs::remove_dir(&past).unwrap();
     engine.dispatch(Command::History(side, 1));
+    pump(&mut engine, |engine| {
+        Side::ALL.into_iter().all(|side| !engine.tab(side).busy())
+    });
     assert_eq!(
         engine.notice.as_deref(),
         Some("This history location is unavailable")
     );
     engine.dispatch(Command::Back(side));
+    pump(&mut engine, |engine| {
+        Side::ALL.into_iter().all(|side| !engine.tab(side).busy())
+    });
     assert_eq!(engine.tab(side).base(), root);
     assert!(engine.tab(side).can_forward());
     engine.dispatch(Command::Forward(side));
+    pump(&mut engine, |engine| {
+        Side::ALL.into_iter().all(|side| !engine.tab(side).busy())
+    });
     assert_eq!(engine.tab(side).base(), current);
     assert_eq!(engine.tab(side).history().count(), 3);
 
     engine.dispatch(Command::LockTab(side, 0, TabLock::Reset));
     engine.dispatch(Command::Parent(side));
+    pump(&mut engine, |engine| {
+        Side::ALL.into_iter().all(|side| !engine.tab(side).busy())
+    });
     assert_eq!(engine.tab(side).base(), root);
     engine.dispatch(Command::NewTab(side));
     engine.dispatch(Command::Tab(side, 0));
@@ -1298,7 +1437,7 @@ fn flat_view_can_be_limited_to_marked_folders_and_restored() {
     let side = Side::Left;
     engine.dispatch(Command::Select(side, child.clone(), Select::Toggle));
     engine.dispatch(Command::Flat(side, true));
-    pump(&mut engine, |engine| !engine.tab(side).loading);
+    pump(&mut engine, |engine| !engine.tab(side).busy());
     assert!(
         matches!(engine.tab(side).location(), Location::Flat { roots, .. } if roots.as_slice() == std::slice::from_ref(&child))
     );
@@ -1312,7 +1451,7 @@ fn flat_view_can_be_limited_to_marked_folders_and_restored() {
         ["nested.txt"]
     );
     engine.dispatch(Command::Flat(side, false));
-    pump(&mut engine, |engine| !engine.tab(side).loading);
+    pump(&mut engine, |engine| !engine.tab(side).busy());
     assert!(matches!(engine.tab(side).location(), Location::Directory(base) if base == &root));
     assert_eq!(engine.tab(side).visible_count(), 2);
 
@@ -1322,12 +1461,18 @@ fn flat_view_can_be_limited_to_marked_folders_and_restored() {
         new_tab: false,
         background: false,
     });
+    pump(&mut engine, |engine| {
+        Side::ALL.into_iter().all(|side| !engine.tab(side).busy())
+    });
     assert_eq!(engine.tab(side).base(), child);
     engine.dispatch(Command::Navigate {
         side,
         path: "~".into(),
         new_tab: false,
         background: false,
+    });
+    pump(&mut engine, |engine| {
+        Side::ALL.into_iter().all(|side| !engine.tab(side).busy())
     });
     assert_eq!(engine.tab(side).base(), root);
 }

@@ -28,6 +28,7 @@ filetime = "0.2"
 fs2 = "0.4"
 getrandom = "0.4"
 walkdir = "2"
+notify = "8"
 
 [target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
 libc = "0.2"

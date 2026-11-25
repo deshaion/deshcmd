@@ -1,29 +1,19 @@
 use super::*;
 
 #[test]
-fn initial_panes_accept_directories_and_fall_back_independently() {
-    let fixture = tempfile::tempdir().unwrap();
-    let cwd = fixture.path().canonicalize().unwrap();
-    let home = cwd.join("home");
-    let left = cwd.join("left");
-    std::fs::create_dir(&home).unwrap();
-    std::fs::create_dir(&left).unwrap();
-    std::fs::write(cwd.join("file"), "not a directory").unwrap();
+fn startup_paths_are_resolved_lexically_without_probing_storage() {
+    let cwd = PathBuf::from("cwd");
+    let absolute = std::env::temp_dir().join("missing");
     assert_eq!(
-        initial_directories(&cwd, &home, std::iter::empty()),
-        [cwd.clone(), home.clone()]
+        requested_directories(&cwd, std::iter::empty()),
+        [None, None]
     );
     assert_eq!(
-        initial_directories(&cwd, &home, ["left".into(), "missing".into()].into_iter()),
-        [left.clone(), home.clone()]
-    );
-    assert_eq!(
-        initial_directories(
+        requested_directories(
             &cwd,
-            &home,
-            ["file".into(), left.clone().into_os_string()].into_iter()
+            ["left".into(), absolute.clone().into_os_string()].into_iter()
         ),
-        [cwd, left]
+        [Some(cwd.join("left")), Some(absolute)]
     );
 }
 
@@ -89,8 +79,7 @@ fn mount_list_decodes_paths_filters_system_mounts_and_keeps_root_first() {
 #[cfg(target_os = "linux")]
 #[test]
 fn native_places_always_include_the_filesystem() {
-    let mut desktop = NativeDesktop { clipboard: None };
-    let places = desktop.places();
+    let places = read_places();
     assert!(
         places
             .iter()

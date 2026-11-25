@@ -62,9 +62,6 @@ impl Desktop for TestDesktop {
         state.files.clear();
         Ok(())
     }
-    fn places(&mut self) -> Vec<Place> {
-        vec![]
-    }
     fn eject(&mut self, _: &Path) -> Result<(), String> {
         unreachable!()
     }
@@ -104,7 +101,7 @@ fn panel_navigation_and_preview_shortcuts() {
     let side = Side::Left;
     let wait_for_listing = |app: &mut App| {
         let deadline = Instant::now() + Duration::from_secs(5);
-        while app.engine.tab(side).loading {
+        while app.engine.tab(side).busy() {
             assert!(Instant::now() < deadline, "directory listing timed out");
             app.engine.poll();
             std::thread::sleep(Duration::from_millis(1));
@@ -146,12 +143,16 @@ fn panel_navigation_and_preview_shortcuts() {
     app.engine
         .dispatch(Command::Select(side, folder.clone(), engine::Select::Focus));
     press(&mut app, &mut frame, Key::ArrowRight, plain);
+    wait_for_listing(&mut app);
     assert_eq!(app.engine.tab(side).base(), folder);
     press(&mut app, &mut frame, Key::ArrowLeft, plain);
+    wait_for_listing(&mut app);
     assert_eq!(app.engine.tab(side).base(), source);
     press(&mut app, &mut frame, Key::ArrowLeft, alt);
+    wait_for_listing(&mut app);
     assert_eq!(app.engine.tab(side).base(), folder);
     press(&mut app, &mut frame, Key::ArrowRight, alt);
+    wait_for_listing(&mut app);
     assert_eq!(app.engine.tab(side).base(), source);
 
     wait_for_listing(&mut app);
@@ -255,11 +256,34 @@ fn panel_navigation_and_preview_shortcuts() {
     });
     wait_for_listing(&mut app);
     press(&mut app, &mut frame, Key::ArrowLeft, plain);
-    assert_eq!(app.engine.tab(side).base(), parent);
     wait_for_listing(&mut app);
+    assert_eq!(app.engine.tab(side).base(), parent);
     assert_eq!(app.engine.tab(side).current().unwrap().path, child);
     assert_eq!(app.engine.tab(side).marked_count(), 0);
     focus_outline(draw(&mut app, &mut frame, vec![]));
+
+    app.engine.dispatch(Command::NewTab(side));
+    app.engine.dispatch(Command::NewTab(side));
+    for (modifiers, index) in [
+        (ctrl, 0),
+        (ctrl | egui::Modifiers::SHIFT, 2),
+        (ctrl | egui::Modifiers::SHIFT, 1),
+        (ctrl | alt, 1),
+        (ctrl, 2),
+        (ctrl, 0),
+    ] {
+        press(&mut app, &mut frame, Key::Tab, modifiers);
+        assert_eq!(app.engine.pane(side).active, index);
+        assert_eq!(app.engine.settings.active, side);
+        assert_eq!(app.engine.pane(side.other()).active, 0);
+    }
+    press(&mut app, &mut frame, Key::Tab, plain);
+    assert_eq!(app.engine.settings.active, side.other());
+    press(&mut app, &mut frame, Key::Tab, ctrl);
+    assert_eq!(app.engine.settings.active, side.other());
+    assert_eq!(app.engine.pane(side.other()).active, 0);
+    press(&mut app, &mut frame, Key::Tab, plain);
+    assert_eq!(app.engine.settings.active, side);
 
     let menu_button = draw(&mut app, &mut frame, vec![])
         .into_iter()
@@ -340,7 +364,7 @@ pub(super) fn settle(app: &mut App) {
         app.engine.poll();
         if Side::ALL
             .into_iter()
-            .all(|side| !app.engine.tab(side).loading)
+            .all(|side| !app.engine.tab(side).busy())
             && app.engine.jobs.iter().all(|job| job.state.finished())
         {
             return;
@@ -386,6 +410,9 @@ fn workspace_exports_can_be_imported_through_native_file_pickers() {
     app.engine.dispatch(Command::CloseTab(Side::Left, 1));
     native.borrow_mut().pick = Some(tabs);
     app.invoke(Side::Left, Tool::ImportTabs, &ctx);
+    wait_for_dialog_read(&mut app, &ctx, |app| {
+        app.engine.pane(Side::Left).tabs.len() == 2
+    });
     assert_eq!(app.engine.pane(Side::Left).tabs.len(), 2);
 
     let bookmarks = root.join("export.bookmarks");
@@ -395,12 +422,21 @@ fn workspace_exports_can_be_imported_through_native_file_pickers() {
     app.engine.dispatch(Command::RemoveBookmark(0));
     native.borrow_mut().pick = Some(bookmarks);
     app.invoke(Side::Left, Tool::ImportBookmarks, &ctx);
+    wait_for_dialog_read(&mut app, &ctx, |app| {
+        !app.engine.settings.bookmarks.is_empty()
+    });
     assert_eq!(app.engine.settings.bookmarks, [bookmark]);
 
     let invalid = root.join("bad.bookmarks");
     std::fs::write(&invalid, "invalid json").unwrap();
     native.borrow_mut().pick = Some(invalid);
     app.invoke(Side::Left, Tool::ImportBookmarks, &ctx);
+    wait_for_dialog_read(&mut app, &ctx, |app| {
+        app.interface
+            .notice
+            .as_ref()
+            .is_some_and(|notice| notice.0.contains("expected"))
+    });
     assert!(
         app.interface
             .notice
@@ -433,7 +469,7 @@ fn close_request_reveals_the_queue_until_pending_work_is_cancelled() {
         )),
         &ctx,
     );
-    app.interface.queue = false;
+    assert!(!app.interface.queue);
     app.apply(Action::Close, &ctx);
     assert!(app.interface.queue);
     assert!(!app.interface.closing);
@@ -573,7 +609,8 @@ fn workspace_renders_tree_gallery_help_and_a_transfer_conflict() {
             drive: true,
             ejectable: true,
         },
-    ];
+    ]
+    .into();
     app.interface.tree = true;
     app.engine.settings.stacked = true;
 
@@ -623,6 +660,7 @@ fn workspace_renders_tree_gallery_help_and_a_transfer_conflict() {
     let shapes = draw(&mut app);
     assert!(frame_contains(&shapes, "shared.txt"));
     assert!(frame_contains(&shapes, "Skip"));
+    assert!(!app.interface.queue);
     let id = app.engine.jobs[0].id;
     app.apply(
         Action::Command(Command::Resolve(id, engine::Collision::Skip, false)),
@@ -633,6 +671,8 @@ fn workspace_renders_tree_gallery_help_and_a_transfer_conflict() {
         std::fs::read(right.join("shared.txt")).unwrap(),
         b"existing"
     );
+    assert!(!app.interface.queue);
+    app.interface.queue = true;
     assert!(frame_contains(&draw(&mut app), "1 skipped"));
 }
 
@@ -719,10 +759,14 @@ fn quick_view_changes_between_a_large_log_image_and_unavailable_file() {
 fn clipboard_shortcuts_route_to_files_or_text_based_on_focus_context() {
     let fixture = tempfile::tempdir().unwrap();
     let root = fixture.path().to_path_buf();
+    let first = root.join("first.txt");
+    let second = root.join("second.txt");
+    std::fs::write(&first, "").unwrap();
+    std::fs::write(&second, "").unwrap();
     let ctx = egui::Context::default();
     let creation = eframe::CreationContext::_new_kittest(ctx.clone());
     let desktop = TestDesktop::default();
-    desktop.state.borrow_mut().text = Some("first\r\nsecond".into());
+    let clipboard = desktop.state.clone();
     let mut app = App::new(
         &creation,
         Box::new(desktop),
@@ -730,8 +774,7 @@ fn clipboard_shortcuts_route_to_files_or_text_based_on_focus_context() {
         [root.clone(), root],
         true,
     );
-    let route = |app: &mut App, key| {
-        let modifiers = egui::Modifiers::COMMAND;
+    let route = |app: &mut App, key, modifiers| {
         let mut actions = Vec::new();
         let mut events = Vec::new();
         let mut output = ctx.run_ui(
@@ -755,20 +798,229 @@ fn clipboard_shortcuts_route_to_files_or_text_based_on_focus_context() {
         output.textures_delta.clear();
         (actions, events)
     };
-    let (actions, _) = route(&mut app, Key::C);
+    let command = egui::Modifiers::COMMAND;
+    let copy_path = COPY_PATH_SHORTCUT.modifiers;
+    let (actions, _) = route(&mut app, Key::C, command);
     assert!(matches!(
         actions.as_slice(),
         [Action::Tool(Side::Left, Tool::CopyClipboard)]
     ));
 
+    settle(&mut app);
+    let side = Side::Left;
+    app.engine
+        .dispatch(Command::Select(side, first.clone(), engine::Select::Focus));
+    let copy_paths = |app: &mut App| {
+        let (actions, _) = route(app, Key::C, copy_path);
+        assert!(matches!(
+            actions.as_slice(),
+            [Action::Tool(Side::Left, Tool::CopyPaths)]
+        ));
+        let mut actions = actions.into_iter();
+        let mut output = ctx.run_ui(egui::RawInput::default(), |_| {
+            for action in actions.by_ref() {
+                app.apply(action, &ctx);
+            }
+            app.publish_text_clipboard(&ctx);
+        });
+        output.textures_delta.clear();
+        clipboard.borrow().text.clone().unwrap()
+    };
+    assert_eq!(copy_paths(&mut app), first.display().to_string());
+    for path in [first.clone(), second.clone()] {
+        app.engine
+            .dispatch(Command::Select(side, path, engine::Select::Toggle));
+    }
+    assert_eq!(
+        copy_paths(&mut app),
+        format!("{}\n{}", first.display(), second.display())
+    );
+
+    clipboard.borrow_mut().text = Some("first\r\nsecond".into());
     app.open_settings(&ctx);
-    for (key, expected) in [
-        (Key::C, egui::Event::Copy),
-        (Key::X, egui::Event::Cut),
-        (Key::V, egui::Event::Paste("first\nsecond".into())),
+    for (key, modifiers, expected) in [
+        (Key::C, command, egui::Event::Copy),
+        (Key::C, copy_path, egui::Event::Copy),
+        (Key::X, command, egui::Event::Cut),
+        (Key::V, command, egui::Event::Paste("first\nsecond".into())),
     ] {
-        let (actions, events) = route(&mut app, key);
+        let (actions, events) = route(&mut app, key, modifiers);
         assert!(actions.is_empty());
         assert!(events.contains(&expected), "{events:?}");
     }
+}
+
+pub(crate) fn wait_for_dialog_read(
+    app: &mut App,
+    ctx: &egui::Context,
+    done: impl Fn(&App) -> bool,
+) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !done(app) {
+        app.poll_dialog_reads(ctx);
+        assert!(Instant::now() < deadline, "dialog read timed out");
+        std::thread::yield_now();
+    }
+}
+
+#[test]
+fn a_blocked_dialog_read_does_not_stall_frames_and_cannot_update_a_new_location() {
+    let fixture = tempfile::tempdir().unwrap();
+    let root = fixture.path().canonicalize().unwrap();
+    let folder = root.join("folder");
+    std::fs::create_dir(&folder).unwrap();
+    let ctx = egui::Context::default();
+    let creation = eframe::CreationContext::_new_kittest(ctx.clone());
+    let mut app = App::new(
+        &creation,
+        Box::new(TestDesktop::default()),
+        root.clone(),
+        [root.clone(), root],
+        true,
+    );
+    let mut frame = eframe::Frame::_new_kittest();
+    let (release, gate) = mpsc::channel();
+    let (started, starts) = mpsc::channel();
+    let (applied, applications) = mpsc::channel();
+    app.read_for_tab(
+        Side::Left,
+        move || {
+            started.send(()).unwrap();
+            gate.recv_timeout(Duration::from_secs(5)).unwrap();
+        },
+        move |_, _, ()| applied.send(()).unwrap(),
+    );
+    starts.recv_timeout(Duration::from_secs(5)).unwrap();
+    app.engine.dispatch(Command::Navigate {
+        side: Side::Left,
+        path: folder.clone(),
+        new_tab: false,
+        background: false,
+    });
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        app.logic(&ctx, &mut frame);
+        ctx.run_ui(Default::default(), |ui| app.ui(ui, &mut frame))
+            .textures_delta
+            .clear();
+        if !app.engine.tab(Side::Left).busy() {
+            break;
+        }
+        assert!(Instant::now() < deadline);
+        std::thread::yield_now();
+    }
+    assert_eq!(app.engine.tab(Side::Left).base(), folder);
+    release.send(()).unwrap();
+    loop {
+        if let Some((_, apply)) = app.dialog_reads.drain().pop() {
+            apply(&mut app, &ctx);
+            break;
+        }
+        assert!(Instant::now() < deadline);
+        std::thread::yield_now();
+    }
+    assert!(applications.try_recv().is_err());
+}
+
+#[test]
+fn review_startup_home_resolution_preserves_defaults_and_valid_cli_arguments() {
+    let fixture = tempfile::tempdir().unwrap();
+    let root = fixture.path().canonicalize().unwrap();
+    let cwd = root.join("cwd");
+    std::fs::create_dir(&cwd).unwrap();
+    let home = root.join("home");
+    let cli = root.join("arg");
+    std::fs::create_dir(&home).unwrap();
+    std::fs::create_dir(&cli).unwrap();
+    for (configured, argument, expected_home, expected_right) in [
+        (
+            root.join("missing-home"),
+            Some(root.join("missing-argument")),
+            &cwd,
+            &cwd,
+        ),
+        (root.join("missing-home"), None, &cwd, &cwd),
+        (home.join("..").join("home"), None, &home, &home),
+        (home.clone(), Some(cli.clone()), &home, &cli),
+    ] {
+        let ctx = egui::Context::default();
+        let creation = eframe::CreationContext::_new_kittest(ctx.clone());
+        let mut app = App::new(
+            &creation,
+            Box::new(TestDesktop::default()),
+            configured,
+            [cwd.clone(), cwd.clone()],
+            true,
+        );
+        app.open_initial_directories(&ctx, [None, argument]);
+        let mut frame = eframe::Frame::_new_kittest();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            app.logic(&ctx, &mut frame);
+            if app.startup_home.is_none()
+                && Side::ALL
+                    .into_iter()
+                    .all(|side| !app.engine.tab(side).busy())
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "startup kept home at {}",
+                app.engine.home.display()
+            );
+            std::thread::yield_now();
+        }
+        assert_eq!(&app.engine.home, expected_home);
+        assert_eq!(app.engine.tab(Side::Right).base(), expected_right);
+        assert!(!app.engine.tab(Side::Right).can_back());
+    }
+}
+
+#[test]
+fn review_history_preview_keeps_the_committed_action_target_visible() {
+    let fixture = tempfile::tempdir().unwrap();
+    let root = fixture.path().canonicalize().unwrap();
+    let history = root.join("history");
+    let current = root.join("current");
+    for dir in [&history, &current] {
+        std::fs::create_dir(dir).unwrap();
+    }
+    std::fs::write(history.join("cached-item.txt"), "old").unwrap();
+    let target = current.join("committed-item.txt");
+    std::fs::write(&target, "current").unwrap();
+    let ctx = egui::Context::default();
+    let creation = eframe::CreationContext::_new_kittest(ctx.clone());
+    let mut app = App::new(
+        &creation,
+        Box::new(TestDesktop::default()),
+        root.clone(),
+        [history, root],
+        true,
+    );
+    app.engine.settings.auto_refresh = false;
+    settle(&mut app);
+    let side = Side::Left;
+    app.engine.dispatch(Command::Navigate {
+        side,
+        path: current,
+        new_tab: false,
+        background: false,
+    });
+    settle(&mut app);
+    app.engine.dispatch(Command::Back(side));
+    assert!(app.engine.history_preview(side).is_some());
+    assert_eq!(app.engine.tab(side).operands(), [target]);
+    let mut frame = eframe::Frame::_new_kittest();
+    // Render before polling validation so the history request stays pending.
+    let mut output = ctx.run_ui(
+        egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, vec2(1280., 800.))),
+            ..Default::default()
+        },
+        |ui| app.ui(ui, &mut frame),
+    );
+    output.textures_delta.clear();
+    assert!(frame_contains(&output.shapes, "cached-item.txt"));
+    assert!(frame_contains(&output.shapes, "committed-item.txt"));
 }

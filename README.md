@@ -73,7 +73,10 @@ Press **F1** for shortcuts. **Right** opens the focused directory, **Left** goes
 
 Double-click a file or press **Enter** to open it. On Linux and macOS, executable binaries and scripts with a shebang run from their containing folder. Windows uses the system’s default action to launch programs. Images, documents, and other files open in the application associated with their type by the desktop.
 
+Press **Ctrl+Shift+C** (**Cmd+Shift+C** on macOS) to copy the full path of the focused item or the full paths of all marked items.
+
 Press **Ctrl+Up** to open the focused folder in a new tab in the same panel, or **Ctrl+Right** from the left panel to open it in a new tab on the right. **Ctrl+T** duplicates the current location in the same panel. **Ctrl+Shift+T** copies the current tab to the opposite panel.
+Use **Ctrl+Tab** and **Ctrl+Shift+Tab** to cycle forward and backward through tabs in the active panel.
 Right-click a tab to **Pin tab** or **Unpin tab**. Pinned tabs stay in their current positions, survive restarts, and are protected from closing and duplicate cleanup.
 
 Press **F9** or choose **Tools → Open Terminal** to start an external terminal in the active panel's folder.
