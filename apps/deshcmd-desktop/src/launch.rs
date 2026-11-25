@@ -69,15 +69,23 @@ fn use_associated_app(error: &io::Error) -> bool {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
     use std::time::{Duration, Instant};
+
+    // A fork can inherit a fixture's write handle from a parallel test until exec.
+    // Keep fixture writes and launches from overlapping to avoid ETXTBSY.
+    static FIXTURE_IO: Mutex<()> = Mutex::new(());
 
     #[test]
     fn executable_script_runs_from_its_own_directory() {
         let directory = tempfile::tempdir().unwrap();
         let script = directory.path().join("example program");
-        fs::write(&script, "#!/bin/sh\nprintf launched > result.txt\n").unwrap();
-        fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
-        open_file(&script).unwrap();
+        {
+            let _fixture_io = FIXTURE_IO.lock().unwrap();
+            fs::write(&script, "#!/bin/sh\nprintf launched > result.txt\n").unwrap();
+            fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
+            open_file(&script).unwrap();
+        }
 
         let result = directory.path().join("result.txt");
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -93,6 +101,7 @@ mod tests {
     #[test]
     fn documents_and_nonexecutable_scripts_use_the_system_opener() {
         let directory = tempfile::tempdir().unwrap();
+        let _fixture_io = FIXTURE_IO.lock().unwrap();
         let image = directory.path().join("image.png");
         fs::write(&image, b"\x89PNG\r\n\x1a\n").unwrap();
         fs::set_permissions(&image, fs::Permissions::from_mode(0o700)).unwrap();
@@ -114,6 +123,7 @@ mod tests {
         elf_object[18] = 0x3e; // EM_X86_64
         elf_object[20] = 1; // ELF version
         elf_object[52] = 64; // ELF header size
+        let _fixture_io = FIXTURE_IO.lock().unwrap();
         for (name, bytes) in [
             ("object.o", elf_object.as_slice()),
             ("Example.class", b"\xca\xfe\xba\xbe\x00\x00\x00\x3d\x00\x01"),
