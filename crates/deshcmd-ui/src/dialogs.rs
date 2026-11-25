@@ -8,7 +8,7 @@ use deshcmd_engine::{
 use eframe::egui;
 use egui::{Align, Id, Layout, TextEdit, Ui};
 
-use crate::{Action, App, FileClipboard, theme::*};
+use crate::{Action, App, COPY_PATH_SHORTCUT, FileClipboard, theme::*};
 
 #[derive(Clone, Copy)]
 pub(crate) enum Tool {
@@ -261,11 +261,15 @@ pub(crate) fn entry_menu(ui: &mut Ui, side: Side, entry: &Entry, actions: &mut V
         menu_item(ui, side, "Extract…", Tool::Unpack, actions);
         menu_item(ui, side, "Test archive…", Tool::TestArchive, actions);
     }
+    let copy_path = format!(
+        "Copy full path · {}",
+        ui.ctx().format_shortcut(&COPY_PATH_SHORTCUT)
+    );
     for (name, tool) in [
         ("Rename", Tool::Rename),
         ("Copy to other panel", Tool::Copy),
         ("Move to other panel", Tool::Move),
-        ("Copy full path", Tool::CopyPaths),
+        (&copy_path, Tool::CopyPaths),
         ("Properties", Tool::Inspect),
         ("Move to Trash", Tool::Trash),
     ] {
@@ -322,9 +326,13 @@ pub(crate) fn selection_menu(ui: &mut Ui, side: Side, actions: &mut Vec<Action>)
         menu_item(ui, side, name, tool, actions);
     }
     ui.menu_button("Copy information", |ui| {
+        let copy_path = format!(
+            "Full paths · {}",
+            ui.ctx().format_shortcut(&COPY_PATH_SHORTCUT)
+        );
         for (name, tool) in [
             ("Names", Tool::CopyNames),
-            ("Full paths", Tool::CopyPaths),
+            (&copy_path, Tool::CopyPaths),
             ("Parent paths", Tool::CopyParentPaths),
             ("Displayed columns", Tool::CopyDetails),
             ("Export details…", Tool::ExportDetails),

@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 
 use deshcmd_engine::{
     Algorithm, Collision, Command, Engine, JobState, Location, ManifestMode, MatchOptions,
-    Operation, Select, Settings, Side, TabLock, TransferOptions,
+    Operation, Select, Settings, Side, Step, TabLock, TransferOptions,
 };
 
 fn pump(engine: &mut Engine, done: impl Fn(&Engine) -> bool) {
@@ -40,6 +40,38 @@ fn run(engine: &mut Engine, operation: Operation) {
     pump(engine, |engine| {
         engine.jobs.last().unwrap().state.finished()
     });
+}
+
+#[test]
+fn rename_updates_a_file_list_and_focuses_the_renamed_item() {
+    let fixture = tempfile::tempdir().unwrap();
+    let root = fixture.path().canonicalize().unwrap();
+    let first = root.join("first.txt");
+    let source = root.join("source.txt");
+    let target = root.join("target.txt");
+    fs::write(&first, "").unwrap();
+    fs::write(&source, "").unwrap();
+    let mut engine = open(&root, &root);
+    let side = Side::Left;
+    engine.dispatch(Command::LoadList(side, "first.txt\nsource.txt".into()));
+    pump(&mut engine, |engine| !engine.tab(side).loading);
+
+    // A single marked file is the rename operand even when the cursor moves.
+    engine.dispatch(Command::Select(side, source.clone(), Select::Replace));
+    engine.dispatch(Command::Step(side, Step::First, false));
+    assert_eq!(engine.tab(side).current().unwrap().path, first);
+    run(
+        &mut engine,
+        Operation::Rename {
+            source,
+            target: target.clone(),
+        },
+    );
+    pump(&mut engine, |engine| !engine.tab(side).loading);
+    assert_eq!(engine.jobs.last().unwrap().state, JobState::Done);
+    assert_eq!(engine.tab(side).current().unwrap().path, target);
+    assert_eq!(engine.tab(Side::Right).current().unwrap().path, first);
+    assert!(engine.take_cursor_restored(side));
 }
 
 #[test]
@@ -245,8 +277,8 @@ fn parent_navigation_restores_the_child_in_linked_panes_and_locked_tabs() {
     assert_eq!(engine.settings.active, side);
     for (pane, child) in [(Side::Left, &left_child), (Side::Right, &right_child)] {
         assert_eq!(engine.tab(pane).current().unwrap().path, *child);
-        assert!(engine.take_parent_focus_restored(pane));
-        assert!(!engine.take_parent_focus_restored(pane));
+        assert!(engine.take_cursor_restored(pane));
+        assert!(!engine.take_cursor_restored(pane));
     }
 
     engine.dispatch(Command::Back(side));

@@ -421,7 +421,7 @@ impl Engine {
             tab
         };
         if !intent.background {
-            tab.pending_parent_focus = parent_focus;
+            tab.pending_cursor = parent_focus;
         }
         if opens_tab || history.is_none() && changed {
             tab.history[tab.history_index].entered_via = entered_via;
