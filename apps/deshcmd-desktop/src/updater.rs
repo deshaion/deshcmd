@@ -20,6 +20,7 @@ const HELPER: &str = if cfg!(windows) {
 };
 const MANIFEST: &str = "latest.json";
 const SIGNATURE: &str = "latest.json.sig";
+const STAGED_BACKUP: &str = "backup";
 const LIMIT: u64 = 256 * 1024 * 1024;
 
 type Error = Box<dyn std::error::Error>;
@@ -228,7 +229,7 @@ pub struct Prepared {
 }
 
 impl Prepared {
-    pub fn install(self) -> Result<()> {
+    pub fn schedule_install(self) -> Result<()> {
         let helper = self.stage.path().join(HELPER);
         Command::new(helper)
             .arg("--install-update")
@@ -373,25 +374,38 @@ fn replace_and_restart(target: &Path, stage: &Path, helper: &Path, key: &[u8; 32
         .to_os_string();
     backup_name.push(".previous");
     let backup = target.with_file_name(backup_name);
-    let backup_copy = stage.join("backup");
-    fs::copy(target, &backup_copy)?;
-    OpenOptions::new()
-        .write(true)
-        .open(&backup_copy)?
-        .sync_all()?;
-    fs::rename(backup_copy, &backup)?;
-    fs::rename(replacement, target)?;
+    let backup_copy = stage.join(STAGED_BACKUP);
+    let replace = (|| {
+        fs::copy(target, &backup_copy)?;
+        OpenOptions::new()
+            .write(true)
+            .open(&backup_copy)?
+            .sync_all()?;
+        fs::rename(replacement, target)
+    })();
+    if let Err(error) = replace {
+        let _ = fs::remove_file(&backup_copy);
+        return Err(error.into());
+    }
     if let Err(error) = restart(target, stage, None) {
-        fs::rename(&backup, target).map_err(|rollback| {
+        fs::rename(&backup_copy, target).map_err(|rollback| {
             format!(
                 "Launch failed ({error}). Restore {} manually ({rollback}).",
-                backup.display()
+                backup_copy.display()
             )
         })?;
         return Err(format!(
             "The new executable could not launch. Restored the previous version. {error}"
         )
         .into());
+    }
+    // The restarted process waits for this helper before checking the staging
+    // directory. If promotion fails, it will report where the backup remains.
+    if let Err(error) = fs::rename(&backup_copy, &backup) {
+        eprintln!(
+            "Could not move the update backup to {}. {error}",
+            backup.display()
+        );
     }
     Ok(())
 }
@@ -416,7 +430,7 @@ pub fn finish(mut args: impl Iterator<Item = OsString>) -> Result<Option<String>
         .filter(|name| is_stage_name(name))
         .ok_or("Invalid update staging folder")?;
     let pid = parse_pid(args.next())?;
-    let message = args.next();
+    let mut message = args.next().map(|text| text.to_string_lossy().into_owned());
     if args.next().is_some() {
         return Err("Unexpected updater arguments".into());
     }
@@ -428,12 +442,19 @@ pub fn finish(mut args: impl Iterator<Item = OsString>) -> Result<Option<String>
         wait_for_parent(pid)?;
         // Delete only files created by the updater, even if a folder with the
         // expected name was supplied from the command line.
-        for file in [HELPER, MANIFEST, SIGNATURE, "replacement", "backup"] {
+        for file in [HELPER, MANIFEST, SIGNATURE, "replacement"] {
             let _ = fs::remove_file(stage.join(file));
+        }
+        let backup = stage.join(STAGED_BACKUP);
+        if message.is_none() && backup.is_file() {
+            message = Some(format!(
+                "DeshCmd updated successfully. The backup is at {}.",
+                backup.display()
+            ));
         }
         let _ = fs::remove_dir(stage);
     }
-    Ok(message.map(|text| text.to_string_lossy().into_owned()))
+    Ok(message)
 }
 
 fn is_stage_name(name: &str) -> bool {

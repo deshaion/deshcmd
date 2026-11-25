@@ -1,15 +1,61 @@
 name: Build desktop packages
 
 on:
-  release:
-    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing Git tag for the draft release
+        type: string
+        required: true
 
 permissions:
   contents: read
 
+concurrency:
+  group: desktop-release-${{ inputs.tag }}
+
+env:
+  RELEASE_TAG: ${{ inputs.tag }}
+
 jobs:
+  prepare:
+    name: Check draft release
+    runs-on: ubuntu-24.04
+    outputs:
+      commit: ${{ steps.source.outputs.commit }}
+      signed: ${{ steps.draft.outputs.signed }}
+    steps:
+      - name: Check release status
+        id: draft
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          UPDATE_PUBLIC_KEY: ${{ vars.DESHCMD_UPDATE_PUBLIC_KEY }}
+        run: |
+          if [[ ! "$RELEASE_TAG" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.+-]+)?$ ]]; then
+            echo "Expected a version tag, such as v0.1.1." >&2
+            exit 1
+          fi
+          release=$(gh release view --repo "$GITHUB_REPOSITORY" --json isDraft,isPrerelease -- "$RELEASE_TAG")
+          jq -e '.isDraft' <<< "$release" >/dev/null || { echo "Release must be a draft." >&2; exit 1; }
+          signed=false
+          if [[ -n "$UPDATE_PUBLIC_KEY" ]] && jq -e '.isPrerelease | not' <<< "$release" >/dev/null; then
+            signed=true
+          fi
+          printf 'signed=%s\n' "$signed" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v6
+        with:
+          ref: refs/tags/${{ inputs.tag }}
+          persist-credentials: false
+
+      - name: Record release commit
+        id: source
+        run: printf 'commit=%s\n' "$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
   package:
     name: ${{ matrix.platform }} (${{ matrix.arch }})
+    needs: prepare
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -48,11 +94,12 @@ jobs:
       ARCH: ${{ matrix.arch }}
       EXTENSION: ${{ matrix.extension }}
       CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS: '-C target-feature=+crt-static'
-      BUILD_STANDALONE: ${{ !github.event.release.prerelease && vars.DESHCMD_UPDATE_PUBLIC_KEY != '' }}
+      BUILD_STANDALONE: ${{ needs.prepare.outputs.signed }}
 
     steps:
       - uses: actions/checkout@v6
         with:
+          ref: ${{ needs.prepare.outputs.commit }}
           persist-credentials: false
 
       - name: Set up Rust
@@ -179,14 +226,15 @@ jobs:
           if-no-files-found: error
 
   attach:
-    name: Attach packages to the release
-    needs: package
+    name: Attach packages and publish release
+    needs: [prepare, package]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
     steps:
       - uses: actions/checkout@v6
         with:
+          ref: ${{ needs.prepare.outputs.commit }}
           persist-credentials: false
 
       - uses: actions/download-artifact@v8
@@ -200,8 +248,9 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ github.event.release.tag_name }}
         run: |
+          draft=$(gh release view --repo "$GITHUB_REPOSITORY" --json isDraft --jq '.isDraft' -- "$RELEASE_TAG")
+          [[ "$draft" == true ]] || { echo "Release must still be a draft." >&2; exit 1; }
           shopt -s nullglob
           assets=(dist/deshcmd-*.AppImage dist/deshcmd-*.exe dist/deshcmd-*.dmg)
           if (( ${#assets[@]} != 4 )); then
@@ -211,11 +260,10 @@ jobs:
           gh release upload --repo "$GITHUB_REPOSITORY" --clobber -- "$RELEASE_TAG" "${assets[@]}" LICENSE
 
       - name: Sign and upload standalone updates
-        if: ${{ !github.event.release.prerelease && vars.DESHCMD_UPDATE_PUBLIC_KEY != '' }}
+        if: needs.prepare.outputs.signed == 'true'
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ github.event.release.tag_name }}
           UPDATE_PUBLIC_KEY: ${{ vars.DESHCMD_UPDATE_PUBLIC_KEY }}
           UPDATE_SIGNING_KEY: ${{ secrets.DESHCMD_UPDATE_SIGNING_KEY }}
         run: |
@@ -229,3 +277,10 @@ jobs:
           python3 packaging/sign-update.py dist "$version" "$RELEASE_TAG" "$signing_key" "$UPDATE_PUBLIC_KEY"
           gh release upload --repo "$GITHUB_REPOSITORY" --clobber -- "$RELEASE_TAG" dist/*.tar.gz dist/*.zip
           gh release upload --repo "$GITHUB_REPOSITORY" --clobber -- "$RELEASE_TAG" dist/latest.json dist/latest.json.sig
+
+      - name: Publish complete release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PROMOTE: ${{ needs.prepare.outputs.signed }}
+        run: gh release edit --repo "$GITHUB_REPOSITORY" --verify-tag --draft=false --latest="$PROMOTE" -- "$RELEASE_TAG"

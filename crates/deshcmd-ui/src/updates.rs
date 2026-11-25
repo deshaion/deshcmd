@@ -12,7 +12,7 @@ pub struct DesktopUpdate {
 pub type UpdateCheck = mpsc::Receiver<Result<Option<DesktopUpdate>, String>>;
 
 pub(crate) enum UpdateDialog {
-    Checking(UpdateCheck),
+    Checking,
     Ready(DesktopUpdate),
     Message(String),
 }
@@ -24,24 +24,35 @@ impl App {
 
     pub(crate) fn check_for_updates(&mut self, ctx: &egui::Context) {
         if self.update.is_none() {
-            self.update = Some(match self.desktop.check_for_update(ctx.clone()) {
-                Ok(check) => UpdateDialog::Checking(check),
-                Err(error) => UpdateDialog::Message(error),
-            });
+            if self.update_check.is_none() {
+                match self.desktop.check_for_update(ctx.clone()) {
+                    Ok(check) => self.update_check = Some(check),
+                    Err(error) => {
+                        self.show_update_error(error);
+                        return;
+                    }
+                }
+            }
+            self.update = Some(UpdateDialog::Checking);
         }
     }
 
     pub(crate) fn poll_update(&mut self) {
-        if let Some(UpdateDialog::Checking(check)) = &self.update {
-            self.update = Some(match check.try_recv() {
-                Err(TryRecvError::Empty) => return,
-                Err(TryRecvError::Disconnected) => {
-                    UpdateDialog::Message("The update check ended unexpectedly.".into())
-                }
-                Ok(Err(error)) => UpdateDialog::Message(error),
-                Ok(Ok(None)) => UpdateDialog::Message("DeshCmd is up to date.".into()),
-                Ok(Ok(Some(update))) => UpdateDialog::Ready(update),
-            });
+        let Some(check) = &self.update_check else {
+            return;
+        };
+        let finished = match check.try_recv() {
+            Err(TryRecvError::Empty) => return,
+            Err(TryRecvError::Disconnected) => {
+                UpdateDialog::Message("The update check ended unexpectedly.".into())
+            }
+            Ok(Err(error)) => UpdateDialog::Message(error),
+            Ok(Ok(None)) => UpdateDialog::Message("DeshCmd is up to date.".into()),
+            Ok(Ok(Some(update))) => UpdateDialog::Ready(update),
+        };
+        self.update_check = None;
+        if matches!(self.update, Some(UpdateDialog::Checking)) {
+            self.update = Some(finished);
         }
     }
 
@@ -52,12 +63,12 @@ impl App {
             ui.set_max_width(440.);
             ui.heading("DeshCmd Updates");
             match update {
-                UpdateDialog::Checking(_) => {
+                UpdateDialog::Checking => {
                     ui.horizontal(|ui| {
                         ui.spinner();
                         ui.label("Checking for and downloading updates…");
                     });
-                    (false, false)
+                    (ui.button("Dismiss").clicked(), false)
                 }
                 UpdateDialog::Ready(update) => {
                     ui.label(format!("DeshCmd {} is ready to install.", update.version));
@@ -85,9 +96,7 @@ impl App {
                 Ok(()) => self.apply(Action::Close, ctx),
                 Err(error) => self.show_update_error(error),
             }
-        } else if (close || response.should_close())
-            && !matches!(self.update, Some(UpdateDialog::Checking(_)))
-        {
+        } else if close || response.should_close() {
             self.update = None;
         }
     }

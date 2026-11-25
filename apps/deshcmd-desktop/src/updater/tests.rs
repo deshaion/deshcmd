@@ -104,9 +104,11 @@ fn replacement_preserves_the_backup_and_restores_it_on_launch_error() {
     let helper = stage.join(HELPER);
     let replacement = stage.join("replacement");
     let old = b"old executable fixture";
+    let older = b"existing rollback executable fixture";
     let installed = b"#!/bin/sh\n: > \"$0.started\"\n";
     fs::write(&helper, old).unwrap();
     fs::write(&target, old).unwrap();
+    fs::write(&backup, older).unwrap();
 
     let write_signed_stage = |payload: &[u8]| {
         fs::write(&replacement, payload).unwrap();
@@ -124,6 +126,7 @@ fn replacement_preserves_the_backup_and_restores_it_on_launch_error() {
             .contains("Restored the previous version")
     );
     assert_eq!(fs::read(&target).unwrap(), old);
+    assert_eq!(fs::read(&backup).unwrap(), older);
 
     write_signed_stage(installed);
     fs::write(&replacement, b"tampered").unwrap();
@@ -146,4 +149,37 @@ fn replacement_preserves_the_backup_and_restores_it_on_launch_error() {
         );
         std::thread::sleep(Duration::from_millis(10));
     }
+}
+
+#[cfg(windows)]
+#[test]
+fn a_busy_executable_does_not_replace_the_existing_rollback_copy() {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
+
+    let key = test_key();
+    let public_key = key.public_key().as_ref().try_into().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let stage = dir.path().join("stage");
+    fs::create_dir(&stage).unwrap();
+    let target = dir.path().join("deshcmd.exe");
+    let backup = dir.path().join("deshcmd.exe.previous");
+    let helper = stage.join(HELPER);
+    fs::write(&target, b"installed").unwrap();
+    fs::write(&helper, b"installed").unwrap();
+    fs::write(&backup, b"previous").unwrap();
+    fs::write(stage.join("replacement"), b"update").unwrap();
+    let manifest = manifest("v999.0.0", platform_asset().unwrap(), b"update");
+    fs::write(stage.join(MANIFEST), &manifest).unwrap();
+    fs::write(stage.join(SIGNATURE), key.sign(&manifest).as_ref()).unwrap();
+
+    let busy = OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .open(&target)
+        .unwrap();
+    assert!(replace_and_restart(&target, &stage, &helper, public_key).is_err());
+    assert_eq!(fs::read(&target).unwrap(), b"installed");
+    assert_eq!(fs::read(&backup).unwrap(), b"previous");
+    drop(busy);
 }

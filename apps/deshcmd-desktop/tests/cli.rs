@@ -17,6 +17,20 @@ fn help_prints_usage_without_opening_a_window() {
 }
 
 #[test]
+fn scheduling_command_rejects_extra_arguments_without_starting_the_gui() {
+    for flag in ["--schedule-update", "--update"] {
+        let output = deshcmd().args([flag, "unexpected"]).output().unwrap();
+        assert!(!output.status.success());
+        let expected = if cfg!(feature = "standalone-updater") {
+            "--schedule-update takes no arguments"
+        } else {
+            "Standalone updates are unavailable"
+        };
+        assert!(String::from_utf8_lossy(&output.stderr).contains(expected));
+    }
+}
+
+#[test]
 fn updater_mode_rejects_missing_arguments_without_opening_a_window() {
     let output = deshcmd().arg("--install-update").output().unwrap();
     assert!(!output.status.success());

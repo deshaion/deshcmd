@@ -129,6 +129,7 @@ pub struct App {
     startup_home: Option<StartupHome>,
     previews: Previews,
     update: Option<updates::UpdateDialog>,
+    update_check: Option<UpdateCheck>,
 }
 
 impl App {
@@ -207,6 +208,7 @@ impl App {
             startup_home: None,
             previews: Previews::new(context.egui_ctx.clone()),
             update: None,
+            update_check: None,
         }
     }
 

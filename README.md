@@ -15,7 +15,7 @@ An ordinary launch restores the saved workspace. Passing directories opens a fre
 
 ## Download builds
 
-The **Build desktop packages** workflow runs when a GitHub release is published and attaches the packages to that release. Download them from the release's **Assets** section. Filenames use the Cargo workspace version.
+The **Build desktop packages** workflow builds and attaches the packages before publishing a GitHub release. Download them from the release's **Assets** section. Filenames use the Cargo workspace version.
 
 | Platform | Package for version 0.1.0 |
 | --- | --- |
@@ -30,7 +30,11 @@ On Linux, mark the downloaded AppImage executable with `chmod +x deshcmd-0.1.0-x
 
 Extract the executable from a standalone archive into a folder you can write to. The standalone archives are `deshcmd-linux-x86_64.tar.gz`, `deshcmd-linux-aarch64.tar.gz`, `deshcmd-windows-x86_64.zip`, `deshcmd-macos-aarch64.tar.gz`, and `deshcmd-macos-x86_64.tar.gz`.
 
-Choose **Tools → Check for Updates…** and then **Install and Restart** when a newer version is ready. From a terminal, run `deshcmd --update` to check and install in one step. DeshCmd verifies the Ed25519 signature on the release manifest and the SHA-256 digests of the archive and extracted executable. A temporary copy of DeshCmd waits for the original process to exit, saves the old executable as `<executable>.previous`, replaces it, and restarts DeshCmd. It restores the backup if the OS rejects the launch. To restore that backup manually, close DeshCmd and rename it to the original executable filename.
+Choose **Tools → Check for Updates…** and then **Install and Restart** when a newer version is ready. You can dismiss an in-progress check and reopen it from Tools while it runs.
+
+From a terminal, run `deshcmd --schedule-update` (`--update` is an alias). Exit code 0 means DeshCmd is already up to date or the verified update was scheduled. The helper installs after the command exits and relaunches DeshCmd, so allow it to finish before launching the executable again.
+
+DeshCmd verifies the Ed25519 signature on the release manifest and the SHA-256 digests of the archive and extracted executable. A temporary copy of DeshCmd waits for the original process to exit, stages a backup, installs the new executable, and restarts DeshCmd. It saves the rollback copy as `<executable>.previous` after a successful launch and restores the staged backup if the OS rejects the launch. To restore the rollback copy manually, close DeshCmd and rename it to the original executable filename.
 
 For APT, Flatpak, Homebrew, and other package managers, use the package manager's update command. AppImages, DMG-installed apps, and the separate versioned Windows executable use manual release downloads. Package maintainers should build with Cargo's default features.
 
@@ -57,7 +61,9 @@ In GitHub, open **Settings → Secrets and variables → Actions** and add these
 | Variable `DESHCMD_UPDATE_PUBLIC_KEY` | The 64 hex characters printed above |
 | Secret `DESHCMD_UPDATE_SIGNING_KEY` | The complete contents of `update-key.pem`, including its PEM header and footer |
 
-Publish a stable release with a tag matching the workspace version, such as `v0.1.1` for version `0.1.1`, and designate it as the latest release. The workflow embeds the public key in standalone builds, then signs and uploads `latest.json` and `latest.json.sig` alongside the archives. First-time users and users of pre-updater builds need to download the first standalone build manually. Keep the same key for subsequent releases so installed builds can verify them. A replacement key requires users to download a build that trusts it.
+Push a tag matching the workspace version, such as `v0.1.1` for version `0.1.1`, and save a GitHub release for it as a draft. In **Actions → Build desktop packages**, run the workflow with that tag. The workflow embeds the public key, uploads the archives and signed manifest, then publishes the draft and marks it as latest. Prereleases and builds without a configured update key are published with latest promotion disabled.
+
+First-time users and users of pre-updater builds need to download the first standalone build manually. Keep the same key for subsequent releases so installed builds can verify them. A replacement key requires users to download a build that trusts it.
 
 Update signing authenticates files to DeshCmd. macOS Gatekeeper and Windows SmartScreen use their own code-signing systems.
 

@@ -44,7 +44,9 @@ impl Desktop for NativeDesktop {
                         update.map(|prepared| deshcmd_ui::DesktopUpdate {
                             version: prepared.version.clone(),
                             install: Box::new(move || {
-                                prepared.install().map_err(|error| error.to_string())
+                                prepared
+                                    .schedule_install()
+                                    .map_err(|error| error.to_string())
                             }),
                         })
                     })
@@ -421,26 +423,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("deshcmd --install-menu-entry");
         #[cfg(feature = "standalone-updater")]
         if updater::available() {
-            println!("deshcmd --update");
+            println!("deshcmd --schedule-update  (install after this process exits)");
         }
         return Ok(());
     }
     #[cfg(not(feature = "standalone-updater"))]
     if args.peek().is_some_and(|arg| {
-        arg == "--update" || arg == "--install-update" || arg == "--finish-update"
+        arg == "--schedule-update"
+            || arg == "--update"
+            || arg == "--install-update"
+            || arg == "--finish-update"
     }) {
         return Err("Standalone updates are unavailable in this installation".into());
     }
     #[cfg(feature = "standalone-updater")]
     let update_status = match args.peek().and_then(|arg| arg.to_str()) {
-        Some("--update") => {
+        Some("--schedule-update" | "--update") => {
             args.next();
             if args.next().is_some() {
-                return Err("--update takes no arguments".into());
+                return Err("--schedule-update takes no arguments".into());
             }
             if let Some(update) = updater::prepare()? {
-                println!("Installing DeshCmd {}", update.version);
-                update.install()?;
+                let version = update.version.clone();
+                update.schedule_install()?;
+                println!("DeshCmd {version} is scheduled to install after this process exits.");
             } else {
                 println!("DeshCmd is up to date");
             }
