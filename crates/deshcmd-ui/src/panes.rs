@@ -1141,18 +1141,46 @@ fn empty(ui: &mut Ui, tab: &Tab, side: Side, actions: &mut Vec<Action>) {
             ui.label(label(error_title, 15., TEXT).strong());
             ui.label(label(message, 12., SUB));
             ui.add_space(5.);
-            ui.horizontal(|ui| {
-                if tab.archive_locked {
-                    if ui.button("Unlock archive…").clicked() {
+            let primary_label = if tab.archive_locked {
+                "Unlock archive…"
+            } else {
+                "Retry"
+            };
+            let gap = 8.;
+            let font = egui::TextStyle::Body.resolve(ui.style());
+            let button_width = |text: &str| {
+                let text_width = ui
+                    .painter()
+                    .layout_no_wrap(text.to_owned(), font.clone(), TEXT)
+                    .size()
+                    .x;
+                text_width + 2. * ui.spacing().button_padding.x
+            };
+            let row_width = button_width(primary_label) + gap + button_width(up_label);
+            let mut buttons = |ui: &mut Ui| {
+                if ui.button(primary_label).clicked() {
+                    if tab.archive_locked {
                         actions.push(Action::Tool(side, Tool::UnlockArchive));
+                    } else {
+                        actions.push(Action::Command(Command::Refresh));
                     }
-                } else if ui.button("Retry").clicked() {
-                    actions.push(Action::Command(Command::Refresh));
                 }
                 if ui.button(up_label).clicked() {
                     actions.push(Action::Command(Command::Parent(side)));
                 }
-            });
+            };
+            if row_width <= ui.available_width() {
+                ui.allocate_ui_with_layout(
+                    vec2(row_width, ui.spacing().interact_size.y),
+                    Layout::left_to_right(Align::Center),
+                    |ui| {
+                        ui.spacing_mut().item_spacing.x = gap;
+                        buttons(ui);
+                    },
+                );
+            } else {
+                buttons(ui);
+            }
         } else if tab.loading && tab.entry_count() == 0 {
             ui.spinner();
             ui.label(label("Loading files…", 13., SUB));
