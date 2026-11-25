@@ -116,10 +116,14 @@ impl Desktop for NativeDesktop {
 
 #[cfg(target_os = "linux")]
 fn volumes() -> Vec<Place> {
+    parse_mounts(&std::fs::read_to_string("/proc/self/mountinfo").unwrap_or_default())
+}
+
+#[cfg(target_os = "linux")]
+fn parse_mounts(mountinfo: &str) -> Vec<Place> {
     use std::os::unix::ffi::OsStringExt;
     let mut seen = std::collections::HashSet::new();
-    let mut mounts = std::fs::read_to_string("/proc/self/mountinfo")
-        .unwrap_or_default()
+    let mut mounts = mountinfo
         .lines()
         .filter_map(|line| {
             let (left, right) = line.split_once(" - ")?;
@@ -367,6 +371,20 @@ fn icon() -> egui::IconData {
     }
 }
 
+fn initial_directories(
+    cwd: &Path,
+    home: &Path,
+    mut args: impl Iterator<Item = std::ffi::OsString>,
+) -> [PathBuf; 2] {
+    [cwd, home].map(|fallback| {
+        args.next()
+            .map(PathBuf::from)
+            .and_then(|path| cwd.join(path).canonicalize().ok())
+            .filter(|path| path.is_dir())
+            .unwrap_or_else(|| fallback.to_path_buf())
+    })
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args_os().skip(1).peekable();
     if args
@@ -405,13 +423,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .and_then(|home| home.canonicalize().ok())
         .unwrap_or_else(|| cwd.clone());
     let fresh = args.peek().is_some();
-    let initial = [cwd.clone(), home.clone()].map(|fallback| {
-        args.next()
-            .map(PathBuf::from)
-            .and_then(|path| cwd.join(path).canonicalize().ok())
-            .filter(|path| path.is_dir())
-            .unwrap_or(fallback)
-    });
+    let initial = initial_directories(&cwd, &home, args);
     let viewport = egui::ViewportBuilder::default()
         .with_title("deshcmd")
         .with_app_id("deshcmd")
@@ -451,3 +463,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests;

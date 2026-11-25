@@ -74,3 +74,28 @@ fn install_file(path: &Path, contents: &[u8]) -> io::Result<()> {
     file.persist(path)?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::ffi::OsStrExt;
+
+    #[test]
+    fn desktop_exec_quotes_spaces_shell_characters_and_desktop_field_codes() {
+        assert_eq!(
+            desktop_exec(Path::new("/tmp/Desh Cmd")).unwrap(),
+            r#""/tmp/Desh Cmd""#
+        );
+        assert_eq!(
+            quote_exec_argument("a\\\"\u{0060}$%\r\n\t"),
+            r#""a\\\\\\"\\`\\$%%\r\n\t""#
+        );
+        for path in ["/tmp/a=b", "/tmp/100%"] {
+            let command = desktop_exec(Path::new(path)).unwrap();
+            assert!(command.starts_with(r#"sh -c "exec \\"\\$0\\"""#));
+            assert!(command.ends_with(&quote_exec_argument(path)));
+        }
+        let invalid = Path::new(std::ffi::OsStr::from_bytes(b"/tmp/non-utf8-\xff"));
+        assert!(desktop_exec(invalid).is_err());
+    }
+}
