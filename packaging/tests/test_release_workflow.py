@@ -76,3 +76,10 @@ class ReleaseWorkflowTest(unittest.TestCase):
                     else:
                         self.assertEqual(result.returncode, 0, result.stderr)
                         self.assertEqual(output.read_text(), f"signed={signed}\n")
+
+    def test_draft_lookup_has_write_access_without_granting_it_to_builds(self):
+        jobs = self.workflow["jobs"]
+        prepare_permissions = jobs["prepare"].get("permissions", self.workflow["permissions"])
+        self.assertEqual(prepare_permissions["contents"], "write")
+        package_permissions = jobs["package"].get("permissions", self.workflow["permissions"])
+        self.assertEqual(package_permissions["contents"], "read")
