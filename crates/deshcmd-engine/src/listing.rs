@@ -579,6 +579,8 @@ fn compare_names(a: &str, b: &str, natural: bool) -> Ordering {
     a.len().cmp(&b.len())
 }
 
+pub const TEXT_PREVIEW_BYTES: u64 = 24 * 1024;
+
 pub enum Preview {
     Image { size: [usize; 2], rgba: Vec<u8> },
     Text(String),
@@ -612,7 +614,7 @@ pub fn preview(path: &Path, kind: Kind, pixels: u32) -> Preview {
     }
     let mut bytes = Vec::new();
     if File::open(path)
-        .and_then(|file| file.take(24 * 1024).read_to_end(&mut bytes))
+        .and_then(|file| file.take(TEXT_PREVIEW_BYTES).read_to_end(&mut bytes))
         .is_err()
     {
         return Preview::Unavailable;

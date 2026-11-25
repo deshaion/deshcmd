@@ -3,6 +3,7 @@ mod listing;
 mod operations;
 #[cfg(feature = "perf")]
 mod perf;
+mod text_preview;
 
 use std::collections::{HashMap, HashSet};
 use std::io;
@@ -16,11 +17,14 @@ pub use archives::{
     ArchiveOperation, ArchiveSelection, ArchiveSource, ExtractLayout, ExtractOptions, PackOptions,
     is_archive, preview_member,
 };
-pub use listing::{Column, Entry, Kind, Location, MatchOptions, Preview, Sort, View, preview};
+pub use listing::{
+    Column, Entry, Kind, Location, MatchOptions, Preview, Sort, TEXT_PREVIEW_BYTES, View, preview,
+};
 pub use operations::{
     Algorithm, Collision, Conflict, ManifestMode, Operation, Progress, TransferOptions,
 };
 use operations::{Control, Worker};
+pub use text_preview::{TextPreviewReader, TextPreviewWindow};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Side {

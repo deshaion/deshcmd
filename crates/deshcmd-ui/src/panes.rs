@@ -9,6 +9,7 @@ use egui::{
 };
 
 use crate::dialogs::{self, Tool};
+use crate::text_preview::LargeTextView;
 use crate::{Action, CachedPreview, Previews, child, theme::*};
 
 // Tabs, navigation, and room for the details header and one row.
@@ -23,6 +24,7 @@ pub(crate) struct PanelUi {
     editing_path: bool,
     request_path: bool,
     active_tab_in_strip: Option<(usize, u64, String, f32)>,
+    large_text: Option<LargeTextView>,
 }
 pub(crate) struct PaneScreen<'a> {
     pub pane: &'a Pane,
@@ -92,10 +94,19 @@ impl PanelUi {
             ),
             egui::StrokeKind::Inside,
         );
-        if let Some((source, entry)) = preview {
-            show_preview(root, rect, side, source, entry, previews, actions);
+        if let Some(selection) = preview {
+            show_preview(
+                root,
+                rect,
+                side,
+                selection,
+                previews,
+                &mut self.large_text,
+                actions,
+            );
             return;
         }
+        self.large_text = None;
         let display_path = tab.location().display_path();
         if self.tab_id != tab.id || self.base != display_path {
             self.tab_id = tab.id;
@@ -1329,11 +1340,16 @@ fn show_preview(
     root: &mut Ui,
     rect: Rect,
     side: Side,
-    source: Side,
-    entry: Option<&Entry>,
+    (source, entry): (Side, Option<&Entry>),
     previews: &mut Previews,
+    large_text: &mut Option<LargeTextView>,
     actions: &mut Vec<Action>,
 ) {
+    if large_text.as_ref().is_some_and(|view| {
+        entry.is_none_or(|entry| entry.archive.is_some() || !view.matches(entry))
+    }) {
+        *large_text = None;
+    }
     let mut ui = child(
         root,
         Id::unique(("quickview", side.index())),
@@ -1379,6 +1395,13 @@ fn show_preview(
                 ui.vertical_centered(|ui| {
                     ui.image((texture.id(), target));
                 });
+            }
+            Some(CachedPreview::Text(_))
+                if entry.archive.is_none() && entry.size > engine::TEXT_PREVIEW_BYTES =>
+            {
+                let view =
+                    large_text.get_or_insert_with(|| LargeTextView::new(entry, ui.ctx().clone()));
+                view.show(&mut ui);
             }
             Some(CachedPreview::Text(text)) => {
                 egui::ScrollArea::both()
