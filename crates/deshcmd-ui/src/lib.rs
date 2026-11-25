@@ -1,6 +1,7 @@
 mod dialogs;
 mod panes;
 mod settings;
+mod text_preview;
 mod theme;
 mod window;
 
