@@ -50,15 +50,27 @@ fn locked_history_navigation_preserves_the_original_tab() {
         Settings::default(),
         || {},
     );
+    let wait = |engine: &mut Engine, done: &dyn Fn(&Engine) -> bool| {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            engine.poll();
+            if done(engine) {
+                break;
+            }
+            assert!(Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+    };
     engine.dispatch(Command::Navigate {
         side,
         path: folder.clone(),
         new_tab: false,
         background: false,
     });
+    wait(&mut engine, &|engine| !engine.tab(side).busy());
     engine.dispatch(Command::LockTab(side, 0, TabLock::Locked));
     engine.dispatch(Command::Back(side));
-    assert_eq!(engine.pane(side).tabs.len(), 2);
+    wait(&mut engine, &|engine| engine.pane(side).tabs.len() == 2);
     assert_eq!(engine.pane(side).tabs[0].base(), folder);
     assert_eq!(engine.tab(side).base(), root);
     assert!(!engine.tab(side).can_forward());
@@ -70,7 +82,7 @@ fn locked_history_navigation_preserves_the_original_tab() {
         new_tab: true,
         background: true,
     });
-    assert_eq!(engine.pane(side).tabs.len(), 3);
+    wait(&mut engine, &|engine| engine.pane(side).tabs.len() == 3);
     assert_eq!(engine.pane(side).active, index);
     assert_eq!(engine.pane(side).tabs[2].base(), folder);
 }

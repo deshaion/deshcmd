@@ -82,29 +82,8 @@ impl Desktop for NativeDesktop {
             .set_text(text)
             .map_err(|error| error.to_string())
     }
-    fn places(&mut self) -> Vec<Place> {
-        let known = [
-            ("Desktop", dirs::desktop_dir()),
-            ("Documents", dirs::document_dir()),
-            ("Downloads", dirs::download_dir()),
-            ("Pictures", dirs::picture_dir()),
-            ("Music", dirs::audio_dir()),
-            ("Videos", dirs::video_dir()),
-        ];
-        let mut result = known
-            .into_iter()
-            .filter_map(|(name, path)| {
-                let path = path?.canonicalize().ok()?;
-                path.is_dir().then_some(Place {
-                    name: name.into(),
-                    path,
-                    drive: false,
-                    ejectable: false,
-                })
-            })
-            .collect::<Vec<_>>();
-        result.extend(volumes());
-        result
+    fn places_reader(&self) -> fn() -> Vec<Place> {
+        read_places
     }
     fn eject(&mut self, path: &Path) -> Result<(), String> {
         unmount(path)
@@ -112,6 +91,31 @@ impl Desktop for NativeDesktop {
     fn shortcut(&mut self, target: &Path, source: &Path) -> Result<(), String> {
         shortcut(target, source)
     }
+}
+
+fn read_places() -> Vec<Place> {
+    let known = [
+        ("Desktop", dirs::desktop_dir()),
+        ("Documents", dirs::document_dir()),
+        ("Downloads", dirs::download_dir()),
+        ("Pictures", dirs::picture_dir()),
+        ("Music", dirs::audio_dir()),
+        ("Videos", dirs::video_dir()),
+    ];
+    let mut result = known
+        .into_iter()
+        .filter_map(|(name, path)| {
+            let path = path?.canonicalize().ok()?;
+            path.is_dir().then_some(Place {
+                name: name.into(),
+                path,
+                drive: false,
+                ejectable: false,
+            })
+        })
+        .collect::<Vec<_>>();
+    result.extend(volumes());
+    result
 }
 
 #[cfg(target_os = "linux")]
@@ -371,18 +375,11 @@ fn icon() -> egui::IconData {
     }
 }
 
-fn initial_directories(
+fn requested_directories(
     cwd: &Path,
-    home: &Path,
     mut args: impl Iterator<Item = std::ffi::OsString>,
-) -> [PathBuf; 2] {
-    [cwd, home].map(|fallback| {
-        args.next()
-            .map(PathBuf::from)
-            .and_then(|path| cwd.join(path).canonicalize().ok())
-            .filter(|path| path.is_dir())
-            .unwrap_or_else(|| fallback.to_path_buf())
-    })
+) -> [Option<PathBuf>; 2] {
+    std::array::from_fn(|_| args.next().map(|path| cwd.join(path)))
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -419,11 +416,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let home = dirs::home_dir()
-        .and_then(|home| home.canonicalize().ok())
-        .unwrap_or_else(|| cwd.clone());
+    let home = dirs::home_dir().unwrap_or_else(|| cwd.clone());
     let fresh = args.peek().is_some();
-    let initial = initial_directories(&cwd, &home, args);
+    let requested = requested_directories(&cwd, args);
+    let initial = [cwd, home.clone()];
     let viewport = egui::ViewportBuilder::default()
         .with_title("deshcmd")
         .with_app_id("deshcmd")
@@ -446,13 +442,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "deshcmd",
         options,
         Box::new(move |context| {
-            let app = App::new(
+            let mut app = App::new(
                 context,
                 Box::new(NativeDesktop { clipboard: None }),
                 home,
                 initial,
                 fresh,
             );
+            app.open_initial_directories(requested);
             // Keep the native window's minimum independent of interface zoom.
             let ctx = &context.egui_ctx;
             ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(

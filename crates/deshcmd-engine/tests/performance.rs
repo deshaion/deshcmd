@@ -42,7 +42,7 @@ fn settle(engine: &mut Engine, wakes: &mpsc::Receiver<()>, label: &str, start: I
         engine.poll();
         longest = longest.max(poll.elapsed());
         polls += 1;
-        if Side::ALL.into_iter().all(|side| !engine.tab(side).loading) {
+        if Side::ALL.into_iter().all(|side| !engine.tab(side).busy()) {
             break;
         }
         wakes.recv_timeout(Duration::from_secs(30)).unwrap();

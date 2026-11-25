@@ -72,8 +72,8 @@ impl ScanTiming {
         self.dedup_paths += 1;
     }
 
-    pub(crate) fn finish(self, capacity: usize) {
-        let Some(start) = self.start else {
+    pub(crate) fn finish(mut self, capacity: usize) {
+        let Some(start) = self.start.take() else {
             return;
         };
         let total = start.elapsed();
@@ -99,5 +99,13 @@ impl ScanTiming {
             self.dedup_paths,
             capacity * std::mem::size_of::<super::Entry>()
         );
+    }
+}
+
+impl Drop for ScanTiming {
+    fn drop(&mut self) {
+        if self.start.is_some() {
+            eprintln!("counts,incomplete_metadata_attempts={}", self.attempts);
+        }
     }
 }

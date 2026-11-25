@@ -1301,6 +1301,11 @@ fn panel_status(root: &mut Ui, rect: Rect, side: Side, tab: &Tab, space: Option<
         rect.shrink2(vec2(12., 2.)),
         Layout::left_to_right(Align::Center),
     );
+    if let Some(path) = tab.pending_navigation() {
+        ui.spinner();
+        ui.add(egui::Label::new(label("Opening…", 11., ACCENT)).truncate())
+            .on_hover_text(path.display().to_string());
+    }
     let shown = tab.visible_count();
     let title = if tab.marked_count() == 0 {
         format!("{shown} items")
@@ -1432,6 +1437,7 @@ pub(crate) fn tree(
     path: &Path,
     current: &Path,
     depth: usize,
+    cache: &mut crate::probes::ReadCache<PathBuf, Vec<PathBuf>>,
     actions: &mut Vec<Action>,
 ) {
     if depth > 15 {
@@ -1448,20 +1454,17 @@ pub(crate) fn tree(
         if ui.small_button("Open folder").clicked() {
             actions.push(Action::Path(side, path.to_path_buf()));
         }
-        let cache_id = Id::unique(("directory-tree", path));
-        let folders = ui.data_mut(|data| {
-            let cached: Option<(std::time::Instant, Vec<PathBuf>)> = data.get_temp(cache_id);
-            if let Some((time, folders)) = cached
-                && time.elapsed().as_secs() < 5
-            {
-                return folders;
-            }
-            let folders = engine::tree_folders(path).unwrap_or_default();
-            data.insert_temp(cache_id, (std::time::Instant::now(), folders.clone()));
-            folders
-        });
+        let Some(folders) = cache.request(path.to_owned(), |path| {
+            engine::tree_folders(path).ok().map(|mut folders| {
+                folders.truncate(251);
+                folders.shrink_to_fit();
+                folders
+            })
+        }) else {
+            return;
+        };
         for folder in folders.iter().take(250) {
-            tree(ui, side, folder, current, depth + 1, actions);
+            tree(ui, side, folder, current, depth + 1, cache, actions);
         }
         if folders.len() > 250 {
             ui.label(label("More folders in the file panel", 11., MUTED));

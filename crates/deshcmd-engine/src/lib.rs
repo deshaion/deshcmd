@@ -1,8 +1,10 @@
 mod archives;
 mod listing;
+mod navigation;
 mod operations;
 #[cfg(feature = "perf")]
 mod perf;
+pub mod read_pool;
 #[cfg(test)]
 mod tests;
 mod text_preview;
@@ -151,13 +153,6 @@ impl HistoryEntry {
             entered_via: None,
         }
     }
-
-    fn is_available(&self) -> bool {
-        match &self.location {
-            Location::Archive { file, .. } => file.is_file(),
-            _ => self.location.base().is_dir(),
-        }
-    }
 }
 
 pub struct Tab {
@@ -183,6 +178,8 @@ pub struct Tab {
     pub archive_locked: bool,
     pub skipped: usize,
     generation: u64,
+    nav_revision: u64,
+    pending_navigation: Option<PathBuf>,
     dirty: bool,
 }
 
@@ -211,6 +208,8 @@ impl Tab {
             archive_locked: false,
             skipped: 0,
             generation: 0,
+            nav_revision: 0,
+            pending_navigation: None,
             dirty: true,
         }
     }
@@ -236,6 +235,19 @@ impl Tab {
             Location::Flat { .. } => "Flat view".into(),
             Location::List { .. } => "File list".into(),
         }
+    }
+    pub fn navigation_stamp(&self) -> (u64, u64) {
+        (self.id, self.nav_revision)
+    }
+    pub fn pending_navigation(&self) -> Option<&Path> {
+        self.pending_navigation.as_deref()
+    }
+    pub fn busy(&self) -> bool {
+        self.loading || self.pending_navigation.is_some()
+    }
+    fn cancel_navigation(&mut self) {
+        self.nav_revision += 1;
+        self.pending_navigation = None;
     }
     pub fn can_back(&self) -> bool {
         self.history_index > 0
@@ -382,6 +394,7 @@ impl Tab {
             }
             self.history_index = self.history.len() - 1;
         }
+        self.cancel_navigation();
         self.saved.location = location;
         self.clear_view();
         self.clear_marks();
@@ -409,17 +422,6 @@ impl Tab {
         self.set_location(location, false);
     }
 
-    fn history_step(&self, backwards: bool) -> Option<usize> {
-        let available = |index: &usize| {
-            let entry = &self.history[*index];
-            &entry.location != self.location() && entry.is_available()
-        };
-        if backwards {
-            (0..self.history_index).rev().find(available)
-        } else {
-            (self.history_index + 1..self.history.len()).find(available)
-        }
-    }
     fn invalidate_scan(&mut self) {
         self.error = None;
         self.archive_locked = false;
@@ -603,6 +605,7 @@ pub enum Command {
         background: bool,
     },
     History(Side, usize),
+    CancelNavigation(Side),
     Back(Side),
     Forward(Side),
     Parent(Side),
@@ -701,12 +704,14 @@ pub struct Job {
 }
 
 enum Event {
-    Listed(u64, u64, io::Result<listing::Scan>, Option<PathBuf>),
     JobProgress(u64, Progress),
     Conflict(u64, Conflict),
     ConflictCompared(u64, PathBuf, PathBuf, io::Result<bool>),
     Done(u64, io::Result<String>, Vec<String>),
 }
+
+type ScanKey = (u64, u64);
+type ScanResult = (io::Result<listing::Scan>, Option<PathBuf>);
 
 pub struct Engine {
     pub settings: Settings,
@@ -722,6 +727,9 @@ pub struct Engine {
     last_refresh: Instant,
     running: Option<u64>,
     archive_cache: Arc<archives::ArchiveCache>,
+    scans: read_pool::ReadPool<ScanKey, ScanResult>,
+    navigation: navigation::Navigation,
+    focus_revision: u64,
 }
 
 impl Engine {
@@ -743,6 +751,7 @@ impl Engine {
             .ok()
             .unwrap();
         let ignore = listing::compile_mask(&settings.ignore, false).unwrap_or_default();
+        let wake: Arc<dyn Fn() + Send + Sync> = Arc::new(wake);
         let mut engine = Self {
             settings,
             panes,
@@ -753,7 +762,10 @@ impl Engine {
             ignore,
             sender,
             receiver,
-            wake: Arc::new(wake),
+            scans: read_pool::ReadPool::new(2, 2, wake.clone()),
+            navigation: navigation::Navigation::new(wake.clone()),
+            focus_revision: 0,
+            wake,
             last_refresh: Instant::now(),
             running: None,
             archive_cache: Arc::default(),
@@ -792,9 +804,20 @@ impl Engine {
         })
     }
     pub fn dispatch(&mut self, command: Command) {
+        if matches!(
+            command,
+            Command::Focus(_) | Command::Tab(..) | Command::Select(..)
+        ) {
+            self.focus_revision += 1;
+        }
+        let previous_focus = (self.settings.active, self.tab(self.settings.active).id);
         if let Err(error) = self.execute(command) {
             self.notice = Some(error.to_string());
         }
+        if previous_focus != (self.settings.active, self.tab(self.settings.active).id) {
+            self.focus_revision += 1;
+        }
+        self.retain_navigation();
         self.start_scans();
         self.start_job();
     }
@@ -837,17 +860,10 @@ impl Engine {
                 new_tab,
                 background,
             } => self.navigate(side, &path, new_tab, background, true)?,
-            Command::History(side, index) => self.history(side, index)?,
-            Command::Back(side) => {
-                if let Some(index) = self.tab(side).history_step(true) {
-                    self.history(side, index)?;
-                }
-            }
-            Command::Forward(side) => {
-                if let Some(index) = self.tab(side).history_step(false) {
-                    self.history(side, index)?;
-                }
-            }
+            Command::CancelNavigation(side) => self.tab_mut(side).cancel_navigation(),
+            Command::History(side, index) => self.request_history(side, Some(index), false)?,
+            Command::Back(side) => self.request_history(side, None, true)?,
+            Command::Forward(side) => self.request_history(side, None, false)?,
             Command::Parent(side) => {
                 let path = match self.tab(side).location() {
                     Location::Directory(path) => path.parent().map(Path::to_path_buf),
@@ -952,6 +968,7 @@ impl Engine {
                 if let Some(tab) = self.pane_mut(side).tabs.get_mut(index) {
                     tab.saved.home = tab.base().to_path_buf();
                     tab.saved.lock = lock;
+                    tab.cancel_navigation();
                 }
             }
             Command::ToggleTabPin(side, index) => {
@@ -966,8 +983,7 @@ impl Engine {
             Command::MatchPanes => {
                 let side = self.settings.active;
                 let path = self.tab(side).base().to_path_buf();
-                self.navigate(side.other(), &path, false, false, false)?;
-                self.settings.active = side;
+                self.navigate_without_focus(side.other(), &path)?;
             }
             Command::Flat(side, selection) => {
                 let tab = self.tab_mut(side);
@@ -1166,11 +1182,7 @@ impl Engine {
             Command::OpenBookmark(index) => {
                 if let Some(bookmark) = self.settings.bookmarks.get(index).cloned() {
                     let side = self.settings.active;
-                    self.navigate(side, &bookmark.path, false, false, false)?;
-                    if let Some(other) = bookmark.opposite {
-                        self.navigate(side.other(), &other, false, false, false)?;
-                    }
-                    self.settings.active = side;
+                    self.navigate_bookmark(side, &bookmark.path, bookmark.opposite)?;
                 }
             }
             Command::SaveFavorite(name) => {
@@ -1310,156 +1322,6 @@ impl Engine {
         Ok(())
     }
 
-    fn navigate(
-        &mut self,
-        side: Side,
-        path: &Path,
-        new_tab: bool,
-        background: bool,
-        linked: bool,
-    ) -> io::Result<()> {
-        let base = self.tab(side).base().to_path_buf();
-        let resolved = if path == Path::new("~") {
-            self.home.clone()
-        } else if let Ok(suffix) = path.strip_prefix("~/") {
-            self.home.join(suffix)
-        } else {
-            base.join(path)
-        };
-        if !resolved.is_dir() {
-            if let Some(file) = resolved
-                .ancestors()
-                .find(|path| is_archive(path) && path.is_file())
-            {
-                let folder = resolved.strip_prefix(file).map_err(io::Error::other)?;
-                if folder
-                    .components()
-                    .any(|component| !matches!(component, std::path::Component::Normal(_)))
-                {
-                    return Err(io::Error::other("Invalid archive folder"));
-                }
-                let file = file.to_owned();
-                let tab = self.tab(side);
-                let previous_folder = match tab.location() {
-                    Location::Archive {
-                        file: previous_file,
-                        folder: previous_folder,
-                    } if previous_file == &file && previous_folder.parent() == Some(folder) => {
-                        Some(previous_file.join(previous_folder))
-                    }
-                    _ => None,
-                };
-                let location = Location::Archive {
-                    file,
-                    folder: folder.into(),
-                };
-                let opens_tab = new_tab
-                    || matches!(tab.saved.lock, TabLock::Locked | TabLock::NewTab)
-                        && tab.location() != &location;
-                if opens_tab {
-                    let mut saved = default_tab(location.base().to_owned());
-                    saved.location = location;
-                    self.add_tab(side, saved, background);
-                } else {
-                    let tab = self.tab_mut(side);
-                    tab.set_location(location, true);
-                    tab.pending_parent_focus = previous_folder;
-                    self.settings.active = side;
-                }
-                return Ok(());
-            }
-            return Err(io::Error::other(format!(
-                "{} is unavailable or is not a directory",
-                resolved.display()
-            )));
-        }
-        let path = resolved.canonicalize()?;
-        let tab = self.tab(side);
-        let previous = tab.base().to_path_buf();
-        let parent_focus = tab
-            .entry_in_parent(&resolved)
-            .or_else(|| tab.entry_in_parent(&path))
-            .and_then(Path::file_name)
-            .map(|name| path.join(name));
-        let location = Location::Directory(path.clone());
-        let location_changed = tab.location() != &location;
-        let lock = tab.saved.lock;
-        let opens_tab = new_tab
-            || matches!(lock, TabLock::Locked | TabLock::NewTab)
-                && (path != previous || matches!(tab.location(), Location::Archive { .. }));
-        let tab = if opens_tab {
-            self.add_tab(side, default_tab(path.clone()), background)
-        } else {
-            self.settings.active = side;
-            let tab = self.tab_mut(side);
-            tab.set_location(location, true);
-            tab
-        };
-        tab.pending_parent_focus = parent_focus;
-        if opens_tab || location_changed {
-            tab.history[tab.history_index].entered_via = Some(resolved);
-        }
-        if self.settings.linked
-            && linked
-            && !background
-            && !opens_tab
-            && !matches!(self.tab(side.other()).location(), Location::Archive { .. })
-        {
-            let target = self.tab(side.other()).base();
-            let paired = if let Some(parent) = previous.parent().filter(|parent| parent == &path) {
-                let _ = parent;
-                target.parent().map(Path::to_path_buf)
-            } else {
-                path.strip_prefix(&previous)
-                    .ok()
-                    .map(|suffix| target.join(suffix))
-            };
-            if let Some(paired) = paired
-                && paired.is_dir()
-            {
-                let _ = self.navigate(side.other(), &paired, false, false, false);
-                self.settings.active = side;
-            }
-        }
-        Ok(())
-    }
-    fn history(&mut self, side: Side, index: usize) -> io::Result<()> {
-        let tab = self.tab_mut(side);
-        if let Some(entry) = tab.history.get(index) {
-            if !entry.is_available() {
-                return Err(io::Error::other("This history location is unavailable"));
-            }
-            let HistoryEntry {
-                location,
-                entered_via,
-            } = entry.clone();
-            let parent_focus = match &location {
-                Location::Directory(parent) => tab.entry_in_parent(parent).map(Path::to_path_buf),
-                _ => None,
-            };
-            let tab = if matches!(tab.saved.lock, TabLock::Locked | TabLock::NewTab)
-                && (location.base() != tab.base()
-                    || (matches!(&location, Location::Archive { .. })
-                        || matches!(tab.location(), Location::Archive { .. }))
-                        && &location != tab.location())
-            {
-                let mut saved = default_tab(location.base().to_path_buf());
-                if matches!(&location, Location::Archive { .. }) {
-                    saved.location = location;
-                }
-                let tab = self.add_tab(side, saved, false);
-                tab.history[0].entered_via = entered_via;
-                tab
-            } else {
-                tab.history_index = index;
-                tab.set_location(location, false);
-                tab
-            };
-            tab.pending_parent_focus = parent_focus;
-            self.settings.active = side;
-        }
-        Ok(())
-    }
     fn add_tab(&mut self, side: Side, saved: SavedTab, background: bool) -> &mut Tab {
         self.ids += 1;
         let index = self.pane(side).tabs.len();
@@ -1516,27 +1378,35 @@ impl Engine {
         }
     }
     fn start_scans(&mut self) {
+        let active = self
+            .panes
+            .each_ref()
+            .map(|pane| (pane.tab().id, pane.tab().generation));
+        self.scans.retain(|key| active.contains(&key));
         for pane in &mut self.panes {
+            let active = pane.active;
+            for (index, tab) in pane.tabs.iter_mut().enumerate() {
+                if index != active && tab.loading {
+                    tab.invalidate_scan();
+                }
+            }
             let tab = pane.tab_mut();
             if tab.loading || !tab.dirty {
                 continue;
             }
-            tab.loading = true;
-            tab.dirty = false;
-            let (id, generation, location) = (tab.id, tab.generation, tab.saved.location.clone());
+            let location = tab.saved.location.clone();
             let recursive = tab.filter.recursive;
             let archive_cache = self.archive_cache.clone();
-            let (sender, wake) = (self.sender.clone(), self.wake.clone());
             #[cfg(feature = "perf")]
             let scheduled = perf::timestamp();
-            std::thread::spawn(move || {
+            let accepted = self.scans.submit((tab.id, tab.generation), move |cancel| {
                 #[cfg(feature = "perf")]
                 perf::elapsed("worker_start", scheduled);
                 let result = match &location {
                     Location::Archive { file, folder } => {
-                        archives::scan(&archive_cache, file, folder, recursive)
+                        archives::scan(&archive_cache, file, folder, recursive, cancel)
                     }
-                    _ => listing::scan(&location, recursive),
+                    _ => listing::scan_cancellable(&location, recursive, cancel),
                 };
                 let fallback = match (&location, &result) {
                     (Location::Directory(path), Err(error))
@@ -1547,16 +1417,24 @@ impl Engine {
                     {
                         path.ancestors()
                             .skip(1)
+                            .take_while(|_| !cancel.cancelled())
                             .find(|parent| parent.is_dir())
                             .map(Path::to_owned)
                     }
                     _ => None,
                 };
-                let _ = sender.send(Event::Listed(id, generation, result, fallback));
                 #[cfg(feature = "perf")]
-                perf::elapsed("publication", scheduled);
-                wake();
+                if cancel.cancelled() {
+                    perf::elapsed("listing_cancel_observed", cancel.cancelled_at());
+                } else {
+                    perf::elapsed("publication", scheduled);
+                }
+                (result, fallback)
             });
+            if accepted {
+                tab.loading = true;
+                tab.dirty = false;
+            }
         }
     }
     fn start_job(&mut self) {
@@ -1597,61 +1475,63 @@ impl Engine {
         });
     }
 
-    pub fn poll(&mut self) {
-        while let Ok(event) = self.receiver.try_recv() {
-            match event {
-                Event::Listed(id, generation, result, fallback) => {
-                    for pane in &mut self.panes {
-                        let Some(tab) = pane
-                            .tabs
-                            .iter_mut()
-                            .find(|tab| tab.id == id && tab.generation == generation)
-                        else {
-                            continue;
-                        };
-                        tab.loading = false;
-                        let parent_focus = tab.pending_parent_focus.take();
-                        match result {
-                            Ok(listing) => {
-                                #[cfg(feature = "perf")]
-                                let install = perf::timestamp();
-                                tab.entries = listing.entries;
-                                tab.skipped = listing.skipped;
-                                tab.error = None;
-                                tab.archive_locked = false;
-                                listing::sort(
-                                    &mut tab.entries,
-                                    &tab.saved.sort,
-                                    self.settings.directories_first,
-                                    self.settings.natural_sort,
-                                );
-                                if let Some(path) = &parent_focus {
-                                    tab.cursor = Some(path.clone());
-                                }
-                                tab.filter_entries(self.settings.show_hidden, self.ignore.as_ref());
-                                if parent_focus.is_some() && parent_focus == tab.cursor {
-                                    tab.anchor.clone_from(&tab.cursor);
-                                    tab.anchor_position = tab.cursor_position;
-                                    tab.parent_focus_restored = true;
-                                }
-                                #[cfg(feature = "perf")]
-                                perf::elapsed("install", install);
-                            }
-                            Err(error) => {
-                                if let Some(parent) = fallback {
-                                    tab.recover_directory(parent);
-                                    break;
-                                }
-                                tab.archive_locked = archives::is_password_error(&error);
-                                tab.error = Some(error.to_string());
-                                tab.clear_view();
-                                tab.clear_marks();
-                                tab.cursor = None;
-                            }
+    fn install_scans(&mut self) {
+        for ((id, generation), (result, fallback)) in self.scans.drain() {
+            for pane in &mut self.panes {
+                let tab = pane.tab_mut();
+                if tab.id != id || tab.generation != generation {
+                    continue;
+                }
+                tab.loading = false;
+                let parent_focus = tab.pending_parent_focus.take();
+                match result {
+                    Ok(listing) => {
+                        #[cfg(feature = "perf")]
+                        let install = perf::timestamp();
+                        tab.entries = listing.entries;
+                        tab.skipped = listing.skipped;
+                        tab.error = None;
+                        tab.archive_locked = false;
+                        listing::sort(
+                            &mut tab.entries,
+                            &tab.saved.sort,
+                            self.settings.directories_first,
+                            self.settings.natural_sort,
+                        );
+                        if let Some(path) = &parent_focus {
+                            tab.cursor = Some(path.clone());
                         }
-                        break;
+                        tab.filter_entries(self.settings.show_hidden, self.ignore.as_ref());
+                        if parent_focus.is_some() && parent_focus == tab.cursor {
+                            tab.anchor.clone_from(&tab.cursor);
+                            tab.anchor_position = tab.cursor_position;
+                            tab.parent_focus_restored = true;
+                        }
+                        #[cfg(feature = "perf")]
+                        perf::elapsed("install", install);
+                    }
+                    Err(error) => {
+                        if let Some(parent) = fallback {
+                            tab.recover_directory(parent);
+                            break;
+                        }
+                        tab.archive_locked = archives::is_password_error(&error);
+                        tab.error = Some(error.to_string());
+                        tab.clear_view();
+                        tab.clear_marks();
+                        tab.cursor = None;
                     }
                 }
+                break;
+            }
+        }
+    }
+
+    pub fn poll(&mut self) {
+        self.install_navigation();
+        self.retain_navigation();
+        while let Ok(event) = self.receiver.try_recv() {
+            match event {
                 Event::JobProgress(id, progress) => {
                     if let Some(job) = self.jobs.iter_mut().find(|job| job.id == id) {
                         job.progress = progress;
@@ -1713,6 +1593,7 @@ impl Engine {
                 }
             }
         }
+        self.install_scans();
         if self.settings.auto_refresh && self.last_refresh.elapsed() >= Duration::from_secs(4) {
             self.last_refresh = Instant::now();
             for pane in &mut self.panes {

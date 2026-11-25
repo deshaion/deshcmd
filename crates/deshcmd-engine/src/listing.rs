@@ -1,3 +1,4 @@
+use crate::read_pool::Cancellation;
 use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
@@ -58,18 +59,24 @@ impl Entry {
         self.kind == Kind::Folder
     }
 
-    fn from_path(path: PathBuf, comments: &HashMap<String, String>) -> io::Result<Self> {
+    fn from_path(
+        path: PathBuf,
+        comments: &HashMap<String, String>,
+        cancel: &Cancellation,
+    ) -> io::Result<Self> {
         let metadata = path.symlink_metadata()?;
-        Ok(Self::from_metadata(path, metadata, comments))
+        Self::from_metadata(path, metadata, comments, cancel)
     }
 
     fn from_metadata(
         path: PathBuf,
         link_meta: Metadata,
         comments: &HashMap<String, String>,
-    ) -> Self {
+        cancel: &Cancellation,
+    ) -> io::Result<Self> {
         let link = link_meta.is_symlink();
         let meta = if link {
+            cancel.check()?;
             path.metadata().unwrap_or(link_meta)
         } else {
             link_meta
@@ -103,7 +110,7 @@ impl Entry {
         };
         #[cfg(not(windows))]
         let system_hidden = false;
-        Self {
+        Ok(Self {
             path,
             archive: None,
             extension,
@@ -118,7 +125,7 @@ impl Entry {
             comment: comments.get(&name).cloned().unwrap_or_default(),
             name,
             attributes,
-        }
+        })
     }
     pub(crate) fn archive(
         source: &Arc<crate::ArchiveSource>,
@@ -384,7 +391,17 @@ impl Scan {
     }
 }
 
-pub(crate) fn scan(location: &Location, recursive: bool) -> io::Result<Scan> {
+#[cfg(test)]
+fn scan(location: &Location, recursive: bool) -> io::Result<Scan> {
+    scan_cancellable(location, recursive, &Default::default())
+}
+
+pub(crate) fn scan_cancellable(
+    location: &Location,
+    recursive: bool,
+    cancel: &Cancellation,
+) -> io::Result<Scan> {
+    cancel.check()?;
     #[cfg(feature = "perf")]
     let mut timing = crate::perf::ScanTiming::new();
     let mut scan = Scan {
@@ -395,9 +412,13 @@ pub(crate) fn scan(location: &Location, recursive: bool) -> io::Result<Scan> {
     if let Location::Directory(path) = location
         && !recursive
     {
-        let directory = fs::read_dir(path)?;
+        let mut directory = fs::read_dir(path)?;
         let mut comments = None;
-        for item in directory {
+        while let Some(item) = {
+            cancel.check()?;
+            directory.next()
+        } {
+            cancel.check()?;
             let item = match item {
                 Ok(item) => item,
                 Err(_) => {
@@ -410,10 +431,11 @@ pub(crate) fn scan(location: &Location, recursive: bool) -> io::Result<Scan> {
                 timing.comment_read();
                 crate::operations::read_comments(path)
             });
+            cancel.check()?;
             let load = || {
                 // DirEntry metadata describes the link itself, as symlink_metadata does.
                 let metadata = item.metadata()?;
-                Ok(Entry::from_metadata(item.path(), metadata, comments))
+                Entry::from_metadata(item.path(), metadata, comments, cancel)
             };
             #[cfg(feature = "perf")]
             let result = timing.entry(load);
@@ -429,7 +451,11 @@ pub(crate) fn scan(location: &Location, recursive: bool) -> io::Result<Scan> {
     let mut paths = Vec::new();
     match location {
         Location::Directory(path) => {
-            for entry in walkdir::WalkDir::new(path).min_depth(1) {
+            let mut walker = walkdir::WalkDir::new(path).min_depth(1).into_iter();
+            while let Some(entry) = {
+                cancel.check()?;
+                walker.next()
+            } {
                 match entry {
                     Ok(entry) => paths.push(entry.into_path()),
                     Err(error) if error.depth() == 0 => return Err(error.into()),
@@ -440,7 +466,12 @@ pub(crate) fn scan(location: &Location, recursive: bool) -> io::Result<Scan> {
         Location::Flat { roots, .. } => {
             let mut seen = HashSet::new();
             for root in roots {
-                for entry in walkdir::WalkDir::new(root) {
+                cancel.check()?;
+                let mut walker = walkdir::WalkDir::new(root).into_iter();
+                while let Some(entry) = {
+                    cancel.check()?;
+                    walker.next()
+                } {
                     match entry {
                         Ok(entry) if !entry.file_type().is_dir() => {
                             let path = entry.into_path();
@@ -459,17 +490,19 @@ pub(crate) fn scan(location: &Location, recursive: bool) -> io::Result<Scan> {
         }
         Location::List { paths: list, .. } => {
             let mut seen = HashSet::new();
-            paths.extend(
-                list.iter()
-                    .filter(|path| seen.insert(path.as_path()))
-                    .cloned(),
-            );
+            for path in list {
+                cancel.check()?;
+                if seen.insert(path.as_path()) {
+                    paths.push(path.clone());
+                }
+            }
         }
         Location::Archive { .. } => unreachable!(),
     }
     scan.entries.reserve_exact(paths.len());
     let mut cache = HashMap::new();
     for path in paths {
+        cancel.check()?;
         let folder = path.parent().unwrap_or(location.base());
         let comments = if let Some(comments) = cache.get(folder) {
             comments
@@ -480,7 +513,8 @@ pub(crate) fn scan(location: &Location, recursive: bool) -> io::Result<Scan> {
             let comments = crate::operations::read_comments(folder);
             cache.entry(key).or_insert(comments)
         };
-        let load = || Entry::from_path(path, comments);
+        cancel.check()?;
+        let load = || Entry::from_path(path, comments, cancel);
         #[cfg(feature = "perf")]
         let result = timing.entry(load);
         #[cfg(not(feature = "perf"))]

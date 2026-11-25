@@ -1057,6 +1057,7 @@ impl ArchiveCache {
 impl ArchiveSource {
     fn inventory(&self, control: &Control) -> io::Result<Arc<Inventory>> {
         let mut cached = self.inventory.lock().unwrap();
+        control.check()?;
         if let Some(inventory) = cached.as_ref() {
             return Ok(inventory.clone());
         }
@@ -1114,12 +1115,16 @@ pub(crate) fn scan(
     file: &Path,
     folder: &Path,
     recursive: bool,
+    cancel: &crate::read_pool::Cancellation,
 ) -> io::Result<Scan> {
+    cancel.check()?;
     let source = cache.source(file)?;
-    let inventory = source.inventory(&Control::default())?;
+    let inventory = source.inventory(&Control::for_read(cancel))?;
+    cancel.check()?;
     let mut rows = BTreeMap::new();
     let mut folder_exists = folder.as_os_str().is_empty();
     for member in &inventory.members {
+        cancel.check()?;
         let Ok(relative) = member.path.strip_prefix(folder) else {
             continue;
         };

@@ -1,5 +1,6 @@
 mod dialogs;
 mod panes;
+mod probes;
 mod settings;
 mod text_preview;
 mod theme;
@@ -42,7 +43,9 @@ pub trait Desktop {
     fn clipboard_files(&mut self) -> Vec<PathBuf>;
     fn clipboard_text(&mut self) -> Option<String>;
     fn copy_text(&mut self, text: &str) -> Result<(), String>;
-    fn places(&mut self) -> Vec<Place>;
+    fn places_reader(&self) -> fn() -> Vec<Place> {
+        Vec::new
+    }
     fn eject(&mut self, path: &Path) -> Result<(), String>;
     fn shortcut(&mut self, target: &Path, source: &Path) -> Result<(), String>;
 }
@@ -88,22 +91,28 @@ struct Interface {
     show_help: bool,
 }
 
+type DialogRead = Box<dyn FnOnce(&mut App, &egui::Context) + Send>;
+
 pub struct App {
     pub(crate) engine: Engine,
     desktop: Box<dyn Desktop>,
     interface: Interface,
     dialog: Option<Dialog>,
     preferences: Option<settings::Preferences>,
-    places: Vec<Place>,
-    spaces: HashMap<PathBuf, (u64, u64)>,
-    last_places: Instant,
+    places: std::sync::Arc<Vec<Place>>,
+    read_places: fn() -> Vec<Place>,
+    places_cache: probes::ReadCache<(), Vec<Place>>,
+    spaces: probes::ReadCache<PathBuf, (u64, u64)>,
+    tree_folders: probes::ReadCache<PathBuf, Vec<PathBuf>>,
+    dialog_reads: engine::read_pool::ReadPool<(), DialogRead>,
+    dialog_revision: u64,
     previews: Previews,
 }
 
 impl App {
     pub fn new(
         context: &eframe::CreationContext<'_>,
-        mut desktop: Box<dyn Desktop>,
+        desktop: Box<dyn Desktop>,
         home: PathBuf,
         initial: [PathBuf; 2],
         fresh: bool,
@@ -136,7 +145,8 @@ impl App {
         let engine = Engine::new(home, initial, settings, move || ctx.request_repaint());
         Self {
             engine,
-            places: desktop.places(),
+            places: Default::default(),
+            read_places: desktop.places_reader(),
             desktop,
             interface: Interface {
                 tree,
@@ -158,10 +168,56 @@ impl App {
             },
             dialog: None,
             preferences: None,
-            spaces: HashMap::new(),
-            last_places: Instant::now(),
+            places_cache: probes::ReadCache::new(&context.egui_ctx, 1, Duration::from_secs(10), 1),
+            spaces: probes::ReadCache::new(&context.egui_ctx, 2, Duration::from_secs(10), 32),
+            tree_folders: probes::ReadCache::new(&context.egui_ctx, 2, Duration::from_secs(5), 192),
+            dialog_reads: engine::read_pool::ReadPool::new(
+                1,
+                1,
+                probes::repaint(&context.egui_ctx),
+            ),
+            dialog_revision: 0,
             previews: Previews::new(context.egui_ctx.clone()),
         }
+    }
+
+    pub fn open_initial_directories(&mut self, locations: [Option<PathBuf>; 2]) {
+        for (side, path) in Side::ALL.into_iter().zip(locations) {
+            if let Some(path) = path {
+                self.engine.request_initial_directory(side, path);
+            }
+        }
+    }
+
+    fn poll_dialog_reads(&mut self, ctx: &egui::Context) {
+        for (_, apply) in self.dialog_reads.drain() {
+            apply(self, ctx);
+        }
+    }
+
+    fn cancel_dialog_read(&mut self) {
+        self.dialog_revision += 1;
+        self.dialog_reads.retain(|()| false);
+    }
+
+    fn read_for_tab<R: Send + 'static>(
+        &self,
+        side: Side,
+        read: impl FnOnce() -> R + Send + 'static,
+        apply: impl FnOnce(&mut Self, &egui::Context, R) + Send + 'static,
+    ) {
+        let revision = self.dialog_revision;
+        let origin = self.engine.tab(side).navigation_stamp();
+        self.dialog_reads.submit((), move |_| {
+            let result = read();
+            Box::new(move |app, ctx| {
+                if app.dialog_revision == revision
+                    && app.engine.tab(side).navigation_stamp() == origin
+                {
+                    apply(app, ctx, result);
+                }
+            })
+        });
     }
 
     fn apply(&mut self, action: Action, ctx: &egui::Context) {
@@ -586,7 +642,7 @@ impl App {
                 }
                 if self.interface.tree {
                     let root = current.ancestors().last().unwrap_or(current).to_path_buf();
-                    panes::tree(ui, side, &root, current, 0, actions);
+                    panes::tree(ui, side, &root, current, 0, &mut self.tree_folders, actions);
                 }
             });
     }
@@ -1028,6 +1084,10 @@ impl App {
             actions.push(Action::Command(Command::Invert(side)));
         }
         if just(Key::Escape) {
+            if self.engine.tab(side).pending_navigation().is_some() {
+                actions.push(Action::Command(Command::CancelNavigation(side)));
+                return;
+            }
             actions.push(Action::Command(Command::UnmarkAll(side)));
             self.interface.quick = None;
         }
@@ -1289,12 +1349,9 @@ impl App {
             let root = pane.tab().base();
             let space = self
                 .spaces
-                .get(root)
-                .copied()
-                .or_else(|| engine::space(root));
-            if let Some(space) = space {
-                self.spaces.insert(root.to_owned(), space);
-            }
+                .request(root.to_owned(), |path| engine::space(path))
+                .as_deref()
+                .copied();
             let column_set = if self.interface.alternate_columns[side.index()] {
                 &self.engine.settings.alternate_columns
             } else {
@@ -1357,11 +1414,14 @@ impl eframe::App for App {
         self.engine.poll();
         self.record_notice();
         self.previews.poll();
-        if self.last_places.elapsed() >= Duration::from_secs(10) {
-            self.places = self.desktop.places();
-            self.spaces.clear();
-            self.last_places = Instant::now();
+        self.places_cache.poll();
+        let read_places = self.read_places;
+        if let Some(places) = self.places_cache.request((), move |()| Some(read_places())) {
+            self.places = places;
         }
+        self.spaces.poll();
+        self.tree_folders.poll();
+        self.poll_dialog_reads(ctx);
         if self
             .interface
             .notice

@@ -62,9 +62,6 @@ impl Desktop for TestDesktop {
         state.files.clear();
         Ok(())
     }
-    fn places(&mut self) -> Vec<Place> {
-        vec![]
-    }
     fn eject(&mut self, _: &Path) -> Result<(), String> {
         unreachable!()
     }
@@ -104,7 +101,7 @@ fn panel_navigation_and_preview_shortcuts() {
     let side = Side::Left;
     let wait_for_listing = |app: &mut App| {
         let deadline = Instant::now() + Duration::from_secs(5);
-        while app.engine.tab(side).loading {
+        while app.engine.tab(side).busy() {
             assert!(Instant::now() < deadline, "directory listing timed out");
             app.engine.poll();
             std::thread::sleep(Duration::from_millis(1));
@@ -146,12 +143,16 @@ fn panel_navigation_and_preview_shortcuts() {
     app.engine
         .dispatch(Command::Select(side, folder.clone(), engine::Select::Focus));
     press(&mut app, &mut frame, Key::ArrowRight, plain);
+    wait_for_listing(&mut app);
     assert_eq!(app.engine.tab(side).base(), folder);
     press(&mut app, &mut frame, Key::ArrowLeft, plain);
+    wait_for_listing(&mut app);
     assert_eq!(app.engine.tab(side).base(), source);
     press(&mut app, &mut frame, Key::ArrowLeft, alt);
+    wait_for_listing(&mut app);
     assert_eq!(app.engine.tab(side).base(), folder);
     press(&mut app, &mut frame, Key::ArrowRight, alt);
+    wait_for_listing(&mut app);
     assert_eq!(app.engine.tab(side).base(), source);
 
     wait_for_listing(&mut app);
@@ -255,8 +256,8 @@ fn panel_navigation_and_preview_shortcuts() {
     });
     wait_for_listing(&mut app);
     press(&mut app, &mut frame, Key::ArrowLeft, plain);
-    assert_eq!(app.engine.tab(side).base(), parent);
     wait_for_listing(&mut app);
+    assert_eq!(app.engine.tab(side).base(), parent);
     assert_eq!(app.engine.tab(side).current().unwrap().path, child);
     assert_eq!(app.engine.tab(side).marked_count(), 0);
     focus_outline(draw(&mut app, &mut frame, vec![]));
@@ -340,7 +341,7 @@ pub(super) fn settle(app: &mut App) {
         app.engine.poll();
         if Side::ALL
             .into_iter()
-            .all(|side| !app.engine.tab(side).loading)
+            .all(|side| !app.engine.tab(side).busy())
             && app.engine.jobs.iter().all(|job| job.state.finished())
         {
             return;
@@ -386,6 +387,9 @@ fn workspace_exports_can_be_imported_through_native_file_pickers() {
     app.engine.dispatch(Command::CloseTab(Side::Left, 1));
     native.borrow_mut().pick = Some(tabs);
     app.invoke(Side::Left, Tool::ImportTabs, &ctx);
+    wait_for_dialog_read(&mut app, &ctx, |app| {
+        app.engine.pane(Side::Left).tabs.len() == 2
+    });
     assert_eq!(app.engine.pane(Side::Left).tabs.len(), 2);
 
     let bookmarks = root.join("export.bookmarks");
@@ -395,12 +399,21 @@ fn workspace_exports_can_be_imported_through_native_file_pickers() {
     app.engine.dispatch(Command::RemoveBookmark(0));
     native.borrow_mut().pick = Some(bookmarks);
     app.invoke(Side::Left, Tool::ImportBookmarks, &ctx);
+    wait_for_dialog_read(&mut app, &ctx, |app| {
+        !app.engine.settings.bookmarks.is_empty()
+    });
     assert_eq!(app.engine.settings.bookmarks, [bookmark]);
 
     let invalid = root.join("bad.bookmarks");
     std::fs::write(&invalid, "invalid json").unwrap();
     native.borrow_mut().pick = Some(invalid);
     app.invoke(Side::Left, Tool::ImportBookmarks, &ctx);
+    wait_for_dialog_read(&mut app, &ctx, |app| {
+        app.interface
+            .notice
+            .as_ref()
+            .is_some_and(|notice| notice.0.contains("expected"))
+    });
     assert!(
         app.interface
             .notice
@@ -573,7 +586,8 @@ fn workspace_renders_tree_gallery_help_and_a_transfer_conflict() {
             drive: true,
             ejectable: true,
         },
-    ];
+    ]
+    .into();
     app.interface.tree = true;
     app.engine.settings.stacked = true;
 
@@ -771,4 +785,76 @@ fn clipboard_shortcuts_route_to_files_or_text_based_on_focus_context() {
         assert!(actions.is_empty());
         assert!(events.contains(&expected), "{events:?}");
     }
+}
+
+pub(crate) fn wait_for_dialog_read(
+    app: &mut App,
+    ctx: &egui::Context,
+    done: impl Fn(&App) -> bool,
+) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !done(app) {
+        app.poll_dialog_reads(ctx);
+        assert!(Instant::now() < deadline, "dialog read timed out");
+        std::thread::yield_now();
+    }
+}
+
+#[test]
+fn a_blocked_dialog_read_does_not_stall_frames_and_cannot_update_a_new_location() {
+    let fixture = tempfile::tempdir().unwrap();
+    let root = fixture.path().canonicalize().unwrap();
+    let folder = root.join("folder");
+    std::fs::create_dir(&folder).unwrap();
+    let ctx = egui::Context::default();
+    let creation = eframe::CreationContext::_new_kittest(ctx.clone());
+    let mut app = App::new(
+        &creation,
+        Box::new(TestDesktop::default()),
+        root.clone(),
+        [root.clone(), root],
+        true,
+    );
+    let mut frame = eframe::Frame::_new_kittest();
+    let (release, gate) = mpsc::channel();
+    let (started, starts) = mpsc::channel();
+    let (applied, applications) = mpsc::channel();
+    app.read_for_tab(
+        Side::Left,
+        move || {
+            started.send(()).unwrap();
+            gate.recv_timeout(Duration::from_secs(5)).unwrap();
+        },
+        move |_, _, ()| applied.send(()).unwrap(),
+    );
+    starts.recv_timeout(Duration::from_secs(5)).unwrap();
+    app.engine.dispatch(Command::Navigate {
+        side: Side::Left,
+        path: folder.clone(),
+        new_tab: false,
+        background: false,
+    });
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        app.logic(&ctx, &mut frame);
+        ctx.run_ui(Default::default(), |ui| app.ui(ui, &mut frame))
+            .textures_delta
+            .clear();
+        if !app.engine.tab(Side::Left).busy() {
+            break;
+        }
+        assert!(Instant::now() < deadline);
+        std::thread::yield_now();
+    }
+    assert_eq!(app.engine.tab(Side::Left).base(), folder);
+    release.send(()).unwrap();
+    loop {
+        if let Some((_, apply)) = app.dialog_reads.drain().pop() {
+            apply(&mut app, &ctx);
+            break;
+        }
+        assert!(Instant::now() < deadline);
+        std::thread::yield_now();
+    }
+    assert!(applications.try_recv().is_err());
 }

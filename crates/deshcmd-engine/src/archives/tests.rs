@@ -172,7 +172,7 @@ fn archive_queue_round_trip() {
     }
     let side = Side::Left;
     engine.dispatch(navigate(archive.clone()));
-    wait(&mut engine, |engine| !engine.tab(side).loading);
+    wait(&mut engine, |engine| !engine.tab(side).busy());
     assert_eq!(
         engine.tab(side).visible_count(),
         2,
@@ -180,7 +180,7 @@ fn archive_queue_round_trip() {
         engine.tab(side).error
     );
     engine.dispatch(navigate(archive.join("docs")));
-    wait(&mut engine, |engine| !engine.tab(side).loading);
+    wait(&mut engine, |engine| !engine.tab(side).busy());
     assert_eq!(
         engine.tab(side).visible_count(),
         2,
@@ -191,7 +191,7 @@ fn archive_queue_round_trip() {
         matches!(preview_member(&archive, Path::new("docs/notes.txt"), Kind::Text, 64), Preview::Text(text) if text == "hello")
     );
     engine.dispatch(Action::Parent(side));
-    wait(&mut engine, |engine| !engine.tab(side).loading);
+    wait(&mut engine, |engine| !engine.tab(side).busy());
     assert_eq!(
         engine.tab(side).location(),
         &Location::Archive {
@@ -252,7 +252,7 @@ fn archive_queue_round_trip() {
     );
     #[cfg(unix)]
     assert_eq!(mode(&archive), 0o600);
-    wait(&mut engine, |engine| !engine.tab(side).loading);
+    wait(&mut engine, |engine| !engine.tab(side).busy());
     engine.dispatch(Action::Step(side, Step::First, false));
     assert_eq!(
         engine.tab(side).visible_count(),
@@ -283,8 +283,15 @@ fn archive_queue_round_trip() {
     assert!(destination.join("docs/empty").is_dir());
     assert_eq!(fs::read(destination.join("extra.dat")).unwrap(), b"added");
     let cache = ArchiveCache::default();
-    let top = scan(&cache, &tarball, Path::new(""), false).unwrap();
-    let nested = scan(&cache, &tarball, Path::new("docs"), false).unwrap();
+    let top = scan(&cache, &tarball, Path::new(""), false, &Default::default()).unwrap();
+    let nested = scan(
+        &cache,
+        &tarball,
+        Path::new("docs"),
+        false,
+        &Default::default(),
+    )
+    .unwrap();
     let top_source = top.entries[0].archive.as_ref().unwrap();
     let nested_source = nested.entries[0].archive.as_ref().unwrap();
     assert!(Arc::ptr_eq(top_source, nested_source));
@@ -405,7 +412,7 @@ fn unlock_rescans_encrypted_headers_and_previews_members() {
     );
     let side = Side::Left;
     engine.dispatch(navigate(file.clone()));
-    wait(&mut engine, |engine| !engine.tab(side).loading);
+    wait(&mut engine, |engine| !engine.tab(side).busy());
     assert!(
         engine
             .tab(side)
@@ -421,7 +428,7 @@ fn unlock_rescans_encrypted_headers_and_previews_members() {
         file: file.clone(),
         password: password.into(),
     });
-    wait(&mut engine, |engine| !engine.tab(side).loading);
+    wait(&mut engine, |engine| !engine.tab(side).busy());
     let entry = engine.tab(side).current().unwrap();
     let source = entry.archive.as_ref().unwrap();
     assert!(
@@ -438,7 +445,7 @@ fn unlock_rescans_encrypted_headers_and_previews_members() {
         file,
         password: "wrong password".into(),
     });
-    wait(&mut engine, |engine| !engine.tab(side).loading);
+    wait(&mut engine, |engine| !engine.tab(side).busy());
     assert!(
         engine
             .tab(side)
@@ -493,10 +500,10 @@ fn archive_alias_and_recursive_ancestor_filtering() {
     );
     let side = Side::Left;
     engine.dispatch(navigate(alias.join("visible")));
-    wait(&mut engine, |engine| !engine.tab(side).loading);
+    wait(&mut engine, |engine| !engine.tab(side).busy());
     assert_eq!(engine.tab(side).current().unwrap().name, "shown.txt");
     engine.dispatch(Action::Parent(side));
-    wait(&mut engine, |engine| !engine.tab(side).loading);
+    wait(&mut engine, |engine| !engine.tab(side).busy());
     assert!(
         matches!(engine.tab(side).location(), Location::Archive { file, folder } if file == &alias && folder.as_os_str().is_empty())
     );
@@ -508,7 +515,7 @@ fn archive_alias_and_recursive_ancestor_filtering() {
             ..MatchOptions::filename("*.txt")
         },
     ));
-    wait(&mut engine, |engine| !engine.tab(side).loading);
+    wait(&mut engine, |engine| !engine.tab(side).busy());
     let names = engine
         .tab(side)
         .visible_entries()
@@ -1176,7 +1183,7 @@ fn archives_preserve_destination_when_separate_folder_name_is_taken() {
     assert_eq!(fs::read_dir(&destination).unwrap().count(), 1);
 
     engine.dispatch(navigate(archive.clone()));
-    wait(&mut engine, |engine| !engine.tab(Side::Left).loading);
+    wait(&mut engine, |engine| !engine.tab(Side::Left).busy());
     assert_eq!(engine.tab(Side::Left).title(), "one.zip");
     assert!(
         matches!(engine.tab(Side::Left).location(), Location::Archive { folder, .. } if folder.as_os_str().is_empty())
@@ -1190,7 +1197,7 @@ fn archives_preserve_destination_when_separate_folder_name_is_taken() {
         Some("Flat view needs a local folder")
     );
     engine.dispatch(navigate(archive.join("absent")));
-    wait(&mut engine, |engine| !engine.tab(Side::Left).loading);
+    wait(&mut engine, |engine| !engine.tab(Side::Left).busy());
     assert_eq!(
         engine.tab(Side::Left).error.as_deref(),
         Some("This folder is no longer in the archive")

@@ -26,14 +26,16 @@ fn phase1_ui() {
     let mut frame = eframe::Frame::_new_kittest();
     let side = Side::Left;
     let draw = |app: &mut App, frame: &mut eframe::Frame, events| {
-        ctx.run_ui(
+        let mut output = ctx.run_ui(
             egui::RawInput {
                 screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, vec2(1280., 800.))),
                 events,
                 ..Default::default()
             },
             |ui| app.ui(ui, frame),
-        )
+        );
+        output.textures_delta.clear();
+        output
     };
     for size in [100, 10_000, 100_000] {
         app.logic(&ctx, &mut frame);
@@ -49,7 +51,7 @@ fn phase1_ui() {
         loop {
             app.logic(&ctx, &mut frame);
             let _ = draw(&mut app, &mut frame, vec![]);
-            if !app.engine.tab(side).loading {
+            if !app.engine.tab(side).busy() {
                 assert!(app.engine.tab(side).visible_entries().count() >= size);
                 sample(&format!("ui/{size}/populated_draw"), start.elapsed());
                 break;
@@ -139,4 +141,74 @@ fn phase1_ui() {
             }
         }
     }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "release benchmark on Linux; uses mkfifo"]
+fn phase2_blocked_listing_ui() {
+    let fixture = tempfile::tempdir().unwrap();
+    let root = fixture.path().canonicalize().unwrap();
+    let blocked = root.join("blocked");
+    std::fs::create_dir(&blocked).unwrap();
+    let fifo = blocked.join("descript.ion");
+    assert!(
+        std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let ctx = egui::Context::default();
+    let cc = eframe::CreationContext::_new_kittest(ctx.clone());
+    let mut app = App::new(
+        &cc,
+        Box::new(TestDesktop::default()),
+        root.clone(),
+        [root.clone(), root],
+        true,
+    );
+    app.engine.settings.auto_refresh = false;
+    let mut frame = eframe::Frame::_new_kittest();
+    let mut draw = |app: &mut App| {
+        app.logic(&ctx, &mut frame);
+        ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, vec2(1280., 800.))),
+                ..Default::default()
+            },
+            |ui| app.ui(ui, &mut frame),
+        )
+        .textures_delta
+        .clear();
+    };
+    for _ in 0..10 {
+        draw(&mut app);
+    }
+    app.engine.dispatch(Command::Navigate {
+        side: Side::Left,
+        path: blocked,
+        new_tab: false,
+        background: false,
+    });
+    let (opened, writer) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = opened.send(std::fs::OpenOptions::new().write(true).open(fifo));
+    });
+    let started = Instant::now();
+    let hold = loop {
+        draw(&mut app);
+        if let Ok(file) = writer.try_recv() {
+            break file.unwrap();
+        }
+        assert!(started.elapsed() < Duration::from_secs(5));
+        std::thread::yield_now();
+    };
+    for _ in 0..100 {
+        let start = Instant::now();
+        draw(&mut app);
+        sample("blocked_ui_frame", start.elapsed());
+        assert!(app.engine.tab(Side::Left).loading);
+    }
+    drop(hold);
 }
