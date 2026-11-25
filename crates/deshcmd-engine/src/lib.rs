@@ -169,8 +169,8 @@ pub struct Tab {
     selected_bytes: u128,
     cursor: Option<PathBuf>,
     cursor_position: Option<usize>,
-    pending_parent_focus: Option<PathBuf>,
-    parent_focus_restored: bool,
+    pending_cursor: Option<PathBuf>,
+    cursor_restored: bool,
     anchor: Option<PathBuf>,
     anchor_position: Option<usize>,
     saved_marks: HashSet<PathBuf>,
@@ -198,8 +198,8 @@ impl Tab {
             selected_bytes: 0,
             cursor: None,
             cursor_position: None,
-            pending_parent_focus: None,
-            parent_focus_restored: false,
+            pending_cursor: None,
+            cursor_restored: false,
             anchor: None,
             anchor_position: None,
             saved_marks: Default::default(),
@@ -386,8 +386,8 @@ impl Tab {
         self.clear_view();
         self.clear_marks();
         self.cursor = None;
-        self.pending_parent_focus = None;
-        self.parent_focus_restored = false;
+        self.pending_cursor = None;
+        self.cursor_restored = false;
         self.anchor = None;
         self.filter.text.clear();
         self.filter_query = Default::default();
@@ -705,7 +705,12 @@ enum Event {
     JobProgress(u64, Progress),
     Conflict(u64, Conflict),
     ConflictCompared(u64, PathBuf, PathBuf, io::Result<bool>),
-    Done(u64, io::Result<String>, Vec<String>),
+    Done {
+        id: u64,
+        result: io::Result<String>,
+        warnings: Vec<String>,
+        renamed: Option<(PathBuf, PathBuf)>,
+    },
 }
 
 pub struct Engine {
@@ -771,8 +776,8 @@ impl Engine {
         self.archive_cache.password(file)
     }
     /// Report a restored cursor once so a view can scroll it into sight.
-    pub fn take_parent_focus_restored(&mut self, side: Side) -> bool {
-        std::mem::take(&mut self.tab_mut(side).parent_focus_restored)
+    pub fn take_cursor_restored(&mut self, side: Side) -> bool {
+        std::mem::take(&mut self.tab_mut(side).cursor_restored)
     }
     fn pane_mut(&mut self, side: Side) -> &mut Pane {
         &mut self.panes[side.index()]
@@ -1363,7 +1368,7 @@ impl Engine {
                 } else {
                     let tab = self.tab_mut(side);
                     tab.set_location(location, true);
-                    tab.pending_parent_focus = previous_folder;
+                    tab.pending_cursor = previous_folder;
                     self.settings.active = side;
                 }
                 return Ok(());
@@ -1395,7 +1400,7 @@ impl Engine {
             tab.set_location(location, true);
             tab
         };
-        tab.pending_parent_focus = parent_focus;
+        tab.pending_cursor = parent_focus;
         if opens_tab || location_changed {
             tab.history[tab.history_index].entered_via = Some(resolved);
         }
@@ -1455,7 +1460,7 @@ impl Engine {
                 tab.set_location(location, false);
                 tab
             };
-            tab.pending_parent_focus = parent_focus;
+            tab.pending_cursor = parent_focus;
             self.settings.active = side;
         }
         Ok(())
@@ -1512,6 +1517,36 @@ impl Engine {
         for pane in &mut self.panes {
             for tab in &mut pane.tabs {
                 tab.dirty = true;
+            }
+        }
+    }
+    fn apply_rename_to_tabs(&mut self, source: &Path, target: &Path) {
+        for pane in &mut self.panes {
+            for tab in &mut pane.tabs {
+                let paths = match &mut tab.saved.location {
+                    Location::List { paths, .. } | Location::Flat { roots: paths, .. } => {
+                        paths.as_mut_slice()
+                    }
+                    _ => &mut [],
+                };
+                let mut location_changed = false;
+                for path in paths.iter_mut().filter(|path| *path == source) {
+                    *path = target.to_owned();
+                    location_changed = true;
+                }
+                if location_changed {
+                    tab.history[tab.history_index].location = tab.saved.location.clone();
+                }
+                let focused = tab.cursor.as_deref() == Some(source)
+                    || tab.pending_cursor.as_deref() == Some(source)
+                    || (tab.selected.len() == 1 && tab.selected.contains(source));
+                if focused {
+                    tab.pending_cursor = Some(target.to_owned());
+                }
+                if focused || location_changed {
+                    // A scan started before the rename can still contain the old path.
+                    tab.invalidate_scan();
+                }
             }
         }
     }
@@ -1591,8 +1626,17 @@ impl Engine {
                 last_report: Instant::now(),
                 warnings: Vec::new(),
             };
+            let renamed = match &operation {
+                Operation::Rename { source, target } => Some((source.clone(), target.clone())),
+                _ => None,
+            };
             let result = worker.run(operation);
-            let _ = sender.send(Event::Done(id, result, worker.warnings));
+            let _ = sender.send(Event::Done {
+                id,
+                result,
+                warnings: worker.warnings,
+                renamed,
+            });
             wake();
         });
     }
@@ -1610,7 +1654,7 @@ impl Engine {
                             continue;
                         };
                         tab.loading = false;
-                        let parent_focus = tab.pending_parent_focus.take();
+                        let pending_cursor = tab.pending_cursor.take();
                         match result {
                             Ok(listing) => {
                                 #[cfg(feature = "perf")]
@@ -1625,14 +1669,14 @@ impl Engine {
                                     self.settings.directories_first,
                                     self.settings.natural_sort,
                                 );
-                                if let Some(path) = &parent_focus {
+                                if let Some(path) = &pending_cursor {
                                     tab.cursor = Some(path.clone());
                                 }
                                 tab.filter_entries(self.settings.show_hidden, self.ignore.as_ref());
-                                if parent_focus.is_some() && parent_focus == tab.cursor {
+                                if pending_cursor.is_some() && pending_cursor == tab.cursor {
                                     tab.anchor.clone_from(&tab.cursor);
                                     tab.anchor_position = tab.cursor_position;
-                                    tab.parent_focus_restored = true;
+                                    tab.cursor_restored = true;
                                 }
                                 #[cfg(feature = "perf")]
                                 perf::elapsed("install", install);
@@ -1678,7 +1722,17 @@ impl Engine {
                         };
                     }
                 }
-                Event::Done(id, result, warnings) => {
+                Event::Done {
+                    id,
+                    result,
+                    warnings,
+                    renamed,
+                } => {
+                    if result.is_ok()
+                        && let Some((source, target)) = renamed
+                    {
+                        self.apply_rename_to_tabs(&source, &target);
+                    }
                     if let Some(job) = self.jobs.iter_mut().find(|job| job.id == id) {
                         job.conflict = None;
                         job.warnings = warnings;

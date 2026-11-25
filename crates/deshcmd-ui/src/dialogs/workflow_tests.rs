@@ -110,10 +110,17 @@ fn create_rename_link_and_comment_dialogs_validate_and_apply() {
     let renamed = session.left.join("renamed.txt");
     assert!(!created.exists());
     assert_eq!(std::fs::read_to_string(&renamed).unwrap(), "new content");
-    session.focus(&renamed);
+    assert_eq!(
+        session.app.engine.tab(Side::Left).current().unwrap().path,
+        renamed
+    );
+    assert!(session.app.engine.take_cursor_restored(Side::Left));
+    assert!(!session.app.interface.queue);
 
+    session.app.interface.queue = true;
     let hardlink = session.dialog(Tool::Hardlink);
     session.submit(&hardlink);
+    assert!(session.app.interface.queue);
     assert_eq!(
         std::fs::read(session.right.join("renamed.txt")).unwrap(),
         b"new content"

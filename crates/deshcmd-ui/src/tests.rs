@@ -433,7 +433,7 @@ fn close_request_reveals_the_queue_until_pending_work_is_cancelled() {
         )),
         &ctx,
     );
-    app.interface.queue = false;
+    assert!(!app.interface.queue);
     app.apply(Action::Close, &ctx);
     assert!(app.interface.queue);
     assert!(!app.interface.closing);
@@ -623,6 +623,7 @@ fn workspace_renders_tree_gallery_help_and_a_transfer_conflict() {
     let shapes = draw(&mut app);
     assert!(frame_contains(&shapes, "shared.txt"));
     assert!(frame_contains(&shapes, "Skip"));
+    assert!(!app.interface.queue);
     let id = app.engine.jobs[0].id;
     app.apply(
         Action::Command(Command::Resolve(id, engine::Collision::Skip, false)),
@@ -633,6 +634,8 @@ fn workspace_renders_tree_gallery_help_and_a_transfer_conflict() {
         std::fs::read(right.join("shared.txt")).unwrap(),
         b"existing"
     );
+    assert!(!app.interface.queue);
+    app.interface.queue = true;
     assert!(frame_contains(&draw(&mut app), "1 skipped"));
 }
 
