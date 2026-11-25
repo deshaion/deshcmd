@@ -1,5 +1,7 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
+#[cfg(target_os = "linux")]
+mod menu;
 mod terminal;
 
 use std::path::{Path, PathBuf};
@@ -30,6 +32,16 @@ impl Desktop for NativeDesktop {
     }
     fn open_terminal(&mut self, directory: &Path) -> Result<(), String> {
         terminal::open(directory)
+    }
+    #[cfg(target_os = "linux")]
+    fn install_menu_entry(&mut self) -> Result<(), String> {
+        menu::install()
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+    #[cfg(windows)]
+    fn install_menu_entry(&mut self) -> Result<(), String> {
+        install_start_menu_entry()
     }
     fn pick_file(&mut self, initial: &Path, title: &str) -> Option<PathBuf> {
         rfd::FileDialog::new()
@@ -266,13 +278,61 @@ fn shortcut(path: &Path, source: &Path) -> Result<(), String> {
     {
         return Err("Choose a new path ending in .lnk".into());
     }
-    let result = std::process::Command::new("powershell.exe").args(["-NoProfile","-NonInteractive","-Command",
-        "$ErrorActionPreference='Stop'; $shell=New-Object -ComObject WScript.Shell; $link=$shell.CreateShortcut($env:DESHCMD_LINK); $link.TargetPath=$env:DESHCMD_SOURCE; $link.Save()"])
-        .env("DESHCMD_LINK",path).env("DESHCMD_SOURCE",source).output().map_err(|error| error.to_string())?;
+    write_windows_shortcut(Some(path), source)
+}
+
+#[cfg(windows)]
+fn install_start_menu_entry() -> Result<(), String> {
+    let executable = std::env::current_exe().map_err(|error| error.to_string())?;
+    write_windows_shortcut(None, &executable)
+}
+
+#[cfg(windows)]
+fn write_windows_shortcut(path: Option<&Path>, source: &Path) -> Result<(), String> {
+    use std::os::windows::process::CommandExt;
+
+    const CREATE_NO_WINDOW: u32 = 0x08000000;
+    let script = r#"
+$ErrorActionPreference = 'Stop'
+$path = $env:DESHCMD_LINK
+$installInStartMenu = [string]::IsNullOrEmpty($path)
+if ($installInStartMenu) {
+    $programs = [Environment]::GetFolderPath(
+        [Environment+SpecialFolder]::Programs,
+        [Environment+SpecialFolderOption]::Create
+    )
+    if ([string]::IsNullOrEmpty($programs)) { throw 'The Start menu Programs folder is unavailable.' }
+    $path = Join-Path $programs 'DeshCmd.lnk'
+}
+$shell = New-Object -ComObject WScript.Shell
+$link = $shell.CreateShortcut($path)
+$link.TargetPath = $env:DESHCMD_SOURCE
+if ($installInStartMenu) {
+    $link.Arguments = ''
+    $link.WorkingDirectory = [System.IO.Path]::GetDirectoryName($env:DESHCMD_SOURCE)
+}
+$link.Save()
+"#;
+    let mut command = std::process::Command::new("powershell.exe");
+    command
+        .creation_flags(CREATE_NO_WINDOW)
+        .args(["-NoProfile", "-NonInteractive", "-Command", script])
+        .env("DESHCMD_SOURCE", source);
+    if let Some(path) = path {
+        command.env("DESHCMD_LINK", path);
+    } else {
+        command.env_remove("DESHCMD_LINK");
+    }
+    let result = command.output().map_err(|error| error.to_string())?;
     if result.status.success() {
         Ok(())
     } else {
-        Err(String::from_utf8_lossy(&result.stderr).trim().to_owned())
+        let error = String::from_utf8_lossy(&result.stderr);
+        Err(if error.trim().is_empty() {
+            format!("Shortcut creation returned {}", result.status)
+        } else {
+            error.trim().to_owned()
+        })
     }
 }
 #[cfg(not(windows))]
@@ -307,7 +367,32 @@ fn icon() -> egui::IconData {
     }
 }
 
-fn main() -> eframe::Result {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let mut args = std::env::args_os().skip(1).peekable();
+    if args
+        .peek()
+        .is_some_and(|arg| arg == "--help" || arg == "-h")
+    {
+        println!("deshcmd [LEFT_DIRECTORY [RIGHT_DIRECTORY]]");
+        #[cfg(any(target_os = "linux", windows))]
+        println!("deshcmd --install-menu-entry");
+        return Ok(());
+    }
+    #[cfg(any(target_os = "linux", windows))]
+    if args.peek().is_some_and(|arg| arg == "--install-menu-entry") {
+        if args.nth(1).is_some() {
+            return Err("--install-menu-entry takes no arguments".into());
+        }
+        #[cfg(target_os = "linux")]
+        println!(
+            "Added DeshCmd to the application menu at {}",
+            menu::install()?.display()
+        );
+        #[cfg(windows)]
+        install_start_menu_entry()?;
+        return Ok(());
+    }
+
     #[cfg(target_os = "linux")]
     if std::env::var_os("WINIT_X11_SCALE_FACTOR").is_none() {
         // Use a consistent pixel scale across X11 monitors. Interface zoom still applies.
@@ -319,14 +404,6 @@ fn main() -> eframe::Result {
     let home = dirs::home_dir()
         .and_then(|home| home.canonicalize().ok())
         .unwrap_or_else(|| cwd.clone());
-    let mut args = std::env::args_os().skip(1).peekable();
-    if args
-        .peek()
-        .is_some_and(|arg| arg == "--help" || arg == "-h")
-    {
-        println!("deshcmd [LEFT_DIRECTORY [RIGHT_DIRECTORY]]");
-        return Ok(());
-    }
     let fresh = args.peek().is_some();
     let initial = [cwd.clone(), home.clone()].map(|fallback| {
         args.next()
@@ -371,5 +448,6 @@ fn main() -> eframe::Result {
             ));
             Ok(Box::new(app))
         }),
-    )
+    )?;
+    Ok(())
 }

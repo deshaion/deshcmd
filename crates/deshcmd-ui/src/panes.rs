@@ -264,13 +264,11 @@ impl PanelUi {
                         } else {
                             SUB
                         };
+                        let pinned = tab.saved.pinned;
+                        let can_close = !pinned && pane.tabs.len() > 1;
+                        let locked = tab.saved.lock != TabLock::Normal;
                         let label_left = 27.;
-                        let label_right =
-                            if pane.tabs.len() > 1 || tab.saved.lock != TabLock::Normal {
-                                22.
-                            } else {
-                                10.
-                            };
+                        let label_right = if can_close || locked { 22. } else { 10. };
                         let padding = label_left + label_right;
                         let mut job = egui::text::LayoutJob::simple_singleline(
                             title.clone(),
@@ -300,7 +298,8 @@ impl PanelUi {
                                 },
                             );
                         }
-                        Icon::Folder.draw(ui, pos2(rect.left() + 14., rect.center().y), 14., ink);
+                        let icon = if pinned { Icon::Pin } else { Icon::Folder };
+                        icon.draw(ui, pos2(rect.left() + 14., rect.center().y), 14., ink);
                         ui.painter().galley(
                             pos2(
                                 rect.left() + label_left,
@@ -313,42 +312,42 @@ impl PanelUi {
                             egui::WidgetInfo::labeled(
                                 egui::Role::Button,
                                 true,
-                                format!("{} tab", title),
+                                if pinned {
+                                    format!("{title}, pinned tab")
+                                } else {
+                                    format!("{title} tab")
+                                },
                             )
                         });
-                        let close = Rect::from_center_size(
-                            pos2(rect.right() - 11., rect.center().y),
-                            vec2(17., 20.),
-                        );
-                        let close_response = ui.interact(
-                            close,
-                            ui.scope_id().with(("close", tab.id)),
-                            Sense::click(),
-                        );
-                        if tab.saved.lock != TabLock::Normal {
+                        let trailing_icon = pos2(rect.right() - 11., rect.center().y);
+                        let mut close_clicked = false;
+                        let mut close_hovered = false;
+                        if can_close {
+                            let close = ui.interact(
+                                Rect::from_center_size(trailing_icon, vec2(17., 20.)),
+                                ui.scope_id().with(("close", tab.id)),
+                                Sense::click(),
+                            );
+                            close_hovered = close.hovered();
+                            if !locked && (current || response.hovered() || close_hovered) {
+                                Icon::Close.draw(
+                                    ui,
+                                    trailing_icon,
+                                    10.,
+                                    if close_hovered { RED } else { MUTED },
+                                );
+                            }
+                            close_clicked = close.clicked() || response.middle_clicked();
+                        }
+                        if locked {
                             Icon::Link.draw(
                                 ui,
-                                close.center(),
+                                trailing_icon,
                                 10.,
-                                if close_response.hovered() {
-                                    ACCENT
-                                } else {
-                                    MUTED
-                                },
-                            );
-                        } else if pane.tabs.len() > 1
-                            && (current || response.hovered() || close_response.hovered())
-                        {
-                            Icon::Close.draw(
-                                ui,
-                                close.center(),
-                                10.,
-                                if close_response.hovered() { RED } else { MUTED },
+                                if close_hovered { ACCENT } else { MUTED },
                             );
                         }
-                        if pane.tabs.len() > 1
-                            && (close_response.clicked() || response.middle_clicked())
-                        {
+                        if close_clicked {
                             actions.push(Action::Command(Command::CloseTab(side, index)));
                         } else if response.clicked() {
                             actions.push(Action::Command(Command::Tab(side, index)));
@@ -373,9 +372,18 @@ impl PanelUi {
                                 if elided {
                                     ui.label(&title);
                                 }
+                                if pinned {
+                                    ui.label("Pinned tab");
+                                }
                                 ui.label(tab.base().display().to_string());
                             })
                             .context_menu(|ui| {
+                                let pin_label = if pinned { "Unpin tab" } else { "Pin tab" };
+                                if ui.button(pin_label).clicked() {
+                                    actions
+                                        .push(Action::Command(Command::ToggleTabPin(side, index)));
+                                    ui.close();
+                                }
                                 if ui.button("Rename tab").clicked() {
                                     actions.push(Action::Tool(side, Tool::RenameTab(index)));
                                     ui.close();
@@ -398,7 +406,13 @@ impl PanelUi {
                                         }
                                     }
                                 });
-                                if ui.button("Move tab to other panel").clicked() {
+                                if ui
+                                    .add_enabled(
+                                        !pinned,
+                                        egui::Button::new("Move tab to other panel"),
+                                    )
+                                    .clicked()
+                                {
                                     actions
                                         .push(Action::Command(Command::SendTab(side, index, true)));
                                     ui.close();
@@ -414,10 +428,7 @@ impl PanelUi {
                                     ui.close();
                                 }
                                 if ui
-                                    .add_enabled(
-                                        pane.tabs.len() > 1,
-                                        egui::Button::new("Close tab"),
-                                    )
+                                    .add_enabled(can_close, egui::Button::new("Close tab"))
                                     .clicked()
                                 {
                                     actions.push(Action::Command(Command::CloseTab(side, index)));

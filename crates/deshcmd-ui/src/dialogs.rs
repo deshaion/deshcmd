@@ -12,6 +12,8 @@ use crate::{Action, App, FileClipboard, theme::*};
 #[derive(Clone, Copy)]
 pub(crate) enum Tool {
     OpenTerminal,
+    #[cfg(any(target_os = "linux", windows))]
+    InstallMenuEntry,
     NewFolder,
     NewFile,
     Copy,
@@ -274,6 +276,22 @@ pub(crate) fn tools_menu(ui: &mut Ui, side: Side, actions: &mut Vec<Action>) {
     menu_item(ui, side, "Settings…", Tool::Settings, actions);
     ui.separator();
     menu_item(ui, side, "Open Terminal · F9", Tool::OpenTerminal, actions);
+    #[cfg(target_os = "linux")]
+    menu_item(
+        ui,
+        side,
+        "Add DeshCmd to Application Menu",
+        Tool::InstallMenuEntry,
+        actions,
+    );
+    #[cfg(windows)]
+    menu_item(
+        ui,
+        side,
+        "Add DeshCmd to Start Menu",
+        Tool::InstallMenuEntry,
+        actions,
+    );
     ui.menu_button("Workspace", |ui| {
         cmd(
             ui,
@@ -393,6 +411,20 @@ impl App {
                         base.display()
                     ));
                 }
+                None
+            }
+            #[cfg(any(target_os = "linux", windows))]
+            Tool::InstallMenuEntry => {
+                let menu = if cfg!(windows) {
+                    "Start menu"
+                } else {
+                    "application menu"
+                };
+                let message = match self.desktop.install_menu_entry() {
+                    Ok(()) => format!("Added DeshCmd to the {menu}"),
+                    Err(error) => format!("Could not add DeshCmd to the {menu}. {error}"),
+                };
+                self.notice(message);
                 None
             }
             Tool::Copy | Tool::CopyHere | Tool::Move if tab.has_operands() => {

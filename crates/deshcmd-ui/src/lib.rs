@@ -30,6 +30,10 @@ pub struct Place {
 pub trait Desktop {
     fn open(&mut self, path: &Path) -> Result<(), String>;
     fn open_terminal(&mut self, directory: &Path) -> Result<(), String>;
+    #[cfg(any(target_os = "linux", windows))]
+    fn install_menu_entry(&mut self) -> Result<(), String> {
+        Err("Application menu integration is unavailable".into())
+    }
     fn pick_file(&mut self, initial: &Path, title: &str) -> Option<PathBuf>;
     fn save_file(&mut self, initial: &Path, name: &str, title: &str) -> Option<PathBuf>;
     fn pick_directory(&mut self, initial: &Path, title: &str) -> Option<PathBuf>;
@@ -914,8 +918,46 @@ impl App {
         if just(Key::Tab) {
             actions.push(Action::Command(Command::Focus(side.other())));
         }
+        let tab_shortcut = |modifiers, key| {
+            ctx.input_mut(|input| {
+                let mut pressed = false;
+                input.events.retain(|event| {
+                    if let egui::Event::Key {
+                        key: event_key,
+                        modifiers: event_modifiers,
+                        pressed: true,
+                        repeat,
+                        ..
+                    } = event
+                        && *event_key == key
+                        && event_modifiers.matches_exact(modifiers)
+                    {
+                        pressed |= !repeat;
+                        return false;
+                    }
+                    true
+                });
+                pressed
+            })
+        };
+        if tab_shortcut(egui::Modifiers::COMMAND | egui::Modifiers::SHIFT, Key::T) {
+            let index = self.engine.pane(side).active;
+            actions.push(Action::Command(Command::SendTab(side, index, false)));
+        }
         if command(Key::T) {
             actions.push(Action::Command(Command::NewTab(side)));
+        }
+        if tab_shortcut(egui::Modifiers::CTRL, Key::ArrowUp) {
+            actions.push(Action::Command(Command::OpenFocusedDirectoryInTab {
+                source: side,
+                destination: side,
+            }));
+        }
+        if tab_shortcut(egui::Modifiers::CTRL, Key::ArrowRight) && side == Side::Left {
+            actions.push(Action::Command(Command::OpenFocusedDirectoryInTab {
+                source: side,
+                destination: Side::Right,
+            }));
         }
         if command(Key::W) {
             let index = self.engine.pane(side).active;
@@ -1040,6 +1082,7 @@ impl App {
                 ui.set_min_width(426.);
                 egui_extras::TableBuilder::new(ui)
                     .striped(true)
+                    .max_scroll_height((ctx.content_rect().height() - 72.).max(26.))
                     .column(egui_extras::Column::exact(145.))
                     .column(egui_extras::Column::remainder())
                     .body(|mut body| {
@@ -1049,7 +1092,13 @@ impl App {
                             ("Left / Alt + Up", "Go to parent"),
                             ("Right", "Open focused directory"),
                             ("Ctrl + L", "Edit location"),
-                            ("Ctrl + T / W", "Open or close tab"),
+                            ("Ctrl + T / W", "Duplicate or close current tab"),
+                            ("Ctrl + Shift + T", "Copy current tab to other panel"),
+                            ("Ctrl + Up", "Open focused folder in new tab"),
+                            (
+                                "Ctrl + Right",
+                                "From left, open focused folder in a right tab",
+                            ),
                             ("Alt + 1–9", "Switch to tab"),
                             ("Enter", "Open focused item"),
                             ("Up / Down · Space", "Move focus · toggle mark"),
