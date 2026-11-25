@@ -21,6 +21,9 @@ jobs:
   prepare:
     name: Check draft release
     runs-on: ubuntu-24.04
+    permissions:
+      # GitHub only lists draft releases for callers with push access.
+      contents: write
     outputs:
       commit: ${{ steps.source.outputs.commit }}
       signed: ${{ steps.draft.outputs.signed }}
