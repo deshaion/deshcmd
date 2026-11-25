@@ -1460,6 +1460,7 @@ impl App {
                 show_modified_time: self.engine.settings.show_modified_time,
                 show_inline_filter: self.interface.show_inline_filter,
                 reveal_cursor: self.interface.focus_scroll == Some(side) || cursor_restored,
+                history_preview: self.engine.history_preview(side),
                 preview: quick.map(|source| (source, self.engine.tab(source).current())),
             };
             self.interface.panes[side.index()].show(
@@ -1505,6 +1506,9 @@ impl App {
 impl eframe::App for App {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.engine.poll();
+        if let Some(delay) = self.engine.listing_wake_after() {
+            ctx.request_repaint_after(delay);
+        }
         self.poll_startup_home();
         self.record_notice();
         self.previews.poll();

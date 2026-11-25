@@ -136,3 +136,23 @@ pub(crate) fn view_sort(partial: bool, rows: usize) {
         );
     }
 }
+
+pub(crate) fn patch_reads(paths: usize) {
+    if enabled() {
+        eprintln!("patch,metadata_paths,{paths}");
+    }
+}
+
+pub(crate) fn cache_stats(stats: crate::ListingStats) {
+    if enabled() {
+        eprintln!(
+            "cache,hits={},misses={},scans={},patches={},bytes={},directories={}",
+            stats.cache_hits,
+            stats.cache_misses,
+            stats.full_scans,
+            stats.patches,
+            stats.retained_bytes,
+            stats.retained_directories
+        );
+    }
+}

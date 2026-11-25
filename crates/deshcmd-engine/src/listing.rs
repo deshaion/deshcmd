@@ -250,7 +250,7 @@ pub struct Sort {
     pub descending: bool,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct MatchOptions {
     pub text: String,
     pub case_sensitive: bool,
@@ -378,9 +378,42 @@ pub(crate) fn compile_mask(
     builder.build().map(Some).map_err(io::Error::other)
 }
 
+// A value snapshot avoids holding a mount open after navigation.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DirectoryIdentity(u64, u64);
+
+pub(crate) fn directory_identity(path: &Path) -> Option<DirectoryIdentity> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let meta = path.metadata().ok()?;
+        meta.is_dir()
+            .then(|| DirectoryIdentity(meta.dev(), meta.ino()))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        None
+    }
+}
+
+fn has_hard_links(metadata: &Metadata) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        metadata.is_file() && metadata.nlink() > 1
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = metadata;
+        false
+    }
+}
+
 pub(crate) struct Scan {
     pub entries: Vec<Entry>,
     pub skipped: usize,
+    pub has_hard_links: bool,
 }
 impl Scan {
     fn push(&mut self, result: io::Result<Entry>) {
@@ -408,6 +441,7 @@ pub(crate) fn scan_cancellable(
     let mut scan = Scan {
         entries: Vec::new(),
         skipped: 0,
+        has_hard_links: false,
     };
 
     if let Location::Directory(path) = location
@@ -433,18 +467,24 @@ pub(crate) fn scan_cancellable(
                 crate::operations::read_comments(path)
             });
             cancel.check()?;
+            let mut found_hard_links = false;
             let load = || {
                 // DirEntry metadata describes the link itself, as symlink_metadata does.
                 let metadata = item.metadata()?;
+                found_hard_links = has_hard_links(&metadata);
                 Entry::from_metadata(item.path(), metadata, comments, cancel)
             };
             #[cfg(feature = "perf")]
             let result = timing.entry(load);
             #[cfg(not(feature = "perf"))]
-            let result = load();
+            let result = {
+                let mut load = load;
+                load()
+            };
             if let Ok(entry) = &result {
                 observe(entry);
             }
+            scan.has_hard_links |= found_hard_links;
             scan.push(result);
         }
         #[cfg(feature = "perf")]
@@ -528,6 +568,67 @@ pub(crate) fn scan_cancellable(
     #[cfg(feature = "perf")]
     timing.finish(scan.entries.capacity());
     Ok(scan)
+}
+
+pub(crate) fn patch_directory(
+    directory: &Path,
+    base: &crate::views::Raw,
+    paths: &[PathBuf],
+    cancel: &Cancellation,
+) -> io::Result<Scan> {
+    let check_directory = || -> io::Result<()> {
+        cancel.check()?;
+        let identity = directory_identity(directory);
+        if identity.is_some() && base.directory == identity {
+            Ok(())
+        } else {
+            Err(io::Error::other("The directory was replaced"))
+        }
+    };
+    check_directory()?;
+    let mut touched: HashSet<_> = paths.iter().map(PathBuf::as_path).collect();
+    let mut entries = Vec::with_capacity(base.entries.len().saturating_add(paths.len()));
+    for entry in &base.entries {
+        cancel.check()?;
+        if entry.link {
+            // A same-directory change can also change what a link resolves to.
+            touched.insert(&entry.path);
+        } else if !touched.contains(entry.path.as_path()) {
+            entries.push(entry.clone());
+        }
+    }
+
+    let comments = crate::operations::read_comments(directory);
+    let mut metadata_reads = 0;
+    for path in touched {
+        cancel.check()?;
+        metadata_reads += 1;
+        match path.symlink_metadata() {
+            Ok(metadata) if has_hard_links(&metadata) => {
+                return Err(io::Error::other(
+                    "A file can have other names in the listing",
+                ));
+            }
+            Ok(metadata) => entries.push(Entry::from_metadata(
+                path.to_owned(),
+                metadata,
+                &comments,
+                cancel,
+            )?),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    check_directory()?;
+    #[cfg(feature = "perf")]
+    crate::perf::patch_reads(metadata_reads);
+    #[cfg(not(feature = "perf"))]
+    let _ = metadata_reads;
+    Ok(Scan {
+        entries,
+        skipped: 0,
+        has_hard_links: false,
+    })
 }
 
 pub(crate) fn sorted_order_from(

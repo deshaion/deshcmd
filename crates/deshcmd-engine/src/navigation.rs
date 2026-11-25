@@ -222,9 +222,15 @@ impl Engine {
                 Some((index, path.to_owned(), archive))
             })
             .collect();
-        let Some((_, path, _)) = candidates.first() else {
+        let Some((index, path, _)) = candidates.first() else {
             self.tab_mut(side).cancel_navigation();
             return Ok(());
+        };
+        let preview = match &tab.history[*index].location {
+            Location::Directory(path) if tab.location() != &tab.history[*index].location => {
+                Some(path.clone())
+            }
+            _ => None,
         };
         self.focus_revision += 1;
         let intent = Intent {
@@ -253,7 +259,9 @@ impl Engine {
             } else {
                 Ok(None)
             }
-        })
+        })?;
+        self.tab_mut(side).cached_history = preview;
+        Ok(())
     }
 
     fn submit_navigation(
@@ -336,7 +344,9 @@ impl Engine {
                 continue;
             };
             if !key.independent {
-                self.tab_mut(side).pending_navigation = None;
+                let tab = self.tab_mut(side);
+                tab.pending_navigation = None;
+                tab.cached_history = None;
             }
             match result {
                 Ok(Some(destination)) => {

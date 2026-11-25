@@ -976,3 +976,51 @@ fn review_startup_home_resolution_preserves_defaults_and_valid_cli_arguments() {
         assert!(!app.engine.tab(Side::Right).can_back());
     }
 }
+
+#[test]
+fn review_history_preview_keeps_the_committed_action_target_visible() {
+    let fixture = tempfile::tempdir().unwrap();
+    let root = fixture.path().canonicalize().unwrap();
+    let history = root.join("history");
+    let current = root.join("current");
+    for dir in [&history, &current] {
+        std::fs::create_dir(dir).unwrap();
+    }
+    std::fs::write(history.join("cached-item.txt"), "old").unwrap();
+    let target = current.join("committed-item.txt");
+    std::fs::write(&target, "current").unwrap();
+    let ctx = egui::Context::default();
+    let creation = eframe::CreationContext::_new_kittest(ctx.clone());
+    let mut app = App::new(
+        &creation,
+        Box::new(TestDesktop::default()),
+        root.clone(),
+        [history, root],
+        true,
+    );
+    app.engine.settings.auto_refresh = false;
+    settle(&mut app);
+    let side = Side::Left;
+    app.engine.dispatch(Command::Navigate {
+        side,
+        path: current,
+        new_tab: false,
+        background: false,
+    });
+    settle(&mut app);
+    app.engine.dispatch(Command::Back(side));
+    assert!(app.engine.history_preview(side).is_some());
+    assert_eq!(app.engine.tab(side).operands(), [target]);
+    let mut frame = eframe::Frame::_new_kittest();
+    // Render before polling validation so the history request stays pending.
+    let mut output = ctx.run_ui(
+        egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, vec2(1280., 800.))),
+            ..Default::default()
+        },
+        |ui| app.ui(ui, &mut frame),
+    );
+    output.textures_delta.clear();
+    assert!(frame_contains(&output.shapes, "cached-item.txt"));
+    assert!(frame_contains(&output.shapes, "committed-item.txt"));
+}

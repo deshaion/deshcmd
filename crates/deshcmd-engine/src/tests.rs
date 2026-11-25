@@ -26,7 +26,7 @@ fn auto_refresh_updates_local_tabs_but_keeps_flat_views_stable() {
     assert_eq!(engine.tab(Side::Right).visible_count(), 1);
 
     std::fs::write(root.join("second.txt"), "second").unwrap();
-    engine.last_refresh = Instant::now() - Duration::from_secs(4);
+    engine.tab_mut(Side::Left).last_scan = Some(Instant::now() - watch::WATCHED_INTERVAL);
     engine.poll();
     settle(&mut engine);
     assert_eq!(engine.tab(Side::Left).visible_count(), 2);
@@ -173,7 +173,7 @@ fn a_new_view_uses_the_latest_filter_and_marks_made_during_preparation() {
 }
 
 #[test]
-fn global_view_options_apply_to_inactive_tabs_without_rescanning() {
+fn global_view_options_apply_when_an_inactive_tab_is_reopened() {
     let fixture = tempfile::tempdir().unwrap();
     let root = fixture.path().canonicalize().unwrap();
     let folder = root.join("folder");
@@ -192,17 +192,16 @@ fn global_view_options_apply_to_inactive_tabs_without_rescanning() {
         || {},
     );
     settle_views(&mut engine, |e| !e.tab(side).busy());
-    let raw = engine.tab(side).raw.clone().unwrap();
     engine.dispatch(Command::NewTab(side));
     settle_views(&mut engine, |e| !e.tab(side).busy());
-    std::fs::remove_dir_all(&folder).unwrap();
+    let scans = engine.listing_stats().full_scans;
     engine.set_sort_preferences(false, true);
     engine.dispatch(Command::ToggleHidden);
     engine.set_ignore("ignored".into()).unwrap();
+    assert_eq!(engine.listing_stats().full_scans, scans);
     engine.dispatch(Command::Tab(side, 0));
     settle_views(&mut engine, |e| !e.tab(side).busy());
     assert_eq!(engine.tab(side).base(), folder);
-    assert!(Arc::ptr_eq(&raw, engine.tab(side).raw.as_ref().unwrap()));
     assert!(
         engine
             .tab(side)
@@ -624,6 +623,7 @@ fn review_parent_focus_survives_the_first_page_and_yields_to_explicit_selection(
                 .recv_timeout(Duration::from_secs(5))
                 .map_err(io::Error::other)
         }));
+        engine.snapshots.remove(&directory);
         engine.dispatch(Command::Parent(side));
         settle_views(&mut engine, |e| e.tab(side).provisional());
         let expected = if select_another {
@@ -727,4 +727,632 @@ fn review_resident_edits_install_while_refresh_is_blocked() {
         engine.tab(side).visible_entry(0).unwrap().name,
         "file259.txt"
     );
+}
+
+#[test]
+fn ordinary_panes_share_raw_rows_and_revisit_with_a_ready_view() {
+    let fixture = tempfile::tempdir().unwrap();
+    let root = fixture.path().canonicalize().unwrap();
+    let folder = root.join("child");
+    std::fs::create_dir(&folder).unwrap();
+    let first = root.join("a.txt");
+    std::fs::write(&first, "small").unwrap();
+    std::fs::write(root.join("z.txt"), "larger").unwrap();
+    let mut engine = Engine::new(
+        root.clone(),
+        [root.clone(), root.clone()],
+        Settings {
+            auto_refresh: false,
+            ..Default::default()
+        },
+        || {},
+    );
+    settle_views(&mut engine, |e| {
+        Side::ALL.into_iter().all(|side| !e.tab(side).busy())
+    });
+    assert_eq!(engine.listing_stats().full_scans, 1);
+    assert!(Arc::ptr_eq(
+        &engine.tab(Side::Left).view.raw,
+        &engine.tab(Side::Right).view.raw
+    ));
+    engine.dispatch(Command::Select(Side::Right, first.clone(), Select::Toggle));
+    engine.dispatch(Command::Sort(Side::Right, Column::Name, false));
+    settle_views(&mut engine, |e| !e.tab(Side::Right).busy());
+    assert_eq!(engine.tab(Side::Right).marked_count(), 1);
+    assert_eq!(engine.tab(Side::Left).marked_count(), 0);
+    assert_ne!(
+        engine.tab(Side::Right).visible_entry(1).unwrap().path,
+        engine.tab(Side::Left).visible_entry(1).unwrap().path
+    );
+    // Keep the last retained view in the options the left tab will request on Back.
+    engine.dispatch(Command::Sort(Side::Right, Column::Name, true));
+    settle_views(&mut engine, |e| !e.tab(Side::Right).busy());
+    let order = engine.tab(Side::Right).view.order.clone();
+    engine.dispatch(Command::Navigate {
+        side: Side::Left,
+        path: folder.clone(),
+        new_tab: false,
+        background: false,
+    });
+    settle_views(&mut engine, |e| !e.tab(Side::Left).busy());
+    assert_eq!(engine.listing_stats().full_scans, 2);
+
+    engine.snapshots.invalidate(|path, _| path == root);
+    engine.dispatch(Command::Back(Side::Left));
+    settle_views(&mut engine, |e| e.tab(Side::Left).base() == root);
+    assert_eq!(engine.tab(Side::Left).visible_count(), 3);
+    assert!(Arc::ptr_eq(&order, &engine.tab(Side::Left).view.order));
+    assert!(engine.tab(Side::Left).scanning);
+    assert_eq!(engine.listing_stats().cache_hits, 1);
+    settle_views(&mut engine, |e| !e.tab(Side::Left).busy());
+    assert_eq!(engine.listing_stats().full_scans, 3);
+}
+
+#[test]
+fn jobs_refresh_only_affected_scopes_even_after_partial_failure() {
+    let fixture = tempfile::tempdir().unwrap();
+    let root = fixture.path().canonicalize().unwrap();
+    let source = root.join("source");
+    let target = root.join("target");
+    for folder in [&source, &target] {
+        std::fs::create_dir(folder).unwrap();
+    }
+    let file = source.join("first");
+    std::fs::write(&file, "contents").unwrap();
+    let mut engine = Engine::new(
+        root,
+        [source.clone(), target.clone()],
+        Settings {
+            auto_refresh: false,
+            ..Default::default()
+        },
+        || {},
+    );
+    let idle = |e: &Engine| Side::ALL.into_iter().all(|side| !e.tab(side).busy());
+    settle_views(&mut engine, idle);
+    let initial = engine.listing_stats().full_scans;
+    let run = |engine: &mut Engine, operation| {
+        engine.dispatch(Command::Queue(operation, false));
+        settle_views(engine, |e| {
+            e.jobs.last().unwrap().state.finished() && idle(e)
+        });
+    };
+    run(&mut engine, Operation::Statistics(vec![source.clone()]));
+    assert_eq!(engine.listing_stats().full_scans, initial);
+    run(
+        &mut engine,
+        Operation::Transfer {
+            paths: vec![file.clone(), source.join("missing")],
+            destination: target.clone(),
+            moving: false,
+            options: Default::default(),
+        },
+    );
+    assert_eq!(engine.jobs.last().unwrap().state, JobState::Failed);
+    assert_eq!(engine.listing_stats().full_scans, initial + 1);
+    assert!(
+        engine
+            .tab(Side::Right)
+            .visible_position(&target.join("first"))
+            .is_some()
+    );
+
+    let second = source.join("second");
+    run(
+        &mut engine,
+        Operation::Rename {
+            source: file,
+            target: second.clone(),
+        },
+    );
+    assert_eq!(engine.listing_stats().full_scans, initial + 2);
+    run(
+        &mut engine,
+        Operation::Transfer {
+            paths: vec![second.clone()],
+            destination: target.clone(),
+            moving: true,
+            options: Default::default(),
+        },
+    );
+    assert_eq!(engine.listing_stats().full_scans, initial + 4);
+    assert!(engine.tab(Side::Left).visible_position(&second).is_none());
+    assert!(
+        engine
+            .tab(Side::Right)
+            .visible_position(&target.join("second"))
+            .is_some()
+    );
+}
+
+#[test]
+fn watch_hint_during_baseline_enumeration_triggers_one_reconciliation() {
+    let GatedDirectory {
+        _fixture,
+        mut engine,
+        directory,
+        release,
+        ..
+    } = gated_directory(None);
+    let side = Side::Left;
+    engine.settings.auto_refresh = true;
+    engine.poll();
+    settle_views(&mut engine, |e| e.tab(side).provisional());
+    let scans = engine.listing_stats().full_scans;
+    let path = directory.join("new.txt");
+    let event = || {
+        notify::Event::new(notify::EventKind::Create(notify::event::CreateKind::File))
+            .add_path(path.clone())
+    };
+    engine.watches.inject(&directory, Ok(event()));
+    engine.watches.inject(&directory, Ok(event()));
+    std::fs::write(&path, "late").unwrap();
+    engine.poll();
+    assert!(engine.tab(side).scanning);
+    assert!(engine.tab(side).dirty);
+    release.send(()).unwrap();
+    settle_views(&mut engine, |e| !e.tab(side).busy());
+    assert_eq!(engine.listing_stats().full_scans, scans + 1);
+    assert!(engine.tab(side).visible_position(&path).is_some());
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
+#[test]
+fn native_watch_updates_an_active_directory() {
+    let fixture = tempfile::tempdir().unwrap();
+    let dir = fixture.path().canonicalize().unwrap();
+    let mut engine = Engine::new(
+        dir.clone(),
+        [dir.clone(), dir.clone()],
+        Settings::default(),
+        || {},
+    );
+    settle_views(&mut engine, |e| {
+        !e.tab(Side::Left).busy() && e.watches.reliable(&dir)
+    });
+    let count = engine.listing_stats().full_scans;
+    engine.tab_mut(Side::Left).last_scan = Some(Instant::now() - Duration::from_secs(5));
+    engine.poll();
+    assert_eq!(engine.listing_stats().full_scans, count);
+    let path = dir.join("external");
+    std::fs::write(&path, b"external").unwrap();
+    settle_views(&mut engine, |e| {
+        e.tab(Side::Left).visible_position(&path).is_some()
+    });
+    #[cfg(target_os = "linux")]
+    {
+        assert_eq!(engine.listing_stats().full_scans, count);
+        assert_eq!(engine.listing_stats().patches, 1);
+    }
+}
+
+#[test]
+fn cached_history_rows_do_not_replace_committed_operands_when_validation_fails() {
+    let fixture = tempfile::tempdir().unwrap();
+    let root = fixture.path().canonicalize().unwrap();
+    let a = root.join("a");
+    let b = root.join("b");
+    for path in [&a, &b] {
+        std::fs::create_dir(path).unwrap();
+        std::fs::write(path.join("file"), b"data").unwrap();
+    }
+    let side = Side::Left;
+    let mut engine = Engine::new(
+        root,
+        [a.clone(), b.clone()],
+        Settings {
+            auto_refresh: false,
+            ..Default::default()
+        },
+        || {},
+    );
+    settle_views(&mut engine, |e| !e.tab(side).busy());
+    engine.dispatch(Command::Navigate {
+        side,
+        path: b.clone(),
+        new_tab: false,
+        background: false,
+    });
+    settle_views(&mut engine, |e| !e.tab(side).busy());
+    engine.dispatch(Command::MarkAll(side));
+    std::fs::remove_dir_all(&a).unwrap();
+    engine.dispatch(Command::History(side, 0));
+    let preview = engine.history_preview(side).unwrap();
+    assert_eq!(preview.path, a);
+    assert_eq!(preview.entries().next().unwrap().path, a.join("file"));
+    assert_eq!(engine.tab(side).operands(), [b.join("file")]);
+    settle_views(&mut engine, |e| !e.tab(side).busy());
+    assert!(engine.history_preview(side).is_none());
+    assert_eq!(engine.tab(side).base(), b);
+    assert_eq!(engine.tab(side).operands(), [b.join("file")]);
+}
+
+#[cfg(unix)]
+#[test]
+fn incremental_changes_preserve_native_focus_marks_and_sorting() {
+    let fixture = tempfile::tempdir().unwrap();
+    let dir = fixture.path().canonicalize().unwrap();
+    let a = dir.join("a.txt");
+    let b = dir.join("b.txt");
+    std::fs::write(&a, b"a").unwrap();
+    std::fs::write(&b, b"bbb").unwrap();
+    let mut engine = Engine::new(
+        dir.clone(),
+        [dir.clone(), dir.clone()],
+        Settings {
+            auto_refresh: false,
+            ..Default::default()
+        },
+        || {},
+    );
+    let side = Side::Left;
+    settle_views(&mut engine, |e| {
+        Side::ALL.into_iter().all(|side| !e.tab(side).busy())
+    });
+    engine.dispatch(Command::Sort(side, Column::Size, false));
+    engine.dispatch(Command::Sort(side, Column::Size, false));
+    settle_views(&mut engine, |e| !e.tab(side).busy());
+    engine.dispatch(Command::Select(side, a.clone(), Select::Toggle));
+
+    std::fs::write(&a, b"aaaaa").unwrap();
+    engine.dirty_directory(&dir, watch::Hint::Paths(vec![a.clone()]));
+    engine.poll();
+    engine.dispatch(Command::Select(side, b.clone(), Select::Toggle));
+    settle_views(&mut engine, |e| {
+        let tab = e.tab(side);
+        !tab.busy()
+            && tab
+                .visible_entry(0)
+                .is_some_and(|entry| entry.path == a && entry.size == 5)
+    });
+    let tab = engine.tab(side);
+    assert_eq!(tab.visible_entry(0).unwrap().path, a);
+    assert_eq!(tab.current().unwrap().path, b);
+    assert!(tab.is_marked(&a) && tab.is_marked(&b));
+    assert_eq!(tab.selected_bytes(), 8);
+    assert_eq!(engine.listing_stats().full_scans, 1);
+    assert_eq!(engine.listing_stats().patches, 1);
+    let reference = listing::scan_cancellable(
+        &Location::Directory(dir),
+        false,
+        &Default::default(),
+        |_| {},
+    )
+    .unwrap();
+    for expected in reference.entries {
+        let actual = tab
+            .visible_entry(tab.visible_position(&expected.path).unwrap())
+            .unwrap();
+        assert_eq!(actual.size, expected.size);
+        assert_eq!(actual.comment, expected.comment);
+    }
+}
+
+#[test]
+fn sidecar_and_replaced_directory_trigger_complete_reconciliation() {
+    let fixture = tempfile::tempdir().unwrap();
+    let root = fixture.path().canonicalize().unwrap();
+    let dir = root.join("active");
+    let old = root.join("old");
+    std::fs::create_dir(&dir).unwrap();
+    let file = dir.join("file");
+    std::fs::write(&file, b"data").unwrap();
+    let side = Side::Left;
+    let mut engine = Engine::new(
+        root.clone(),
+        [dir.clone(), root],
+        Settings::default(),
+        || {},
+    );
+    settle_views(&mut engine, |e| !e.tab(side).busy());
+    let scans = engine.listing_stats().full_scans;
+    let sidecar = dir.join("descript.ion");
+    let modify = notify::EventKind::Modify(notify::event::ModifyKind::Data(
+        notify::event::DataChange::Content,
+    ));
+    engine.watches.inject(
+        &dir,
+        Ok(notify::Event::new(modify).add_path(sidecar.clone())),
+    );
+    std::fs::write(&sidecar, b"file updated comment\n").unwrap();
+    settle_views(&mut engine, |e| {
+        e.tab(side)
+            .visible_entries()
+            .any(|row| row.comment == "updated comment")
+    });
+    assert!(engine.listing_stats().full_scans > scans);
+    engine
+        .watches
+        .inject(&dir, Err(notify::Error::generic("watch invalidation")));
+    std::fs::rename(&dir, old).unwrap();
+    std::fs::create_dir(&dir).unwrap();
+    let replacement = dir.join("replacement");
+    std::fs::write(&replacement, b"new").unwrap();
+    settle_views(&mut engine, |e| {
+        e.tab(side).visible_position(&replacement).is_some()
+            && e.tab(side).visible_position(&file).is_none()
+    });
+    assert_eq!(engine.tab(side).base(), dir);
+}
+
+#[cfg(unix)]
+#[test]
+fn manual_refresh_supersedes_an_incremental_read_before_it_can_publish() {
+    let fixture = tempfile::tempdir().unwrap();
+    let dir = fixture.path().canonicalize().unwrap();
+    let path = dir.join("update");
+    std::fs::write(&path, b"before").unwrap();
+    let mut engine = Engine::new(
+        dir.clone(),
+        [dir.clone(), dir.clone()],
+        Settings {
+            auto_refresh: false,
+            ..Default::default()
+        },
+        || {},
+    );
+    let idle = |e: &Engine| Side::ALL.into_iter().all(|side| !e.tab(side).busy());
+    settle_views(&mut engine, idle);
+    let initial = engine.listing_stats().full_scans;
+    let (started, starts) = mpsc::channel();
+    let releases: Vec<_> = (0..2)
+        .map(|id| {
+            let (release, gate) = mpsc::channel();
+            let started = started.clone();
+            assert!(engine.scans.submit((u64::MAX - id, 0, 0), move |cancel| {
+                started.send(()).unwrap();
+                gate.recv_timeout(Duration::from_secs(5)).unwrap();
+                (cancel.check().map(|()| unreachable!()), None)
+            }));
+            release
+        })
+        .collect();
+    for _ in 0..2 {
+        starts.recv_timeout(Duration::from_secs(5)).unwrap();
+    }
+    std::fs::write(&path, b"incremental").unwrap();
+    engine.dirty_directory(&dir, watch::Hint::Paths(vec![path.clone()]));
+    engine.poll();
+    assert!(engine.tab(Side::Left).scan_base.is_some());
+    std::fs::remove_file(&path).unwrap();
+    engine.dispatch(Command::Refresh);
+    for release in releases {
+        release.send(()).unwrap();
+    }
+    settle_views(&mut engine, idle);
+    assert_eq!(engine.listing_stats().patches, 0);
+    assert_eq!(engine.listing_stats().full_scans, initial + 1);
+    assert_eq!(engine.tab(Side::Left).visible_count(), 0);
+    assert_eq!(engine.tab(Side::Right).visible_count(), 0);
+}
+
+#[test]
+fn ordinary_cache_cannot_discard_marks_learned_by_a_newer_recursive_scan() {
+    let fixture = tempfile::tempdir().unwrap();
+    let dir = fixture.path().canonicalize().unwrap();
+    let mut engine = Engine::new(
+        dir.clone(),
+        [dir.clone(), dir.clone()],
+        Settings {
+            auto_refresh: false,
+            ..Default::default()
+        },
+        || {},
+    );
+    let side = Side::Left;
+    settle_views(&mut engine, |e| !e.tab(side).busy());
+    let late = dir.join("late");
+    std::fs::write(&late, b"data").unwrap();
+    let mut recursive = MatchOptions::filename("");
+    recursive.recursive = true;
+    engine.dispatch(Command::Filter(side, recursive));
+    settle_views(&mut engine, |e| !e.tab(side).busy());
+    engine.dispatch(Command::MarkAll(side));
+    assert!(engine.tab(side).is_marked(&late));
+    engine.dispatch(Command::Filter(side, MatchOptions::filename("")));
+    settle_views(&mut engine, |e| !e.tab(side).busy());
+    assert!(engine.tab(side).is_marked(&late));
+    assert_eq!(engine.tab(side).selected_bytes(), 4);
+}
+
+#[test]
+fn unsupported_watch_and_virtual_scope_reconcile_on_the_fallback_interval() {
+    let fixture = tempfile::tempdir().unwrap();
+    let dir = fixture.path().canonicalize().unwrap();
+    let path = dir.join("entry");
+    std::fs::write(&path, "before").unwrap();
+    let left = Side::Left;
+    let right = Side::Right;
+    let mut engine = Engine::new(
+        dir.clone(),
+        [dir.clone(), dir.clone()],
+        Settings::default(),
+        || {},
+    );
+    engine.tab_mut(right).set_location(
+        Location::List {
+            base: dir.clone(),
+            paths: vec![path.clone()],
+        },
+        true,
+    );
+    let idle = |e: &Engine| Side::ALL.into_iter().all(|side| !e.tab(side).busy());
+    settle_views(&mut engine, idle);
+    let before = engine.listing_stats().full_scans;
+    engine
+        .watches
+        .inject(&dir, Err(notify::Error::generic("unsupported filesystem")));
+    engine.watches.drain(Instant::now());
+    assert!(!engine.watches.reliable(&dir));
+    let completed = Instant::now() - snapshots::UNWATCHED_INTERVAL;
+    for side in Side::ALL {
+        engine.tab_mut(side).last_scan = Some(completed);
+    }
+    engine.poll();
+    assert!(engine.tab(left).scanning && engine.tab(right).scanning);
+    settle_views(&mut engine, idle);
+    assert_eq!(engine.listing_stats().full_scans, before + 1);
+    assert_eq!(engine.tab(right).visible_entry(0).unwrap().path, path);
+}
+
+#[test]
+fn review_revisit_revalidates_after_watch_coverage_ends() {
+    let fixture = tempfile::tempdir().unwrap();
+    let root = fixture.path().canonicalize().unwrap();
+    let dir = root.join("watched");
+    std::fs::create_dir(&dir).unwrap();
+    std::fs::write(dir.join("cached"), "old").unwrap();
+    let side = Side::Left;
+    let mut engine = Engine::new(
+        root.clone(),
+        [dir.clone(), root.clone()],
+        Settings::default(),
+        || {},
+    );
+    settle_views(&mut engine, |e| !e.tab(side).busy());
+    engine.dispatch(Command::Navigate {
+        side,
+        path: root.clone(),
+        new_tab: false,
+        background: false,
+    });
+    settle_views(&mut engine, |e| {
+        e.tab(side).base() == root && !e.tab(side).busy()
+    });
+    let new = dir.join("new");
+    std::fs::write(&new, "changed while unwatched").unwrap();
+
+    engine.dispatch(Command::Back(side));
+    settle_views(&mut engine, |e| e.tab(side).base() == dir);
+    assert!(
+        engine
+            .tab(side)
+            .visible_position(&dir.join("cached"))
+            .is_some()
+    );
+    settle_views(&mut engine, |e| !e.tab(side).busy());
+    assert!(engine.tab(side).visible_position(&new).is_some());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn review_inactive_cached_directory_does_not_hold_a_descriptor() {
+    let fixture = tempfile::tempdir().unwrap();
+    let root = fixture.path().canonicalize().unwrap();
+    let dir = root.join("removable");
+    std::fs::create_dir(&dir).unwrap();
+    let side = Side::Left;
+    let mut engine = Engine::new(
+        root.clone(),
+        [dir.clone(), root.clone()],
+        Settings {
+            auto_refresh: false,
+            ..Default::default()
+        },
+        || {},
+    );
+    settle_views(&mut engine, |e| !e.tab(side).busy());
+    engine.dispatch(Command::Navigate {
+        side,
+        path: root.clone(),
+        new_tab: false,
+        background: false,
+    });
+    settle_views(&mut engine, |e| {
+        e.tab(side).base() == root && !e.tab(side).busy()
+    });
+    assert!(engine.listing_stats().retained_directories >= 2);
+    assert!(
+        !std::fs::read_dir("/proc/self/fd")
+            .unwrap()
+            .filter_map(Result::ok)
+            .any(|fd| std::fs::read_link(fd.path()).is_ok_and(|path| path == dir))
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn review_file_changes_update_hard_link_aliases_and_marked_bytes() {
+    let fixture = tempfile::tempdir().unwrap();
+    let dir = fixture.path().canonicalize().unwrap();
+    let a = dir.join("a");
+    let b = dir.join("b");
+    std::fs::write(&a, b"a").unwrap();
+    std::fs::hard_link(&a, &b).unwrap();
+    let side = Side::Left;
+    let mut engine = Engine::new(
+        dir.clone(),
+        [dir.clone(), dir.clone()],
+        Settings {
+            auto_refresh: false,
+            ..Default::default()
+        },
+        || {},
+    );
+    settle_views(&mut engine, |e| !e.tab(side).busy());
+    engine.dispatch(Command::Select(side, b.clone(), Select::Toggle));
+    std::fs::write(&a, b"changed").unwrap();
+    engine.dirty_directory(&dir, watch::Hint::Paths(vec![a]));
+    engine.poll();
+    settle_views(&mut engine, |e| !e.tab(side).busy());
+    let tab = engine.tab(side);
+    assert_eq!(tab.current().unwrap().path, b);
+    assert_eq!(tab.current().unwrap().size, 7);
+    assert_eq!(tab.selected_bytes(), 7);
+}
+
+#[cfg(unix)]
+#[test]
+fn review_job_through_real_path_updates_the_directory_symlink_pane() {
+    let fixture = tempfile::tempdir().unwrap();
+    let root = fixture.path().canonicalize().unwrap();
+    let dir = root.join("real");
+    let alias = root.join("alias");
+    std::fs::create_dir(&dir).unwrap();
+    std::os::unix::fs::symlink(&dir, &alias).unwrap();
+    let mut engine = Engine::new(
+        root,
+        [dir.clone(), alias.clone()],
+        Settings {
+            auto_refresh: false,
+            ..Default::default()
+        },
+        || {},
+    );
+    let idle = |e: &Engine| Side::ALL.into_iter().all(|side| !e.tab(side).busy());
+    settle_views(&mut engine, idle);
+    engine.dispatch(Command::Queue(Operation::Create(dir.join("new")), false));
+    settle_views(&mut engine, |e| {
+        e.jobs.last().unwrap().state.finished() && idle(e)
+    });
+    assert_eq!(engine.tab(Side::Left).visible_count(), 1);
+    assert!(
+        engine
+            .tab(Side::Right)
+            .visible_position(&alias.join("new"))
+            .is_some()
+    );
+}
+
+#[test]
+fn review_multivolume_archive_effects_include_virtual_members() {
+    let fixture = tempfile::tempdir().unwrap();
+    let dir = fixture.path().canonicalize().unwrap();
+    let operation = Operation::Archive(ArchiveOperation::Pack {
+        paths: vec![dir.join("input")],
+        output: dir.join("archive.7z"),
+        folder: PathBuf::new(),
+        options: PackOptions {
+            volume: "1m".into(),
+            ..Default::default()
+        },
+    });
+    let effects = changes::Effects::for_operation(&operation);
+    assert!(effects.listing(
+        &Location::List {
+            base: dir.clone(),
+            paths: vec![dir.join("archive.7z.001"), dir.join("archive.7z.002")],
+        },
+        false
+    ));
 }

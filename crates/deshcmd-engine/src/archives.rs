@@ -1075,6 +1075,14 @@ impl ArchiveCache {
         self.state.lock().unwrap().passwords.get(file).cloned()
     }
 
+    pub(crate) fn invalidate_inventories(&self, affected: impl Fn(&Path) -> bool) {
+        self.state
+            .lock()
+            .unwrap()
+            .sources
+            .retain(|source| !affected(&source.file));
+    }
+
     pub(crate) fn clear_inventories(&self) {
         self.state.lock().unwrap().sources.clear();
     }
@@ -1188,6 +1196,7 @@ pub(crate) fn scan(
             .map(|(path, (folder, size))| Entry::archive(&source, path, folder, size))
             .collect(),
         skipped: inventory.skipped,
+        has_hard_links: false,
     })
 }
 

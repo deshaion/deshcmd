@@ -26,9 +26,14 @@ pub(crate) struct Raw {
     pub entries: Vec<Entry>,
     pub skipped: usize,
     pub partial: bool,
+    pub directory: Option<listing::DirectoryIdentity>,
+    pub resolved_directory: Option<Arc<Path>>,
+    pub has_hard_links: bool,
+    pub links: usize,
     #[cfg(feature = "perf")]
     sampled_bytes: usize,
     by_path: HashMap<u64, usize>,
+    bytes: usize,
     hash: RandomState,
     retire: Option<Retire>,
 }
@@ -46,18 +51,36 @@ impl Raw {
             sampled_bytes: crate::perf::snapshot_created(scan.entries.capacity()),
             entries: scan.entries,
             partial,
+            directory: None,
+            resolved_directory: None,
+            has_hard_links: scan.has_hard_links,
+            links: 0,
             skipped: scan.skipped,
             retire: Some(retire),
+            bytes: 0,
             hash: RandomState::new(),
         };
+        raw.bytes = size_of::<Self>()
+            + raw.entries.capacity() * size_of::<Entry>()
+            + raw.by_path.capacity() * (size_of::<(u64, usize)>() + 1);
         for (index, entry) in raw.entries.iter().enumerate() {
             cancel.check()?;
+            raw.links += usize::from(entry.link);
+            raw.bytes += entry.path.capacity()
+                + entry.name.capacity()
+                + entry.extension.capacity()
+                + entry.comment.capacity()
+                + entry.attributes.capacity();
             raw.by_path
                 .entry(raw.hash.hash_one(&entry.path))
                 .and_modify(|index| *index = ABSENT)
                 .or_insert(index);
         }
         Ok(raw)
+    }
+
+    pub fn bytes(&self) -> usize {
+        self.bytes
     }
 
     fn index(&self, path: &Path) -> Option<usize> {
@@ -92,17 +115,22 @@ pub(crate) struct ViewKey {
     pub revision: u64,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(crate) struct View {
     pub raw: Arc<Raw>,
     pub order: Arc<Vec<usize>>,
     pub sort_revision: u64,
     pub eligibility_revision: u64,
-    pub visible: Vec<usize>,
-    positions: Vec<usize>,
+    pub visible: Arc<Vec<usize>>,
+    positions: Arc<Vec<usize>>,
 }
 
 impl View {
+    pub fn index_bytes(&self) -> usize {
+        (self.order.capacity() + self.visible.capacity() + self.positions.capacity())
+            * size_of::<usize>()
+    }
+
     pub fn position(&self, path: &Path) -> Option<usize> {
         let position = self.positions[self.raw.index(path)?];
         (position != ABSENT).then_some(position)
@@ -121,7 +149,46 @@ pub(crate) struct Options {
     pub eligibility_revision: u64,
 }
 
+pub(crate) struct ViewSpec {
+    sort: Vec<Sort>,
+    directories_first: bool,
+    natural: bool,
+    hidden: bool,
+    ignore: Option<Arc<globset::GlobSet>>,
+    criteria: Arc<MatchOptions>,
+}
+
+impl ViewSpec {
+    pub fn matches(&self, options: &Options) -> bool {
+        self.sort == options.sort
+            && self.directories_first == options.directories_first
+            && self.natural == options.natural
+            && self.hidden == options.hidden
+            && self.criteria == options.criteria
+            && match (&self.ignore, &options.ignore) {
+                (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+                (None, None) => true,
+                _ => false,
+            }
+    }
+
+    pub fn bytes(&self) -> usize {
+        self.sort.capacity() * size_of::<Sort>() + self.criteria.text.capacity()
+    }
+}
+
 impl Options {
+    pub fn spec(self) -> ViewSpec {
+        ViewSpec {
+            sort: self.sort,
+            directories_first: self.directories_first,
+            natural: self.natural,
+            hidden: self.hidden,
+            ignore: self.ignore,
+            criteria: self.criteria,
+        }
+    }
+
     pub fn shown(&self, entry: &Entry) -> bool {
         (self.hidden || !entry.hidden)
             && !self
@@ -193,8 +260,8 @@ impl Options {
             order,
             sort_revision: self.sort_revision,
             eligibility_revision: self.eligibility_revision,
-            visible,
-            positions,
+            visible: Arc::new(visible),
+            positions: Arc::new(positions),
         })
     }
 }
@@ -276,7 +343,9 @@ impl FirstPages {
     pub fn expect(&self, slot: usize, key: crate::ScanKey) {
         let mut state = self.0.lock().unwrap();
         let previous = std::mem::replace(&mut state.active[slot], key);
-        state.ready.retain(|(key, _)| *key != previous);
+        if !state.active.contains(&previous) {
+            state.ready.retain(|(key, _)| *key != previous);
+        }
     }
 
     pub fn publish(&self, key: crate::ScanKey, raw: Arc<Raw>, cancel: &Cancellation) -> bool {

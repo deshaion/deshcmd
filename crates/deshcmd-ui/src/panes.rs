@@ -37,6 +37,7 @@ pub(crate) struct PaneScreen<'a> {
     pub show_inline_filter: bool,
     pub reveal_cursor: bool,
     pub preview: Option<(Side, Option<&'a Entry>)>,
+    pub history_preview: Option<engine::HistoryPreview<'a>>,
 }
 
 #[derive(Clone)]
@@ -78,6 +79,7 @@ impl PanelUi {
             show_inline_filter,
             reveal_cursor,
             preview,
+            history_preview,
         } = screen;
         let tab = pane.tab();
         root.painter().rect(
@@ -173,6 +175,22 @@ impl PanelUi {
         contents.spacing_mut().item_spacing = vec2(0., 0.);
         if tab.provisional() && !show_status {
             contents.label(label("Loading more files…", 11., SUB));
+        }
+        if let Some(preview) = &history_preview
+            && body.height() >= 108.
+        {
+            contents.add(
+                egui::Label::new(label(
+                    format!("Cached rows · Opening {}", preview.path.display()),
+                    12.,
+                    SUB,
+                ))
+                .truncate(),
+            );
+            for entry in preview.entries().take(3) {
+                contents.add(egui::Label::new(label(&entry.name, 12., SUB)).truncate());
+            }
+            contents.separator();
         }
         match tab.saved.view {
             View::Gallery => gallery(&mut contents, tab, side, reveal_cursor, previews, actions),
@@ -1394,6 +1412,9 @@ fn panel_status(root: &mut Ui, rect: Rect, side: Side, tab: &Tab, space: Option<
     if tab.provisional() {
         ui.spinner();
         ui.label(mono(format!("{shown} shown · loading…"), 11., ACCENT));
+    } else if tab.refreshing() {
+        ui.spinner();
+        ui.add(egui::Label::new(label("Refreshing…", 11., ACCENT)).truncate());
     } else if tab.listing_pending() && shown != 0 {
         ui.spinner();
     }
