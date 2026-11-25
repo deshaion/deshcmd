@@ -30,7 +30,7 @@ On Linux, mark the downloaded AppImage executable with `chmod +x deshcmd-0.1.0-x
 
 Extract the executable from a standalone archive into a folder you can write to. The standalone archives are `deshcmd-linux-x86_64.tar.gz`, `deshcmd-linux-aarch64.tar.gz`, `deshcmd-windows-x86_64.zip`, `deshcmd-macos-aarch64.tar.gz`, and `deshcmd-macos-x86_64.tar.gz`.
 
-Choose **Tools → Check for Updates…** and then **Install and Restart** when a newer version is ready. You can dismiss an in-progress check and reopen it from Tools while it runs.
+Choose **Help → Check for Updates…** and then **Install and Restart** when a newer version is ready. You can dismiss an in-progress check and reopen it from Help while it runs.
 
 From a terminal, run `deshcmd --schedule-update` (`--update` is an alias). Exit code 0 means DeshCmd is already up to date or the verified update was scheduled. The helper installs after the command exits and relaunches DeshCmd, so allow it to finish before launching the executable again.
 

@@ -423,13 +423,18 @@ impl App {
         toolbar.menu_button("Select", |ui| dialogs::selection_menu(ui, side, actions));
         toolbar.menu_button("View", |ui| self.view_menu(ui, side, actions));
         toolbar.menu_button("Tools", |ui| {
-            dialogs::tools_menu(ui, side, actions);
+            let bottom_margin = egui::Frame::menu(ui.style()).total_margin().bottom;
+            let available_height =
+                ui.ctx().content_rect().bottom() - ui.cursor().top() - bottom_margin;
+            egui::ScrollArea::vertical()
+                .max_height(available_height.max(1.))
+                .show(ui, |ui| dialogs::tools_menu(ui, side, actions));
+        });
+        toolbar.menu_button("Help", |ui| {
             if self.desktop.supports_updates() && ui.button("Check for Updates…").clicked() {
                 actions.push(Action::CheckForUpdates);
                 ui.close();
             }
-        });
-        toolbar.menu_button("Help", |ui| {
             if ui.button("Keyboard shortcuts · F1").clicked() {
                 self.interface.show_help = true;
                 ui.close();
