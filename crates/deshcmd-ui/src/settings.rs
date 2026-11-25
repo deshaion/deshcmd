@@ -43,6 +43,7 @@ enum Page {
     Interface,
     Panels,
     Navigation,
+    Confirmations,
     Visibility,
     Sorting,
     Columns,
@@ -54,6 +55,7 @@ impl Page {
             Self::Interface => "Interface",
             Self::Panels => "Panels",
             Self::Navigation => "Navigation",
+            Self::Confirmations => "Confirmations",
             Self::Visibility => "Visibility",
             Self::Sorting => "Sorting",
             Self::Columns => "Columns",
@@ -67,6 +69,7 @@ pub(crate) struct Preferences {
     show_inline_filter: bool,
     show_places: bool,
     show_bottom_bar: bool,
+    ui_font: UiFont,
     alternate_columns: [bool; 2],
     zoom: u32,
     page: Page,
@@ -80,6 +83,7 @@ impl Preferences {
         for (group, pages) in [
             ("Appearance", &[Page::Interface, Page::Panels][..]),
             ("Workspace", &[Page::Navigation][..]),
+            ("File operations", &[Page::Confirmations][..]),
             (
                 "File lists",
                 &[Page::Visibility, Page::Sorting, Page::Columns][..],
@@ -119,6 +123,15 @@ impl Preferences {
                         self.zoom = 100;
                     }
                 });
+                ui.label("Interface font");
+                ui.horizontal_wrapped(|ui| {
+                    ui.selectable_value(&mut self.ui_font, UiFont::UbuntuLight, "Ubuntu Light");
+                    ui.selectable_value(
+                        &mut self.ui_font,
+                        UiFont::DejaVuSansMono,
+                        "DejaVu Sans Mono",
+                    );
+                });
             }
             Page::Panels => {
                 ui.label("Panel orientation");
@@ -154,6 +167,16 @@ impl Preferences {
                 ui.checkbox(
                     &mut self.workspace.auto_refresh,
                     "Refresh active folders automatically",
+                );
+            }
+            Page::Confirmations => {
+                ui.checkbox(
+                    &mut self.workspace.confirm_trash,
+                    "Confirm before moving items to Trash",
+                );
+                ui.checkbox(
+                    &mut self.workspace.confirm_delete,
+                    "Confirm before permanently deleting items",
                 );
             }
             Page::Visibility => {
@@ -223,6 +246,7 @@ impl App {
             show_inline_filter: self.interface.show_inline_filter,
             show_places: self.interface.show_places,
             show_bottom_bar: self.interface.show_bottom_bar,
+            ui_font: self.interface.ui_font,
             alternate_columns: self.interface.alternate_columns,
             zoom: zoom_percent(ctx.zoom_factor()),
             page: Page::Interface,
@@ -237,6 +261,11 @@ impl App {
         let viewport = ctx.content_rect().size();
         let width = (viewport.x - 36.).min(620.);
         let height = (viewport.y - 154.).min(330.);
+        let tree_width = if self.interface.ui_font == UiFont::DejaVuSansMono {
+            168.
+        } else {
+            146.
+        };
         let mut cancel = false;
         let mut save = false;
 
@@ -255,10 +284,10 @@ impl App {
                 |ui| {
                     ui.set_height(height);
                     ui.allocate_ui_with_layout(
-                        vec2(146., height),
+                        vec2(tree_width, height),
                         Layout::top_down(Align::Min),
                         |ui| {
-                            ui.set_width(146.);
+                            ui.set_width(tree_width);
                             egui::ScrollArea::vertical()
                                 .id_salt("settings-tree")
                                 .max_height(height)
@@ -323,6 +352,8 @@ impl App {
         settings.split = draft.split;
         settings.linked = draft.linked;
         settings.auto_refresh = draft.auto_refresh;
+        settings.confirm_trash = draft.confirm_trash;
+        settings.confirm_delete = draft.confirm_delete;
         settings.natural_sort = draft.natural_sort;
         settings.directories_first = draft.directories_first;
         settings.show_modified_time = draft.show_modified_time;
@@ -336,6 +367,10 @@ impl App {
         self.interface.show_bottom_bar = preferences.show_bottom_bar;
         self.interface.alternate_columns = preferences.alternate_columns;
         ctx.set_zoom_factor(zoom_factor(preferences.zoom));
+        if self.interface.ui_font != preferences.ui_font {
+            self.interface.ui_font = preferences.ui_font;
+            set_ui_font(ctx, preferences.ui_font);
+        }
 
         if toggle_hidden {
             self.engine.dispatch(Command::ToggleHidden);
@@ -352,6 +387,33 @@ impl App {
 mod tests {
     use super::*;
     use crate::tests::TestDesktop;
+
+    #[test]
+    fn deletion_confirmations_default_on_and_can_be_saved_independently() {
+        let fixture = tempfile::tempdir().unwrap();
+        let path = fixture.path().to_owned();
+        let ctx = egui::Context::default();
+        let creation = eframe::CreationContext::_new_kittest(ctx.clone());
+        let mut app = App::new(
+            &creation,
+            Box::new(TestDesktop::default()),
+            path.clone(),
+            [path.clone(), path],
+            true,
+        );
+        let older_settings: Settings = serde_json::from_str("{}").unwrap();
+        assert!(older_settings.confirm_trash && older_settings.confirm_delete);
+        app.engine.settings.confirm_delete = false;
+        app.open_settings(&ctx);
+        let mut draft = app.preferences.take().unwrap();
+        draft.workspace.confirm_trash = false;
+        draft.workspace.confirm_delete = true;
+        app.save_settings(&draft, &ctx).unwrap();
+
+        let restored: Settings =
+            serde_json::from_str(&serde_json::to_string(&app.engine.snapshot()).unwrap()).unwrap();
+        assert!(!restored.confirm_trash && restored.confirm_delete);
+    }
 
     #[test]
     fn modified_time_preference_is_enabled_by_default_and_can_be_saved_off() {

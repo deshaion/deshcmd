@@ -1,8 +1,9 @@
 use std::path::{Component, Path, PathBuf};
 
 use deshcmd_engine::{
-    self as engine, Algorithm, Bookmark, Collision, Column, Command, Entry, ManifestMode,
-    MatchOptions, Operation, Side, TransferOptions,
+    self as engine, Algorithm, ArchiveOperation, ArchiveSelection, Bookmark, Collision, Column,
+    Command, Entry, ExtractLayout, ExtractOptions, ManifestMode, MatchOptions, Operation,
+    PackOptions, Side, TransferOptions,
 };
 use eframe::egui;
 use egui::{Align, Id, Layout, TextEdit, Ui};
@@ -12,6 +13,13 @@ use crate::{Action, App, FileClipboard, theme::*};
 #[derive(Clone, Copy)]
 pub(crate) enum Tool {
     OpenTerminal,
+    BrowseArchive,
+    UnlockArchive,
+    OpenAssociated,
+    Pack,
+    Unpack,
+    DeleteArchiveMembers,
+    TestArchive,
     #[cfg(any(target_os = "linux", windows))]
     InstallMenuEntry,
     NewFolder,
@@ -70,6 +78,11 @@ pub(crate) enum Tool {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Kind {
     Text,
+    Pack,
+    Unpack,
+    DeleteArchiveMembers,
+    TestArchive,
+    UnlockArchive,
     Transfer,
     Delete,
     Wipe,
@@ -102,7 +115,12 @@ pub(crate) struct Dialog {
     numeric: String,
     flags: [bool; 4],
     criteria: MatchOptions,
+    pack: PackOptions,
+    extract: ExtractOptions,
+    archives: Vec<ArchiveSelection>,
+    archive_target: Option<(PathBuf, PathBuf)>,
     focus: bool,
+    focus_footer: bool,
     error: Option<String>,
 }
 
@@ -124,7 +142,15 @@ impl Dialog {
             numeric: String::new(),
             flags: [false; 4],
             criteria: MatchOptions::filename(""),
-            focus: true,
+            pack: PackOptions::default(),
+            extract: ExtractOptions::default(),
+            archives: Vec::new(),
+            archive_target: None,
+            focus: kind != Kind::Unpack,
+            focus_footer: matches!(
+                kind,
+                Kind::Delete | Kind::DeleteArchiveMembers | Kind::Unpack
+            ),
             error: None,
         }
     }
@@ -139,6 +165,14 @@ impl Dialog {
         );
         dialog.primary = destination.display().to_string();
         dialog.description = summarize(&dialog.paths);
+        dialog
+    }
+    pub fn pack(side: Side, paths: Vec<PathBuf>, archive: &Path, folder: &Path) -> Self {
+        let mut dialog = Self::new(Kind::Pack, Tool::Pack, side, "Add to archive", paths);
+        dialog.primary = archive.display().to_string();
+        dialog.description = summarize(&dialog.paths);
+        dialog.archive_target = Some((archive.to_owned(), folder.to_owned()));
+        dialog.pack.update = true;
         dialog
     }
     pub fn eject(path: PathBuf) -> Self {
@@ -190,13 +224,41 @@ pub(crate) fn file_menu(ui: &mut Ui, side: Side, actions: &mut Vec<Action>) {
         menu_item(ui, side, name, tool, actions);
     }
     ui.separator();
+    menu_item(ui, side, "Pack…", Tool::Pack, actions);
+    menu_item(ui, side, "Extract…", Tool::Unpack, actions);
+    ui.separator();
     menu_item(ui, side, "Properties", Tool::Inspect, actions);
     if ui.button("Quit").clicked() {
         actions.push(Action::Close);
         ui.close();
     }
 }
-pub(crate) fn entry_menu(ui: &mut Ui, side: Side, actions: &mut Vec<Action>) {
+pub(crate) fn entry_menu(ui: &mut Ui, side: Side, entry: &Entry, actions: &mut Vec<Action>) {
+    if entry.archive.is_some() {
+        menu_item(ui, side, "Unlock archive…", Tool::UnlockArchive, actions);
+        menu_item(ui, side, "Extract…", Tool::Unpack, actions);
+        menu_item(ui, side, "Test archive…", Tool::TestArchive, actions);
+        menu_item(
+            ui,
+            side,
+            "Delete archive members…",
+            Tool::DeleteArchiveMembers,
+            actions,
+        );
+        return;
+    }
+    if !entry.is_dir() && engine::is_archive(&entry.path) {
+        menu_item(ui, side, "Browse archive", Tool::BrowseArchive, actions);
+        menu_item(
+            ui,
+            side,
+            "Open with associated application",
+            Tool::OpenAssociated,
+            actions,
+        );
+        menu_item(ui, side, "Extract…", Tool::Unpack, actions);
+        menu_item(ui, side, "Test archive…", Tool::TestArchive, actions);
+    }
     for (name, tool) in [
         ("Rename", Tool::Rename),
         ("Copy to other panel", Tool::Copy),
@@ -276,6 +338,18 @@ pub(crate) fn tools_menu(ui: &mut Ui, side: Side, actions: &mut Vec<Action>) {
     menu_item(ui, side, "Settings…", Tool::Settings, actions);
     ui.separator();
     menu_item(ui, side, "Open Terminal · F9", Tool::OpenTerminal, actions);
+    ui.menu_button("Archives", |ui| {
+        for (name, tool) in [
+            ("Browse archive", Tool::BrowseArchive),
+            ("Unlock archive…", Tool::UnlockArchive),
+            ("Pack…", Tool::Pack),
+            ("Extract…", Tool::Unpack),
+            ("Delete archive members…", Tool::DeleteArchiveMembers),
+            ("Test archive…", Tool::TestArchive),
+        ] {
+            menu_item(ui, side, name, tool, actions);
+        }
+    });
     #[cfg(target_os = "linux")]
     menu_item(
         ui,
@@ -400,10 +474,204 @@ impl App {
         }
         let tab = self.engine.tab(side);
         let base = tab.base().to_owned();
-        let other = self.engine.tab(side.other()).base().to_owned();
+        let other_tab = self.engine.tab(side.other());
+        let other = other_tab.base().to_owned();
+        let archive = tab.archive_selection();
+        let other_archive = other_tab.archive_selection();
         let missing = || "Select one file or folder to use this command";
         let empty = || "Select a file or folder first";
+        if archive.is_some()
+            && !matches!(
+                tool,
+                Tool::Copy
+                    | Tool::Unpack
+                    | Tool::TestArchive
+                    | Tool::UnlockArchive
+                    | Tool::DeleteArchiveMembers
+                    | Tool::Delete
+                    | Tool::Trash
+                    | Tool::Find
+                    | Tool::FilterOptions
+                    | Tool::MarkMask
+                    | Tool::UnmarkMask
+                    | Tool::RenameTab(_)
+                    | Tool::SaveFavorite
+                    | Tool::Favorites
+                    | Tool::ImportTabs
+                    | Tool::ExportTabs
+                    | Tool::FolderPicker
+                    | Tool::CopyNames
+                    | Tool::CopyPaths
+                    | Tool::CopyParentPaths
+                    | Tool::CopyDetails
+                    | Tool::ExportDetails
+                    | Tool::OpenTerminal
+            )
+        {
+            self.notice("This action requires a local file or folder");
+            return;
+        }
+        if matches!(tool, Tool::Move) && other_archive.is_some() {
+            self.notice("Use Copy to add files to an archive");
+            return;
+        }
         let mut result = match tool {
+            Tool::UnlockArchive => {
+                if let Some(archive) = archive.as_ref() {
+                    let mut dialog = Dialog::new(
+                        Kind::UnlockArchive,
+                        tool,
+                        side,
+                        "Unlock archive",
+                        vec![archive.file.clone()],
+                    );
+                    dialog.description = archive.file.display().to_string();
+                    Some(dialog)
+                } else {
+                    self.notice("Open the archive before unlocking it");
+                    None
+                }
+            }
+            Tool::BrowseArchive | Tool::OpenAssociated => {
+                if let Some(entry) = tab
+                    .single_operand()
+                    .filter(|entry| !entry.is_dir() && engine::is_archive(&entry.path))
+                {
+                    let path = entry.path.clone();
+                    if matches!(tool, Tool::BrowseArchive) {
+                        self.apply(Action::Path(side, path), ctx);
+                    } else if let Err(error) = self.desktop.open(&path) {
+                        self.notice(error);
+                    }
+                } else {
+                    self.notice("Select an archive first");
+                }
+                None
+            }
+            Tool::Pack if tab.has_operands() => {
+                let paths = tab.operands();
+                let name = paths
+                    .first()
+                    .and_then(|path| path.file_stem())
+                    .unwrap_or_default()
+                    .to_string_lossy();
+                let mut dialog = Dialog::new(Kind::Pack, tool, side, "Pack files", paths.clone());
+                dialog.primary = other.join(format!("{name}.zip")).display().to_string();
+                dialog.description = summarize(&paths);
+                Some(dialog)
+            }
+            Tool::Copy if archive.is_none() && other_archive.is_some() && tab.has_operands() => {
+                let target = other_archive.as_ref().unwrap();
+                Some(Dialog::pack(
+                    side,
+                    tab.operands(),
+                    &target.file,
+                    &target.folder,
+                ))
+            }
+            Tool::Unpack | Tool::Copy if matches!(tool, Tool::Unpack) || archive.is_some() => {
+                if matches!(tool, Tool::Copy) && other_archive.is_some() {
+                    self.notice("Choose a local destination for the extracted files");
+                    return;
+                }
+                let archives = if let Some(selection) = archive {
+                    if matches!(tool, Tool::Copy) && selection.members.is_empty() {
+                        self.notice("Select archive members to copy");
+                        return;
+                    }
+                    vec![selection]
+                } else {
+                    tab.operands()
+                        .into_iter()
+                        .filter(|path| path.is_file() && engine::is_archive(path))
+                        .map(|file| ArchiveSelection {
+                            file,
+                            folder: PathBuf::new(),
+                            members: Vec::new(),
+                        })
+                        .collect()
+                };
+                if archives.is_empty() {
+                    self.notice("Select an archive first");
+                    return;
+                }
+                let mut dialog = Dialog::new(
+                    Kind::Unpack,
+                    tool,
+                    side,
+                    "Extract archive contents",
+                    Vec::new(),
+                );
+                dialog.primary = other.display().to_string();
+                dialog.description = summarize(
+                    &archives
+                        .iter()
+                        .map(|source| source.file.clone())
+                        .collect::<Vec<_>>(),
+                );
+                dialog.archives = archives;
+                if let [source] = dialog.archives.as_slice()
+                    && let Some(password) = self.engine.archive_password(&source.file)
+                {
+                    dialog.extract.password = password.to_string();
+                }
+                Some(dialog)
+            }
+            Tool::DeleteArchiveMembers | Tool::Delete | Tool::Trash if archive.is_some() => {
+                let selection = archive.unwrap();
+                if selection.members.is_empty() {
+                    self.notice("Select archive members to delete");
+                    return;
+                }
+                let mut dialog = Dialog::new(
+                    Kind::DeleteArchiveMembers,
+                    tool,
+                    side,
+                    "Delete archive members",
+                    Vec::new(),
+                );
+                dialog.description = summarize(&selection.members);
+                dialog.archives = vec![selection];
+                Some(dialog)
+            }
+            Tool::TestArchive => {
+                let paths = if let Some(archive) = archive {
+                    vec![archive.file]
+                } else {
+                    tab.operands()
+                        .into_iter()
+                        .filter(|path| path.is_file() && engine::is_archive(path))
+                        .collect()
+                };
+                if paths.is_empty() {
+                    self.notice("Select an archive first");
+                    return;
+                }
+                let mut dialog = Dialog::new(
+                    Kind::TestArchive,
+                    tool,
+                    side,
+                    "Test archive integrity",
+                    paths,
+                );
+                dialog.description = summarize(&dialog.paths);
+                if let [path] = dialog.paths.as_slice()
+                    && let Some(password) = self.engine.archive_password(path)
+                {
+                    dialog.extract.password = password.to_string();
+                }
+                Some(dialog)
+            }
+            Tool::Pack | Tool::DeleteArchiveMembers | Tool::Unpack => {
+                self.notice(if matches!(tool, Tool::Pack) {
+                    empty()
+                } else if matches!(tool, Tool::Unpack) {
+                    "Select an archive first"
+                } else {
+                    "Open an archive to delete its members"
+                });
+                None
+            }
             Tool::OpenTerminal => {
                 if let Err(error) = self.desktop.open_terminal(&base) {
                     self.notice(format!(
@@ -543,7 +811,19 @@ impl App {
                 );
                 dialog.description = summarize(&dialog.paths);
                 dialog.numeric = "3".into();
-                Some(dialog)
+                let confirm = match tool {
+                    Tool::Trash => self.engine.settings.confirm_trash,
+                    Tool::Delete => self.engine.settings.confirm_delete,
+                    _ => true,
+                };
+                if confirm {
+                    Some(dialog)
+                } else {
+                    if let Err(error) = self.submit(&dialog, false, ctx) {
+                        self.notice(error);
+                    }
+                    None
+                }
             }
             Tool::Trash | Tool::Delete | Tool::Wipe => {
                 self.notice(empty());
@@ -810,7 +1090,10 @@ impl App {
                 let mut dialog = Dialog::new(Kind::Criteria, tool, side, title, Vec::new());
                 if matches!(tool, Tool::FilterOptions) {
                     dialog.criteria = tab.filter().clone();
-                    dialog.flags[0] = matches!(tab.location(), engine::Location::Directory(_));
+                    dialog.flags[0] = matches!(
+                        tab.location(),
+                        engine::Location::Directory(_) | engine::Location::Archive { .. }
+                    );
                 }
                 Some(dialog)
             }
@@ -967,7 +1250,7 @@ impl App {
                     dialog.criteria = MatchOptions::filename("");
                     outcome = Outcome::Submit(false);
                 }
-                if dialog.kind == Kind::Transfer
+                if matches!(dialog.kind, Kind::Transfer | Kind::Pack | Kind::Unpack)
                     && ui
                         .button("Queue paused")
                         .on_hover_text("Add this operation and start it later from the queue")
@@ -983,6 +1266,11 @@ impl App {
                     let button_text = match dialog.kind {
                         Kind::Delete if matches!(dialog.tool, Tool::Trash) => "Move to Trash",
                         Kind::Delete => "Delete permanently",
+                        Kind::Pack => "Pack",
+                        Kind::Unpack => "Extract",
+                        Kind::DeleteArchiveMembers => "Delete members",
+                        Kind::TestArchive => "Test",
+                        Kind::UnlockArchive => "Unlock",
                         Kind::Wipe => "Overwrite and delete",
                         Kind::Transfer if matches!(dialog.tool, Tool::Move) => "Move",
                         Kind::Transfer => "Copy",
@@ -991,25 +1279,51 @@ impl App {
                         _ if only_close => "Close",
                         _ => "Apply",
                     };
-                    let dangerous = matches!(dialog.kind, Kind::Delete | Kind::Wipe);
+                    let dangerous = matches!(
+                        dialog.kind,
+                        Kind::Delete | Kind::Wipe | Kind::DeleteArchiveMembers
+                    );
                     let ink = BASE;
                     let fill = if dangerous { RED } else { ACCENT };
-                    if ui
-                        .add(
-                            egui::Button::new(label(button_text, 13., ink).strong())
-                                .fill(fill)
-                                .stroke(egui::Stroke::NONE),
-                        )
-                        .clicked()
-                    {
+                    let confirm = ui.add(
+                        egui::Button::new(label(button_text, 13., ink).strong())
+                            .fill(fill)
+                            .stroke(egui::Stroke::NONE),
+                    );
+                    if confirm.clicked() {
                         outcome = if only_close {
                             Outcome::Close
                         } else {
                             Outcome::Submit(false)
                         };
                     }
-                    if !only_close && ui.button("Cancel").clicked() {
-                        outcome = Outcome::Close;
+                    if !only_close {
+                        let cancel = ui.button("Cancel");
+                        if std::mem::take(&mut dialog.focus_footer) {
+                            if dangerous {
+                                cancel.request_focus();
+                            } else {
+                                confirm.request_focus();
+                            }
+                        }
+                        if matches!(
+                            dialog.kind,
+                            Kind::Delete | Kind::DeleteArchiveMembers | Kind::Unpack
+                        ) {
+                            for button in [&confirm, &cancel] {
+                                if button.has_focus() {
+                                    ui.painter().rect_stroke(
+                                        button.rect.expand(2.),
+                                        5.,
+                                        egui::Stroke::new(1.5, TEXT),
+                                        egui::StrokeKind::Outside,
+                                    );
+                                }
+                            }
+                        }
+                        if cancel.clicked() {
+                            outcome = Outcome::Close;
+                        }
                     }
                 });
             });
@@ -1040,6 +1354,12 @@ impl App {
                 if let Err(error) = self.submit(&dialog, held, ctx) {
                     dialog.error = Some(error);
                     self.dialog = Some(dialog);
+                } else if dialog.kind == Kind::Delete && dialog.flags[0] {
+                    if matches!(dialog.tool, Tool::Trash) {
+                        self.engine.settings.confirm_trash = false;
+                    } else {
+                        self.engine.settings.confirm_delete = false;
+                    }
                 }
             }
         }
@@ -1159,6 +1479,43 @@ impl App {
         };
         let queue = |operation| Action::Command(Command::Queue(operation, held));
         let action = match kind {
+            Kind::UnlockArchive => Action::Command(Command::UnlockArchive {
+                side,
+                file: item()?,
+                password: dialog.extract.password.clone(),
+            }),
+            Kind::Pack => {
+                if primary.trim().is_empty() {
+                    return Err("Enter the archive path".into());
+                }
+                let (output, folder) = match &dialog.archive_target {
+                    Some(target) => target.clone(),
+                    None => (path_input(primary)?, PathBuf::new()),
+                };
+                queue(Operation::Archive(ArchiveOperation::Pack {
+                    paths: paths.clone(),
+                    output,
+                    folder,
+                    options: dialog.pack.clone(),
+                }))
+            }
+            Kind::Unpack => {
+                if primary.trim().is_empty() {
+                    return Err("Enter a destination folder".into());
+                }
+                queue(Operation::Archive(ArchiveOperation::Extract {
+                    sources: dialog.archives.clone(),
+                    destination: path_input(primary)?,
+                    options: dialog.extract.clone(),
+                }))
+            }
+            Kind::DeleteArchiveMembers => queue(Operation::Archive(ArchiveOperation::Delete(
+                dialog.archives[0].clone(),
+            ))),
+            Kind::TestArchive => queue(Operation::Archive(ArchiveOperation::Test {
+                paths: paths.clone(),
+                password: dialog.extract.password.clone(),
+            })),
             Kind::Text => match tool {
                 Tool::NewFolder => {
                     let relative = Path::new(primary.trim());
@@ -1413,15 +1770,107 @@ fn draw_fields(ui: &mut Ui, dialog: &mut Dialog, outcome: &mut Outcome) {
         numeric,
         flags,
         criteria,
+        pack,
+        extract,
+        archive_target,
         focus,
         ..
     } = dialog;
     if !description.is_empty() && !matches!(kind, Kind::Bookmark | Kind::HelpDetail | Kind::Inspect)
     {
-        ui.add(egui::Label::new(mono(description.as_str(), 11., SUB)).truncate())
+        ui.add(egui::Label::new(mono(description.as_str(), 12., SUB)).truncate())
             .on_hover_text(description.as_str());
     }
     match kind {
+        Kind::Pack => {
+            if let Some((archive, folder)) = archive_target {
+                ui.label(archive.join(folder).display().to_string());
+            } else {
+                field(ui, "Archive path and extension", primary, focus);
+                ui.checkbox(&mut pack.update, "Update existing archive");
+            }
+            ui.add(egui::Slider::new(&mut pack.level, 0..=9).text("Compression level"));
+            ui.label("Password (optional)");
+            ui.add(TextEdit::singleline(&mut pack.password).password(true));
+            ui.label("Volume size (optional, for example 100m)");
+            ui.add(TextEdit::singleline(&mut pack.volume));
+        }
+        Kind::Unpack => {
+            field(ui, "Destination folder", primary, focus);
+            if ui.small_button("Browse…").clicked() {
+                *outcome = Outcome::Browse;
+            }
+            ui.label("File mask (optional)");
+            ui.add(TextEdit::singleline(&mut extract.mask).hint_text("*.txt"));
+            ui.checkbox(&mut extract.flatten, "Flatten paths");
+            egui::ComboBox::from_id_salt("archive-layout")
+                .selected_text(match extract.layout {
+                    ExtractLayout::Direct => "Extract into destination",
+                    ExtractLayout::Separate => "One folder per archive",
+                    ExtractLayout::Smart => "Smart Extract",
+                })
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(
+                        &mut extract.layout,
+                        ExtractLayout::Direct,
+                        "Extract into destination",
+                    );
+                    ui.selectable_value(
+                        &mut extract.layout,
+                        ExtractLayout::Separate,
+                        "One folder per archive",
+                    );
+                    ui.selectable_value(&mut extract.layout, ExtractLayout::Smart, "Smart Extract");
+                });
+            egui::ComboBox::from_id_salt("archive-overwrite")
+                .selected_text(match extract.collision {
+                    Collision::Replace => "Replace existing files",
+                    Collision::Skip => "Skip existing files",
+                    Collision::RenameIncoming => "Rename extracted files",
+                    _ => "Ask before replacing",
+                })
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(
+                        &mut extract.collision,
+                        Collision::Ask,
+                        "Ask before replacing",
+                    );
+                    ui.selectable_value(
+                        &mut extract.collision,
+                        Collision::Replace,
+                        "Replace existing files",
+                    );
+                    ui.selectable_value(
+                        &mut extract.collision,
+                        Collision::Skip,
+                        "Skip existing files",
+                    );
+                    ui.selectable_value(
+                        &mut extract.collision,
+                        Collision::RenameIncoming,
+                        "Rename extracted files",
+                    );
+                });
+            ui.label("Password (optional)");
+            ui.add(TextEdit::singleline(&mut extract.password).password(true));
+        }
+        Kind::DeleteArchiveMembers => {
+            ui.label("Selected folders and their members will be removed from the archive.");
+        }
+        Kind::TestArchive => {
+            ui.label("Password (optional)");
+            ui.add(TextEdit::singleline(&mut extract.password).password(true));
+        }
+        Kind::UnlockArchive => {
+            ui.label("Archive password");
+            let response = ui.add(TextEdit::singleline(&mut extract.password).password(true));
+            if std::mem::take(focus) {
+                response.request_focus();
+            }
+            if ui.input(|input| input.key_pressed(egui::Key::Enter)) {
+                *outcome = Outcome::Submit(false);
+            }
+        }
         Kind::Text => {
             let hint = match tool {
                 Tool::Comment => "Comment",
@@ -1530,6 +1979,7 @@ fn draw_fields(ui: &mut Ui, dialog: &mut Dialog, outcome: &mut Outcome) {
                     RED
                 },
             ));
+            ui.checkbox(&mut flags[0], "Don't ask again for this action");
         }
         Kind::Wipe => {
             ui.label(label("File contents will be overwritten before deletion. Recovery may still be possible on SSDs, snapshots, and copy-on-write storage.",13.,RED));
@@ -1654,7 +2104,9 @@ fn draw_fields(ui: &mut Ui, dialog: &mut Dialog, outcome: &mut Outcome) {
                         flags[0],
                         egui::Checkbox::new(&mut criteria.recursive, "Recursive"),
                     )
-                    .on_disabled_hover_text("Recursive filtering is available in directory tabs");
+                    .on_disabled_hover_text(
+                        "Recursive filtering is available in folder and archive tabs",
+                    );
                 }
                 ui.checkbox(&mut criteria.directories, "Directories");
                 ui.checkbox(&mut criteria.files, "Files");
@@ -1811,6 +2263,198 @@ fn describe(entry: &Entry) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn draw_dialog(app: &mut App, ctx: &egui::Context, key: Option<egui::Key>) {
+        let events = key
+            .into_iter()
+            .flat_map(|key| {
+                [true, false].map(|pressed| egui::Event::Key {
+                    key,
+                    physical_key: None,
+                    pressed,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                })
+            })
+            .collect();
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1100., 700.),
+                )),
+                events,
+                ..Default::default()
+            },
+            |_| app.dialogs(ctx),
+        );
+        output.textures_delta.clear();
+    }
+
+    #[test]
+    fn delete_confirmation_has_keyboard_focus_and_can_be_disabled() {
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path().canonicalize().unwrap();
+        let first = root.join("first.txt");
+        let second = root.join("second.txt");
+        std::fs::write(&first, "").unwrap();
+        std::fs::write(&second, "").unwrap();
+        let ctx = egui::Context::default();
+        let creation = eframe::CreationContext::_new_kittest(ctx.clone());
+        let mut app = App::new(
+            &creation,
+            Box::new(crate::tests::TestDesktop::default()),
+            root.clone(),
+            [root.clone(), root],
+            true,
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while app.engine.tab(Side::Left).loading {
+            app.engine.poll();
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        app.engine
+            .dispatch(Command::Select(Side::Left, first, engine::Select::Focus));
+        app.invoke(Side::Left, Tool::Delete, &ctx);
+        app.dialog.as_mut().unwrap().flags[0] = true;
+        draw_dialog(&mut app, &ctx, None);
+        draw_dialog(&mut app, &ctx, Some(egui::Key::Enter));
+        assert!(app.dialog.is_none());
+        assert!(app.engine.jobs.is_empty());
+        assert!(app.engine.settings.confirm_delete);
+
+        app.invoke(Side::Left, Tool::Delete, &ctx);
+        app.dialog.as_mut().unwrap().flags[0] = true;
+        draw_dialog(&mut app, &ctx, None);
+        draw_dialog(&mut app, &ctx, Some(egui::Key::ArrowRight));
+        draw_dialog(&mut app, &ctx, Some(egui::Key::Enter));
+        assert!(app.dialog.is_none());
+        assert_eq!(app.engine.jobs.len(), 1);
+        assert!(!app.engine.settings.confirm_delete);
+        assert!(app.engine.settings.confirm_trash);
+
+        app.engine
+            .dispatch(Command::Select(Side::Left, second, engine::Select::Focus));
+        app.invoke(Side::Left, Tool::Delete, &ctx);
+        assert!(app.dialog.is_none());
+        assert_eq!(app.engine.jobs.len(), 2);
+    }
+
+    #[test]
+    fn pack_and_copy_archive_members_use_archive_dialogs() {
+        let archiver_found = ["7zz", "7z", "7za"].iter().any(|program| {
+            std::process::Command::new(program)
+                .arg("i")
+                .output()
+                .is_ok_and(|output| output.status.success())
+        });
+        if !archiver_found {
+            return;
+        }
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path().canonicalize().unwrap();
+        let destination = root.join("destination");
+        std::fs::create_dir(&destination).unwrap();
+        let file = root.join("note.txt");
+        std::fs::write(&file, "Archive member").unwrap();
+        let ctx = egui::Context::default();
+        let creation = eframe::CreationContext::_new_kittest(ctx.clone());
+        let mut app = App::new(
+            &creation,
+            Box::new(crate::tests::TestDesktop::default()),
+            root.clone(),
+            [root.clone(), destination.clone()],
+            true,
+        );
+        let wait = |app: &mut App, job: bool| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                app.engine.poll();
+                if !app.engine.tab(Side::Left).loading
+                    && (!job
+                        || app
+                            .engine
+                            .jobs
+                            .last()
+                            .is_some_and(|job| job.state.finished()))
+                {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "archive action timed out"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        };
+        wait(&mut app, false);
+        app.engine
+            .dispatch(Command::Select(Side::Left, file, engine::Select::Focus));
+        app.invoke(Side::Left, Tool::Pack, &ctx);
+        let mut dialog = app.dialog.take().unwrap();
+        assert!(dialog.kind == Kind::Pack);
+        let password = "preview fixture password";
+        dialog.pack.password = password.into();
+        app.submit(&dialog, false, &ctx).unwrap();
+        wait(&mut app, true);
+        assert_eq!(
+            app.engine.jobs.last().unwrap().state,
+            engine::JobState::Done
+        );
+
+        app.apply(Action::Path(Side::Left, destination.join("note.zip")), &ctx);
+        wait(&mut app, false);
+        let entry = app.engine.tab(Side::Left).current().unwrap().clone();
+        let locked_revision = entry.archive.as_ref().unwrap().revision;
+        app.apply(Action::Open(Side::Left, entry, false), &ctx);
+        assert_eq!(app.interface.quick, Some(Side::Left));
+        app.invoke(Side::Left, Tool::Copy, &ctx);
+        draw_dialog(&mut app, &ctx, None);
+        draw_dialog(&mut app, &ctx, Some(egui::Key::Enter));
+        assert!(app.dialog.is_none());
+        wait(&mut app, true);
+        let failed = app.engine.jobs.last().unwrap();
+        assert_eq!(failed.state, engine::JobState::Failed);
+        assert!(failed.message.starts_with("Password required"));
+        assert!(!destination.join("note.txt").exists());
+        app.invoke(Side::Left, Tool::UnlockArchive, &ctx);
+        let mut dialog = app.dialog.take().unwrap();
+        assert!(dialog.kind == Kind::UnlockArchive);
+        dialog.extract.password = password.into();
+        app.submit(&dialog, false, &ctx).unwrap();
+        wait(&mut app, false);
+        let source = app
+            .engine
+            .tab(Side::Left)
+            .current()
+            .unwrap()
+            .archive
+            .as_ref()
+            .unwrap();
+        assert_ne!(source.revision, locked_revision);
+        assert!(matches!(
+            source.preview(Path::new("note.txt"), engine::Kind::Text, 64),
+            engine::Preview::Text(text) if text == "Archive member"
+        ));
+        app.invoke(Side::Left, Tool::Copy, &ctx);
+        let dialog = app.dialog.as_ref().unwrap();
+        assert!(dialog.kind == Kind::Unpack);
+        assert_eq!(dialog.extract.password, password);
+        draw_dialog(&mut app, &ctx, None);
+        draw_dialog(&mut app, &ctx, Some(egui::Key::Enter));
+        assert!(app.dialog.is_none());
+        assert_eq!(app.engine.jobs.len(), 3);
+        wait(&mut app, true);
+        assert_eq!(
+            app.engine.jobs.last().unwrap().state,
+            engine::JobState::Done
+        );
+        assert_eq!(
+            std::fs::read(destination.join("note.txt")).unwrap(),
+            b"Archive member"
+        );
+    }
 
     #[test]
     fn details_export_uses_visible_order_and_marked_subset() {

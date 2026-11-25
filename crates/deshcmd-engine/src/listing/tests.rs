@@ -1,5 +1,13 @@
 use super::*;
 
+#[test]
+fn zip_based_documents_keep_the_document_open_action() {
+    for extension in ["docx", "xlsx", "pptx", "odt", "ods", "odp", "epub"] {
+        assert_eq!(file_kind(extension, false), Kind::Text);
+        assert!(crate::archives::supports_extension(extension));
+    }
+}
+
 fn reference_name(left: &str, right: &str, natural: bool) -> Ordering {
     let (left, right) = (left.to_lowercase(), right.to_lowercase());
     if !natural {
@@ -62,6 +70,7 @@ fn reference_sort(entries: &mut [Entry], columns: &[Sort], dirs_first: bool, nat
 
 fn entry(name: &str, i: usize) -> Entry {
     Entry {
+        archive: None,
         path: PathBuf::from(format!("root/{i}/{name}")),
         name: name.into(),
         extension: Path::new(name)

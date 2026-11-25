@@ -77,6 +77,7 @@ struct Interface {
     show_inline_filter: bool,
     show_places: bool,
     show_bottom_bar: bool,
+    ui_font: UiFont,
     alternate_columns: [bool; 2],
     quick: Option<Side>,
     clipboard: Option<FileClipboard>,
@@ -106,7 +107,11 @@ impl App {
         initial: [PathBuf; 2],
         fresh: bool,
     ) -> Self {
-        theme::install(&context.egui_ctx);
+        let ui_font = context
+            .storage
+            .and_then(|storage| eframe::get_value(storage, "ui_font"))
+            .unwrap_or_default();
+        theme::install(&context.egui_ctx, ui_font);
         settings::install_zoom(&context.egui_ctx);
         #[cfg(not(target_os = "macos"))]
         context.egui_ctx.options_mut(|options| {
@@ -135,6 +140,7 @@ impl App {
             interface: Interface {
                 tree,
                 alternate_columns,
+                ui_font,
                 show_inline_filter: context
                     .storage
                     .and_then(|storage| eframe::get_value(storage, "show_inline_filter"))
@@ -171,7 +177,9 @@ impl App {
             }
             Action::Tool(side, tool) => self.invoke(side, tool, ctx),
             Action::Open(side, entry, background) => {
-                if entry.is_dir() {
+                if entry.archive.is_some() && !entry.is_dir() {
+                    self.interface.quick = Some(side);
+                } else if entry.is_dir() || entry.kind == engine::Kind::Archive {
                     self.engine.dispatch(Command::Navigate {
                         side,
                         path: entry.path,
@@ -188,7 +196,21 @@ impl App {
                 destination,
                 moving,
             } => {
-                self.dialog = Some(Dialog::transfer(side, paths, destination, moving));
+                if let Some(archive) = destination
+                    .ancestors()
+                    .find(|path| path.is_file() && engine::is_archive(path))
+                {
+                    if moving {
+                        self.notice("Use Copy to add files to an archive");
+                    } else {
+                        let folder = destination
+                            .strip_prefix(archive)
+                            .unwrap_or_else(|_| Path::new(""));
+                        self.dialog = Some(Dialog::pack(side, paths, archive, folder));
+                    }
+                } else {
+                    self.dialog = Some(Dialog::transfer(side, paths, destination, moving));
+                }
             }
             Action::Path(side, path) => self.engine.dispatch(Command::Navigate {
                 side,
@@ -489,7 +511,7 @@ impl App {
                     && place(
                         ui,
                         Icon::Star,
-                        "Add current folder",
+                        "Bookmark here",
                         "Bookmark the active location",
                         false,
                     )
@@ -918,7 +940,7 @@ impl App {
         if just(Key::Tab) {
             actions.push(Action::Command(Command::Focus(side.other())));
         }
-        let tab_shortcut = |modifiers, key| {
+        let initial_press = |modifiers, key| {
             ctx.input_mut(|input| {
                 let mut pressed = false;
                 input.events.retain(|event| {
@@ -940,20 +962,20 @@ impl App {
                 pressed
             })
         };
-        if tab_shortcut(egui::Modifiers::COMMAND | egui::Modifiers::SHIFT, Key::T) {
+        if initial_press(egui::Modifiers::COMMAND | egui::Modifiers::SHIFT, Key::T) {
             let index = self.engine.pane(side).active;
             actions.push(Action::Command(Command::SendTab(side, index, false)));
         }
         if command(Key::T) {
             actions.push(Action::Command(Command::NewTab(side)));
         }
-        if tab_shortcut(egui::Modifiers::CTRL, Key::ArrowUp) {
+        if initial_press(egui::Modifiers::CTRL, Key::ArrowUp) {
             actions.push(Action::Command(Command::OpenFocusedDirectoryInTab {
                 source: side,
                 destination: side,
             }));
         }
-        if tab_shortcut(egui::Modifiers::CTRL, Key::ArrowRight) && side == Side::Left {
+        if initial_press(egui::Modifiers::CTRL, Key::ArrowRight) && side == Side::Left {
             actions.push(Action::Command(Command::OpenFocusedDirectoryInTab {
                 source: side,
                 destination: Side::Right,
@@ -1055,16 +1077,20 @@ impl App {
         if shift(Key::F5) {
             actions.push(Action::Tool(side, Tool::CopyHere));
         }
-        if shift(Key::Delete) {
-            actions.push(Action::Tool(side, Tool::Delete));
+        for (modifiers, key, tool) in [
+            (egui::Modifiers::SHIFT, Key::Delete, Tool::Delete),
+            (egui::Modifiers::NONE, Key::Delete, Tool::Trash),
+            (egui::Modifiers::NONE, Key::F8, Tool::Trash),
+        ] {
+            if initial_press(modifiers, key) {
+                actions.push(Action::Tool(side, tool));
+            }
         }
         for (key, tool) in [
             (Key::F2, Tool::Rename),
             (Key::F5, Tool::Copy),
             (Key::F6, Tool::Move),
             (Key::F7, Tool::NewFolder),
-            (Key::F8, Tool::Trash),
-            (Key::Delete, Tool::Trash),
         ] {
             if just(key) {
                 actions.push(Action::Tool(side, tool));
@@ -1144,6 +1170,8 @@ impl App {
             0.
         } else if root.width() > 1050. {
             184.
+        } else if self.interface.ui_font == UiFont::DejaVuSansMono {
+            176.
         } else {
             158.
         };
@@ -1314,7 +1342,7 @@ impl App {
             actions.push(Action::Drop {
                 side,
                 paths: dropped,
-                destination: self.engine.tab(side).base().to_path_buf(),
+                destination: self.engine.tab(side).location().display_path(),
                 moving: false,
             });
         }
@@ -1405,6 +1433,7 @@ impl eframe::App for App {
         );
         eframe::set_value(storage, "show_places", &self.interface.show_places);
         eframe::set_value(storage, "show_bottom_bar", &self.interface.show_bottom_bar);
+        eframe::set_value(storage, "ui_font", &self.interface.ui_font);
         eframe::set_value(
             storage,
             "panel_display",
@@ -1420,7 +1449,12 @@ fn child(ui: &mut Ui, id: Id, rect: Rect, layout: Layout) -> Ui {
     child
 }
 
-type PreviewKey = (PathBuf, Option<SystemTime>, u32);
+#[derive(Clone, PartialEq, Eq, Hash)]
+enum PreviewRevision {
+    Local(Option<SystemTime>),
+    Archive(u64),
+}
+type PreviewKey = (PathBuf, PreviewRevision, u32);
 enum CachedPreview {
     Image(TextureHandle, egui::Vec2),
     Text(String),
@@ -1429,21 +1463,34 @@ enum CachedPreview {
 
 struct Previews {
     ctx: egui::Context,
-    requests: mpsc::SyncSender<(PreviewKey, engine::Kind)>,
+    requests: mpsc::SyncSender<PreviewRequest>,
     results: mpsc::Receiver<(PreviewKey, engine::Preview)>,
     pending: HashSet<PreviewKey>,
     cached: HashMap<PreviewKey, CachedPreview>,
     order: std::collections::VecDeque<PreviewKey>,
 }
 
+type PreviewRequest = (
+    PreviewKey,
+    engine::Kind,
+    Option<std::sync::Arc<engine::ArchiveSource>>,
+);
+
 impl Previews {
     fn new(ctx: egui::Context) -> Self {
-        let (requests, receive) = mpsc::sync_channel::<(PreviewKey, engine::Kind)>(32);
+        let (requests, receive) = mpsc::sync_channel::<PreviewRequest>(32);
         let (send, results) = mpsc::channel();
         let wake = ctx.clone();
         std::thread::spawn(move || {
-            while let Ok((key, kind)) = receive.recv() {
-                let preview = engine::preview(&key.0, kind, key.2);
+            while let Ok((key, kind, archive)) = receive.recv() {
+                let preview = if let Some(archive) = archive {
+                    match key.0.strip_prefix(&archive.file) {
+                        Ok(member) => archive.preview(member, kind, key.2),
+                        Err(_) => engine::Preview::Unavailable,
+                    }
+                } else {
+                    engine::preview(&key.0, kind, key.2)
+                };
                 if send.send((key, preview)).is_err() {
                     break;
                 }
@@ -1460,10 +1507,19 @@ impl Previews {
         }
     }
     fn get(&mut self, entry: &Entry, size: u32) -> Option<&CachedPreview> {
-        let key = (entry.path.clone(), entry.modified, size);
+        let revision = entry
+            .archive
+            .as_ref()
+            .map_or(PreviewRevision::Local(entry.modified), |archive| {
+                PreviewRevision::Archive(archive.revision)
+            });
+        let key = (entry.path.clone(), revision, size);
         if !self.cached.contains_key(&key)
             && !self.pending.contains(&key)
-            && self.requests.try_send((key.clone(), entry.kind)).is_ok()
+            && self
+                .requests
+                .try_send((key.clone(), entry.kind, entry.archive.clone()))
+                .is_ok()
         {
             self.pending.insert(key.clone());
         }

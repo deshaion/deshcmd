@@ -2,8 +2,8 @@ use std::f32::consts::{FRAC_PI_2, TAU};
 
 use eframe::egui;
 use egui::{
-    Align2, Color32 as C, CornerRadius, FontId, Pos2, Rect, RichText, Sense, Stroke, StrokeKind,
-    Style, Ui, Vec2, pos2, vec2,
+    Align2, Color32 as C, CornerRadius, FontData, FontDefinitions, FontFamily, FontId, Pos2, Rect,
+    RichText, Sense, Stroke, StrokeKind, Style, Ui, Vec2, pos2, vec2,
 };
 
 pub const BASE: C = C::from_rgb(12, 15, 19);
@@ -12,7 +12,7 @@ pub const SURFACE: C = C::from_rgb(19, 24, 30);
 pub const RAISED: C = C::from_rgb(26, 32, 40);
 pub const HOVER: C = C::from_rgb(35, 43, 52);
 pub const LINE: C = C::from_rgb(45, 54, 64);
-pub const TEXT: C = C::from_rgb(232, 238, 243);
+pub const TEXT: C = C::from_rgb(200, 203, 208);
 pub const SUB: C = C::from_rgb(165, 176, 189);
 pub const MUTED: C = C::from_rgb(123, 138, 154);
 pub const ACCENT: C = C::from_rgb(170, 235, 129);
@@ -21,7 +21,38 @@ pub const BLUE: C = C::from_rgb(124, 178, 245);
 pub const AMBER: C = C::from_rgb(234, 187, 116);
 pub const RED: C = C::from_rgb(247, 145, 143);
 
-pub fn install(context: &egui::Context) {
+#[derive(Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum UiFont {
+    #[default]
+    UbuntuLight,
+    DejaVuSansMono,
+}
+
+pub fn set_ui_font(context: &egui::Context, font: UiFont) {
+    let mut fonts = FontDefinitions::default();
+    let mono = "DejaVu Sans Mono";
+    fonts.font_data.insert(
+        mono.into(),
+        FontData::from_static(include_bytes!("../assets/DejaVuSansMono.ttf")).into(),
+    );
+    fonts
+        .families
+        .entry(FontFamily::Monospace)
+        .or_default()
+        .insert(0, mono.into());
+
+    if font == UiFont::DejaVuSansMono {
+        fonts
+            .families
+            .entry(FontFamily::Proportional)
+            .or_default()
+            .insert(0, mono.into());
+    }
+    context.set_fonts(fonts);
+}
+
+pub fn install(context: &egui::Context, font: UiFont) {
+    set_ui_font(context, font);
     let mut style = Style {
         visuals: egui::Visuals::dark(),
         ..Style::default()

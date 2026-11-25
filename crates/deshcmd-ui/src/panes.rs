@@ -96,10 +96,11 @@ impl PanelUi {
             show_preview(root, rect, side, source, entry, previews, actions);
             return;
         }
-        if self.tab_id != tab.id || self.base != tab.base() {
+        let display_path = tab.location().display_path();
+        if self.tab_id != tab.id || self.base != display_path {
             self.tab_id = tab.id;
-            self.base = tab.base().to_path_buf();
-            self.path_draft = tab.base().display().to_string();
+            self.path_draft = display_path.display().to_string();
+            self.base = display_path;
             self.filter.clone_from(&tab.filter().text);
         }
         let short = rect.height() < 225.;
@@ -190,7 +191,7 @@ impl PanelUi {
                 actions.push(Action::Drop {
                     side,
                     paths: payload.0.clone(),
-                    destination: tab.base().to_path_buf(),
+                    destination: tab.location().display_path(),
                     moving,
                 });
             }
@@ -363,7 +364,7 @@ impl PanelUi {
                             actions.push(Action::Drop {
                                 side,
                                 paths: payload.0.clone(),
-                                destination: tab.base().to_path_buf(),
+                                destination: tab.location().display_path(),
                                 moving,
                             });
                         }
@@ -375,7 +376,7 @@ impl PanelUi {
                                 if pinned {
                                     ui.label("Pinned tab");
                                 }
-                                ui.label(tab.base().display().to_string());
+                                ui.label(tab.location().display_path().display().to_string());
                             })
                             .context_menu(|ui| {
                                 let pin_label = if pinned { "Unpin tab" } else { "Pin tab" };
@@ -476,7 +477,10 @@ impl PanelUi {
                 .max_height(250.)
                 .show(ui, |ui| {
                     for (index, location) in tab.history().enumerate().rev() {
-                        if ui.button(location.base().display().to_string()).clicked() {
+                        if ui
+                            .button(location.display_path().display().to_string())
+                            .clicked()
+                        {
                             actions.push(Action::Command(Command::History(side, index)));
                             ui.close();
                         }
@@ -493,14 +497,22 @@ impl PanelUi {
         {
             actions.push(Action::Command(Command::Forward(side)));
         }
-        if icon_button(
-            &mut ui,
-            Icon::Up,
-            "Parent folder · Alt+Up",
-            tab.base().parent().is_some() || !matches!(tab.location(), Location::Directory(_)),
-        )
-        .clicked()
-        {
+        let up = if let Location::Archive { folder, .. } = tab.location() {
+            ui.small_button(if folder.as_os_str().is_empty() {
+                "Exit archive"
+            } else {
+                "Up"
+            })
+            .on_hover_text("Go up one level · Left")
+        } else {
+            icon_button(
+                &mut ui,
+                Icon::Up,
+                "Parent folder · Left",
+                tab.base().parent().is_some() || !matches!(tab.location(), Location::Directory(_)),
+            )
+        };
+        if up.clicked() {
             actions.push(Action::Command(Command::Parent(side)));
         }
         ui.add_space(4.);
@@ -542,11 +554,12 @@ impl PanelUi {
                 self.editing_path = false;
             }
             if root.input(|input| input.key_pressed(egui::Key::Escape)) {
-                self.path_draft = tab.base().display().to_string();
+                self.path_draft = tab.location().display_path().display().to_string();
                 self.editing_path = false;
             }
         } else {
-            let crumbs = crumbs(tab.base(), home);
+            let display_path = tab.location().display_path();
+            let crumbs = crumbs(&display_path, home);
             let label_width = |text: &str| {
                 path_ui
                     .painter()
@@ -600,7 +613,7 @@ impl PanelUi {
             if path_response.clicked() {
                 self.start_path();
             }
-            path_response.on_hover_text(tab.base().display().to_string());
+            path_response.on_hover_text(display_path.display().to_string());
         }
         if icon_button(&mut ui, Icon::More, "Location and view options", true).clicked() {
             self.start_path();
@@ -884,7 +897,7 @@ fn rows(
                         pos2(x + 41., rect.center().y),
                         Align2::LEFT_CENTER,
                         &entry.name,
-                        FontId::proportional(13.),
+                        FontId::proportional(14.),
                         if marked {
                             TEXT
                         } else if entry.hidden {
@@ -941,7 +954,7 @@ fn row_interaction(
             },
         )));
     }
-    if response.drag_started() {
+    if response.drag_started() && entry.archive.is_none() {
         let paths = if marked {
             tab.operands()
         } else {
@@ -970,7 +983,7 @@ fn row_interaction(
             ui.close();
         }
         ui.separator();
-        dialogs::entry_menu(ui, side, actions);
+        dialogs::entry_menu(ui, side, entry, actions);
     });
 }
 
@@ -1088,6 +1101,20 @@ fn gallery(
 }
 
 fn empty(ui: &mut Ui, tab: &Tab, side: Side, actions: &mut Vec<Action>) {
+    let in_archive = matches!(tab.location(), Location::Archive { .. });
+    let error_title = if tab.archive_locked {
+        "Archive locked"
+    } else if in_archive {
+        "Archive unavailable"
+    } else {
+        "Folder unavailable"
+    };
+    let up_label = if matches!(tab.location(), Location::Archive { folder, .. } if folder.as_os_str().is_empty())
+    {
+        "Exit archive"
+    } else {
+        "Go up"
+    };
     let filtering = tab.filter().is_active();
     let empty_message = if filtering {
         "No matching items"
@@ -1097,7 +1124,7 @@ fn empty(ui: &mut Ui, tab: &Tab, side: Side, actions: &mut Vec<Action>) {
     if ui.available_height() < 45. {
         ui.vertical_centered(|ui| {
             if let Some(message) = tab.error.as_deref() {
-                ui.label(label("Folder unavailable", 13., TEXT))
+                ui.label(label(error_title, 13., TEXT))
                     .on_hover_text(message);
             } else if tab.loading && tab.entry_count() == 0 {
                 ui.label(label("Loading files…", 13., SUB));
@@ -1111,10 +1138,48 @@ fn empty(ui: &mut Ui, tab: &Tab, side: Side, actions: &mut Vec<Action>) {
     ui.add_space(offset);
     ui.vertical_centered(|ui| {
         if let Some(message) = tab.error.as_deref() {
-            ui.label(label("Folder unavailable", 15., TEXT).strong());
+            ui.label(label(error_title, 15., TEXT).strong());
             ui.label(label(message, 12., SUB));
-            if ui.small_button("Retry").clicked() {
-                actions.push(Action::Command(Command::Refresh));
+            ui.add_space(5.);
+            let primary_label = if tab.archive_locked {
+                "Unlock archive…"
+            } else {
+                "Retry"
+            };
+            let gap = 8.;
+            let font = egui::TextStyle::Body.resolve(ui.style());
+            let button_width = |text: &str| {
+                let text_width = ui
+                    .painter()
+                    .layout_no_wrap(text.to_owned(), font.clone(), TEXT)
+                    .size()
+                    .x;
+                text_width + 2. * ui.spacing().button_padding.x
+            };
+            let row_width = button_width(primary_label) + gap + button_width(up_label);
+            let mut buttons = |ui: &mut Ui| {
+                if ui.button(primary_label).clicked() {
+                    if tab.archive_locked {
+                        actions.push(Action::Tool(side, Tool::UnlockArchive));
+                    } else {
+                        actions.push(Action::Command(Command::Refresh));
+                    }
+                }
+                if ui.button(up_label).clicked() {
+                    actions.push(Action::Command(Command::Parent(side)));
+                }
+            };
+            if row_width <= ui.available_width() {
+                ui.allocate_ui_with_layout(
+                    vec2(row_width, ui.spacing().interact_size.y),
+                    Layout::left_to_right(Align::Center),
+                    |ui| {
+                        ui.spacing_mut().item_spacing.x = gap;
+                        buttons(ui);
+                    },
+                );
+            } else {
+                buttons(ui);
             }
         } else if tab.loading && tab.entry_count() == 0 {
             ui.spinner();
@@ -1324,6 +1389,9 @@ fn show_preview(
             }
             Some(CachedPreview::None) => {
                 ui.label(label("Preview unavailable for this file.", 13., SUB));
+                if entry.archive.is_some() && ui.button("Unlock archive…").clicked() {
+                    actions.push(Action::Tool(source, Tool::UnlockArchive));
+                }
                 if ui.button("Open file").clicked() {
                     actions.push(Action::Open(source, entry.clone(), false));
                 }

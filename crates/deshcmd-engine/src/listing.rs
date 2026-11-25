@@ -4,6 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, Metadata};
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
@@ -38,6 +39,7 @@ impl Kind {
 #[derive(Clone, Debug)]
 pub struct Entry {
     pub path: PathBuf,
+    pub archive: Option<Arc<crate::ArchiveSource>>,
     pub name: String,
     pub extension: String,
     pub kind: Kind,
@@ -82,25 +84,7 @@ impl Entry {
             .unwrap_or_default()
             .to_string_lossy()
             .to_ascii_lowercase();
-        let kind = if meta.is_dir() {
-            Kind::Folder
-        } else {
-            match extension.as_str() {
-                "png" | "jpg" | "jpeg" | "gif" | "bmp" | "webp" | "ico" | "tiff" | "tif"
-                | "svg" | "heic" | "avif" => Kind::Image,
-                "mp3" | "wav" | "ogg" | "flac" | "m4a" | "aac" | "opus" => Kind::Audio,
-                "mp4" | "mkv" | "avi" | "mov" | "webm" | "m4v" => Kind::Video,
-                "zip" | "tar" | "gz" | "xz" | "rar" | "7z" | "bz2" | "zst" | "deb" | "rpm" => {
-                    Kind::Archive
-                }
-                "rs" | "js" | "ts" | "jsx" | "tsx" | "py" | "html" | "css" | "cpp" | "c" | "h"
-                | "sh" | "toml" | "json" | "yaml" | "yml" | "go" | "java" => Kind::Code,
-                "txt" | "md" | "log" | "csv" | "tsv" | "pdf" | "rtf" | "docx" | "odt" | "xlsx" => {
-                    Kind::Text
-                }
-                _ => Kind::Other,
-            }
-        };
+        let kind = file_kind(&extension, meta.is_dir());
         #[cfg(unix)]
         let attributes = {
             use std::os::unix::fs::PermissionsExt;
@@ -121,6 +105,7 @@ impl Entry {
         let system_hidden = false;
         Self {
             path,
+            archive: None,
             extension,
             kind,
             size: meta.len(),
@@ -135,11 +120,59 @@ impl Entry {
             attributes,
         }
     }
+    pub(crate) fn archive(
+        source: &Arc<crate::ArchiveSource>,
+        member: PathBuf,
+        folder: bool,
+        size: u64,
+    ) -> Self {
+        let name = crate::display_name(&member);
+        let extension = member
+            .extension()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_ascii_lowercase();
+        Self {
+            kind: file_kind(&extension, folder),
+            path: source.file.join(member),
+            archive: Some(Arc::clone(source)),
+            hidden: name.starts_with('.'),
+            name,
+            extension,
+            size,
+            modified: None,
+            created: None,
+            accessed: None,
+            read_only: true,
+            link: false,
+            comment: String::new(),
+            attributes: String::new(),
+        }
+    }
+}
+fn file_kind(extension: &str, folder: bool) -> Kind {
+    if folder {
+        Kind::Folder
+    } else {
+        match extension {
+            "png" | "jpg" | "jpeg" | "gif" | "bmp" | "webp" | "ico" | "tiff" | "tif" | "svg"
+            | "heic" | "avif" => Kind::Image,
+            "mp3" | "wav" | "ogg" | "flac" | "m4a" | "aac" | "opus" => Kind::Audio,
+            "mp4" | "mkv" | "avi" | "mov" | "webm" | "m4v" => Kind::Video,
+            "rs" | "js" | "ts" | "jsx" | "tsx" | "py" | "html" | "css" | "cpp" | "c" | "h"
+            | "sh" | "toml" | "json" | "yaml" | "yml" | "go" | "java" => Kind::Code,
+            "txt" | "md" | "log" | "csv" | "tsv" | "pdf" | "rtf" | "docx" | "odt" | "xlsx"
+            | "pptx" | "ods" | "odp" | "epub" => Kind::Text,
+            _ if crate::archives::supports_extension(extension) => Kind::Archive,
+            _ => Kind::Other,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Location {
     Directory(PathBuf),
+    Archive { file: PathBuf, folder: PathBuf },
     Flat { base: PathBuf, roots: Vec<PathBuf> },
     List { base: PathBuf, paths: Vec<PathBuf> },
 }
@@ -149,6 +182,14 @@ impl Location {
             Self::Directory(path)
             | Self::Flat { base: path, .. }
             | Self::List { base: path, .. } => path,
+            Self::Archive { file, .. } => file.parent().unwrap_or_else(|| Path::new(".")),
+        }
+    }
+    pub fn display_path(&self) -> PathBuf {
+        match self {
+            Self::Archive { file, folder } if !folder.as_os_str().is_empty() => file.join(folder),
+            Self::Archive { file, .. } => file.clone(),
+            _ => self.base().to_owned(),
         }
     }
 }
@@ -424,6 +465,7 @@ pub(crate) fn scan(location: &Location, recursive: bool) -> io::Result<Scan> {
                     .cloned(),
             );
         }
+        Location::Archive { .. } => unreachable!(),
     }
     scan.entries.reserve_exact(paths.len());
     let mut cache = HashMap::new();

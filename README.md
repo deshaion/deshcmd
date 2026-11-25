@@ -47,7 +47,41 @@ On Linux, choose **Tools → Add DeshCmd to Application Menu** or run `deshcmd -
 
 On Windows, choose **Tools → Add DeshCmd to Start Menu** or run the executable with `--install-menu-entry` to create a Start menu shortcut for your user account. Run the command again if you move the executable.
 
-This version supports local files, mounted locations, and virtual path lists. Archive and plugin-backed volumes in [Features.md](Features.md). The deshcmd workspace and bookmark interchange format is JSON. The integrity tools support 22 checksum options, including SFV. HAVAL and native ACL editing remain outside this version. Trash, volume discovery, and system clipboard behavior depend on the desktop. Linux/X11 is the verified desktop target.
+This version supports local files, mounted locations, archives, and virtual path lists. See [Features.md](Features.md) for the broader feature inventory. The deshcmd workspace and bookmark interchange format is JSON. The integrity tools support 22 checksum options, including SFV. HAVAL and native ACL editing remain outside this version. Trash, volume discovery, and system clipboard behavior depend on the desktop. Linux/X11 is the verified desktop target.
+
+## Archives and packages
+
+Install 7-Zip and put `7zz`, `7z`, or `7za` on your PATH. On Windows, DeshCmd also looks in the default 7-Zip installation folder. Set `DESHCMD_7ZIP` to use a specific executable.
+
+- Press **Enter** or double-click an archive to browse it in the active panel. Use **Left** to go up or leave the archive. Press **Ctrl+Q** to preview a member. For supported Office, OpenDocument, and other ZIP-based documents, use **Browse archive** from the context menu to see their internal files.
+- Choose **Tools → Archives → Unlock archive** to browse encrypted headers or preview encrypted files. The password is remembered for that archive until you close the app.
+- **F5** copies selected members to a local folder or adds local files to the archive open in the opposite panel. **Tools → Archives** also contains **Pack**, **Extract**, **Delete archive members**, and **Test archive**.
+- In **Pack**, choose the format by typing its extension in the destination path. ZIP and 7z support passwords and split volumes. To open a split archive, start with the `.001` file. In **Extract**, choose a mask, path preservation or flattening, and how existing files are handled. **Smart Extract** creates a containing folder when the matched members have multiple top-level items.
+
+ZIP, 7z, and TAR support creation and member changes. TAR can also be packed with gzip, bzip2, XZ, LZMA, or Zstandard compression. The LZMA packer uses `xz`, Zstandard packing uses `zstd`, Brotli reads use `brotli`, and Base64 encoding uses `base64`. RAR uses UnRAR when available, with 7-Zip as the default when UnRAR is absent. Set `DESHCMD_UNRAR` to select the reader or `DESHCMD_RAR` to select the writer. Read-only formats and supported codecs depend on the installed archiver. DEB and RPM browsing opens the package payload. Archive extraction stages regular files and directories and skips links, special files, and unsafe paths.
+
+### External archivers
+
+Set `DESHCMD_ARCHIVERS` to a JSON configuration path and restart DeshCmd to register extensions or override existing handlers. Each action is an argument array passed directly to the configured executable.
+
+```json
+[
+  {
+    "extensions": ["example"],
+    "executable": "/path/to/archiver-adapter",
+    "listing": "json",
+    "commands": {
+      "list": ["list", "{archive}"],
+      "extract": ["extract-to-stdout", "{archive}", "{member}"],
+      "pack": ["pack", "{archive}", "{input}"],
+      "delete": ["delete", "{archive}", "{input}"],
+      "test": ["test", "{archive}"]
+    }
+  }
+]
+```
+
+The list action can return a JSON array of members with `path`, optional `size`, and optional booleans `folder` and `link`. With `"listing": "technical"`, it returns the same record format as `7z l -slt -ba`. The extract action writes one member’s bytes to stdout. The pack action receives a staged directory as `{input}`, and delete receives a UTF-8 file with one selected member path per line. Add `{password}` as an argument if your adapter supports it. Omit unsupported actions from the configuration.
 
 ## Workspace
 
