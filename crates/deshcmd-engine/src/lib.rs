@@ -180,6 +180,8 @@ pub struct Tab {
     generation: u64,
     nav_revision: u64,
     pending_navigation: Option<PathBuf>,
+    deferred_recovery: Option<PathBuf>,
+    waiting_for_archive: bool,
     dirty: bool,
 }
 
@@ -210,6 +212,8 @@ impl Tab {
             generation: 0,
             nav_revision: 0,
             pending_navigation: None,
+            deferred_recovery: None,
+            waiting_for_archive: false,
             dirty: true,
         }
     }
@@ -243,7 +247,10 @@ impl Tab {
         self.pending_navigation.as_deref()
     }
     pub fn busy(&self) -> bool {
-        self.loading || self.pending_navigation.is_some()
+        self.listing_pending() || self.pending_navigation.is_some()
+    }
+    pub fn listing_pending(&self) -> bool {
+        self.loading || self.waiting_for_archive
     }
     fn cancel_navigation(&mut self) {
         self.nav_revision += 1;
@@ -385,6 +392,13 @@ impl Tab {
             }
         }
     }
+    fn set_initial_location(&mut self, location: Location) {
+        self.saved.home = location.base().to_owned();
+        self.history = vec![HistoryEntry::new(location.clone())];
+        self.history_index = 0;
+        self.set_location(location, false);
+    }
+
     fn set_location(&mut self, location: Location, record: bool) {
         if record && self.history[self.history_index].location != location {
             self.history.truncate(self.history_index + 1);
@@ -395,6 +409,7 @@ impl Tab {
             self.history_index = self.history.len() - 1;
         }
         self.cancel_navigation();
+        self.deferred_recovery = None;
         self.saved.location = location;
         self.clear_view();
         self.clear_marks();
@@ -423,6 +438,7 @@ impl Tab {
     }
 
     fn invalidate_scan(&mut self) {
+        self.waiting_for_archive = false;
         self.error = None;
         self.archive_locked = false;
         self.generation += 1;
@@ -1338,9 +1354,14 @@ impl Engine {
         &mut self.pane_mut(side).tabs[index]
     }
     fn switch_tab(&mut self, side: Side, index: usize) {
+        if self.select_tab(side, index) {
+            self.settings.active = side;
+        }
+    }
+    fn select_tab(&mut self, side: Side, index: usize) -> bool {
         let pane = self.pane_mut(side);
         if index >= pane.tabs.len() {
-            return;
+            return false;
         }
         if pane.active != index {
             let tab = pane.tab_mut();
@@ -1349,7 +1370,7 @@ impl Engine {
             }
             pane.active = index;
         }
-        self.settings.active = side;
+        true
     }
     fn close_tab(&mut self, side: Side, index: usize) {
         let pane = self.pane_mut(side);
@@ -1413,6 +1434,14 @@ impl Engine {
         }
     }
     fn start_scans(&mut self) {
+        for pane in &mut self.panes {
+            let tab = pane.tab_mut();
+            if tab.pending_navigation.is_none()
+                && let Some(parent) = tab.deferred_recovery.take()
+            {
+                tab.recover_directory(parent);
+            }
+        }
         let active = self
             .panes
             .each_ref()
@@ -1421,17 +1450,32 @@ impl Engine {
         for pane in &mut self.panes {
             let active = pane.active;
             for (index, tab) in pane.tabs.iter_mut().enumerate() {
-                if index != active && tab.loading {
-                    tab.invalidate_scan();
+                if index != active {
+                    tab.waiting_for_archive = false;
+                    if tab.loading {
+                        tab.invalidate_scan();
+                    }
                 }
             }
             let tab = pane.tab_mut();
             if tab.loading || !tab.dirty {
                 continue;
             }
+            // An archive reservation survives cancellation until its worker leaves
+            // the blocking read. A duplicate stays dirty without taking a worker.
+            let reservation = if let Location::Archive { file, .. } = tab.location() {
+                let Some(reservation) = self.archive_cache.reserve_listing(file) else {
+                    tab.waiting_for_archive = true;
+                    continue;
+                };
+                Some(reservation)
+            } else {
+                None
+            };
             let location = tab.saved.location.clone();
             let recursive = tab.filter.recursive;
             let archive_cache = self.archive_cache.clone();
+            let wake = self.wake.clone();
             #[cfg(feature = "perf")]
             let scheduled = perf::timestamp();
             let accepted = self.scans.submit((tab.id, tab.generation), move |cancel| {
@@ -1464,9 +1508,16 @@ impl Engine {
                 } else {
                     perf::elapsed("publication", scheduled);
                 }
+                if let Some(reservation) = reservation {
+                    drop(reservation);
+                    if cancel.cancelled() {
+                        wake();
+                    }
+                }
                 (result, fallback)
             });
             if accepted {
+                tab.waiting_for_archive = false;
                 tab.loading = true;
                 tab.dirty = false;
             }
@@ -1527,9 +1578,10 @@ impl Engine {
                     continue;
                 }
                 tab.loading = false;
-                let pending_cursor = tab.pending_cursor.take();
+                tab.deferred_recovery = fallback;
                 match result {
                     Ok(listing) => {
+                        let pending_cursor = tab.pending_cursor.take();
                         #[cfg(feature = "perf")]
                         let install = perf::timestamp();
                         tab.entries = listing.entries;
@@ -1555,10 +1607,10 @@ impl Engine {
                         perf::elapsed("install", install);
                     }
                     Err(error) => {
-                        if let Some(parent) = fallback {
-                            tab.recover_directory(parent);
+                        if tab.deferred_recovery.is_some() {
                             break;
                         }
+                        tab.pending_cursor = None;
                         tab.archive_locked = archives::is_password_error(&error);
                         tab.error = Some(error.to_string());
                         tab.clear_view();

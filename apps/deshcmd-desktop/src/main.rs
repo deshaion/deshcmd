@@ -419,7 +419,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let home = dirs::home_dir().unwrap_or_else(|| cwd.clone());
     let fresh = args.peek().is_some();
     let requested = requested_directories(&cwd, args);
-    let initial = [cwd, home.clone()];
+    let initial = [cwd.clone(), cwd];
     let viewport = egui::ViewportBuilder::default()
         .with_title("deshcmd")
         .with_app_id("deshcmd")
@@ -449,7 +449,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 initial,
                 fresh,
             );
-            app.open_initial_directories(requested);
+            app.open_initial_directories(&context.egui_ctx, requested);
             // Keep the native window's minimum independent of interface zoom.
             let ctx = &context.egui_ctx;
             ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(

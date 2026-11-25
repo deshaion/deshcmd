@@ -15,6 +15,7 @@ struct Cached<V> {
     value: Option<Arc<V>>,
     pending: bool,
     touched: Instant,
+    touched_pass: Option<u64>,
     retry: Instant,
 }
 
@@ -24,6 +25,7 @@ pub(crate) struct ReadCache<K, V> {
     sequence: u64,
     ttl: Duration,
     limit: usize,
+    render_pass: Option<u64>,
 }
 
 impl<K: Clone + Eq + Hash + Send + 'static, V: Send + 'static> ReadCache<K, V> {
@@ -34,7 +36,12 @@ impl<K: Clone + Eq + Hash + Send + 'static, V: Send + 'static> ReadCache<K, V> {
             sequence: 0,
             ttl,
             limit,
+            render_pass: None,
         }
+    }
+
+    pub(crate) fn begin_render_pass(&mut self, pass: u64) {
+        self.render_pass = Some(pass);
     }
 
     pub(crate) fn request(
@@ -47,7 +54,10 @@ impl<K: Clone + Eq + Hash + Send + 'static, V: Send + 'static> ReadCache<K, V> {
             let victim = self
                 .entries
                 .iter()
-                .filter(|(_, entry)| !entry.pending)
+                .filter(|(_, entry)| {
+                    !entry.pending
+                        && (self.render_pass.is_none() || entry.touched_pass != self.render_pass)
+                })
                 .min_by_key(|(_, entry)| entry.touched)
                 .map(|(key, _)| key.clone());
             self.entries.remove(&victim?);
@@ -56,9 +66,11 @@ impl<K: Clone + Eq + Hash + Send + 'static, V: Send + 'static> ReadCache<K, V> {
             value: None,
             pending: false,
             touched: now,
+            touched_pass: None,
             retry: now,
         });
         entry.touched = now;
+        entry.touched_pass = self.render_pass;
         if !entry.pending && now >= entry.retry {
             self.sequence += 1;
             entry.pending = self.pool.submit(self.sequence, move |_| {
@@ -139,5 +151,36 @@ mod tests {
                 .request(0, |_| panic!("failure retried immediately"))
                 .is_none()
         );
+    }
+
+    #[test]
+    fn review_tree_overflow_keeps_nodes_used_in_the_same_pass() {
+        let ctx = egui::Context::default();
+        let mut cache = ReadCache::new(&ctx, 1, Duration::from_secs(5), 2);
+        let now = Instant::now();
+        cache.entries.insert(
+            0,
+            Cached {
+                value: Some(Arc::new(0)),
+                pending: false,
+                touched: now,
+                touched_pass: None,
+                retry: now + Duration::from_secs(5),
+            },
+        );
+        ctx.run_ui(Default::default(), |_| {
+            cache.begin_render_pass(ctx.cumulative_pass_nr());
+            assert_eq!(
+                cache
+                    .request(0, |_| panic!("cached root reread"))
+                    .as_deref(),
+                Some(&0)
+            );
+            cache.request(1, |_| Some(1));
+            cache.request(2, |_| Some(2));
+            assert_eq!(cache.request(0, |_| Some(0)).as_deref(), Some(&0));
+        })
+        .textures_delta
+        .clear();
     }
 }

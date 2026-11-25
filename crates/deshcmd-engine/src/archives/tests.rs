@@ -1373,3 +1373,56 @@ fn multi_volume_pack_rolls_back_earlier_parts_after_a_conflict() {
     assert_eq!(fs::read(occupied).unwrap(), b"existing volume");
     assert_eq!(fs::read(input).unwrap(), vec![b'a'; 30_000]);
 }
+
+#[test]
+fn review_duplicate_archive_scan_leaves_a_worker_for_an_unrelated_listing() {
+    let fixture = tempfile::tempdir().unwrap();
+    let root = fixture.path().canonicalize().unwrap();
+    let file = root.join("blocked.zip");
+    fs::write(&file, []).unwrap();
+    let healthy = root.join("healthy");
+    fs::create_dir(&healthy).unwrap();
+    fs::write(healthy.join("ready.txt"), []).unwrap();
+    let mut engine = Engine::new(
+        root.clone(),
+        [root.clone(), root],
+        Settings::default(),
+        || {},
+    );
+    wait(&mut engine, |e| {
+        Side::ALL.into_iter().all(|side| !e.tab(side).busy())
+    });
+    let source = engine.archive_cache.source(&file).unwrap();
+    let inventory = source.inventory.lock().unwrap();
+    for side in Side::ALL {
+        engine.tab_mut(side).set_location(
+            Location::Archive {
+                file: file.clone(),
+                folder: PathBuf::new(),
+            },
+            true,
+        );
+    }
+    engine.start_scans();
+    assert_eq!(
+        Side::ALL
+            .into_iter()
+            .filter(|&side| engine.tab(side).loading)
+            .count(),
+        1
+    );
+    engine.dispatch(Action::Navigate {
+        side: Side::Left,
+        path: healthy,
+        new_tab: false,
+        background: false,
+    });
+    wait(&mut engine, |e| !e.tab(Side::Left).busy());
+    assert_eq!(engine.tab(Side::Left).current().unwrap().name, "ready.txt");
+    assert!(engine.tab(Side::Right).listing_pending());
+    drop(inventory);
+    wait(&mut engine, |e| !e.tab(Side::Right).busy());
+    assert!(
+        matches!(engine.tab(Side::Right).location(), Location::Archive { file: current, .. } if current == &file)
+    );
+}

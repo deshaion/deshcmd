@@ -98,6 +98,11 @@ struct Interface {
 
 type DialogRead = Box<dyn FnOnce(&mut App, &egui::Context) + Send>;
 
+struct StartupHome {
+    read: Option<engine::read_pool::ReadPool<(), PathBuf>>,
+    right_stamp: Option<(u64, u64)>,
+}
+
 pub struct App {
     pub(crate) engine: Engine,
     desktop: Box<dyn Desktop>,
@@ -111,6 +116,8 @@ pub struct App {
     tree_folders: probes::ReadCache<PathBuf, Vec<PathBuf>>,
     dialog_reads: engine::read_pool::ReadPool<(), DialogRead>,
     dialog_revision: u64,
+    startup_defaults: Option<(PathBuf, bool)>,
+    startup_home: Option<StartupHome>,
     previews: Previews,
 }
 
@@ -146,6 +153,10 @@ impl App {
                 .and_then(|storage| eframe::get_value(storage, "workspace"))
                 .unwrap_or_default()
         };
+        let startup_defaults = (
+            initial[0].clone(),
+            settings.panes[Side::Right.index()].tabs.is_empty(),
+        );
         let ctx = context.egui_ctx.clone();
         let engine = Engine::new(home, initial, settings, move || ctx.request_repaint());
         Self {
@@ -182,16 +193,63 @@ impl App {
                 probes::repaint(&context.egui_ctx),
             ),
             dialog_revision: 0,
+            startup_defaults: Some(startup_defaults),
+            startup_home: None,
             previews: Previews::new(context.egui_ctx.clone()),
         }
     }
 
-    pub fn open_initial_directories(&mut self, locations: [Option<PathBuf>; 2]) {
+    pub fn open_initial_directories(
+        &mut self,
+        ctx: &egui::Context,
+        locations: [Option<PathBuf>; 2],
+    ) {
+        let Some((cwd, default_right)) = self.startup_defaults.take() else {
+            return;
+        };
+        let configured_home = std::mem::replace(&mut self.engine.home, cwd.clone());
         for (side, path) in Side::ALL.into_iter().zip(locations) {
             if let Some(path) = path {
                 self.engine.request_initial_directory(side, path);
             }
         }
+        let right_stamp = default_right.then(|| self.engine.tab(Side::Right).navigation_stamp());
+        let read = engine::read_pool::ReadPool::new(1, 1, probes::repaint(ctx));
+        read.submit((), move |_| {
+            configured_home
+                .canonicalize()
+                .ok()
+                .filter(|path| path.is_dir())
+                .unwrap_or(cwd)
+        });
+        self.startup_home = Some(StartupHome {
+            read: Some(read),
+            right_stamp,
+        });
+    }
+
+    fn poll_startup_home(&mut self) {
+        let Some(startup) = &mut self.startup_home else {
+            return;
+        };
+        if let Some(read) = &startup.read {
+            let Some(((), home)) = read.drain().pop() else {
+                return;
+            };
+            self.engine.home = home;
+            startup.read = None;
+        }
+        let right = self.engine.tab(Side::Right);
+        if startup.right_stamp == Some(right.navigation_stamp()) {
+            if right.pending_navigation().is_some() {
+                return;
+            }
+            if right.base() != self.engine.home {
+                self.engine
+                    .apply_initial_directory(Side::Right, self.engine.home.clone());
+            }
+        }
+        self.startup_home = None;
     }
 
     fn poll_dialog_reads(&mut self, ctx: &egui::Context) {
@@ -1445,6 +1503,7 @@ impl App {
 impl eframe::App for App {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.engine.poll();
+        self.poll_startup_home();
         self.record_notice();
         self.previews.poll();
         self.places_cache.poll();
@@ -1474,6 +1533,8 @@ impl eframe::App for App {
 
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        self.tree_folders
+            .begin_render_pass(ctx.cumulative_pass_nr());
         #[cfg(target_os = "macos")]
         _frame.set_traffic_lights_position(
             &ctx,

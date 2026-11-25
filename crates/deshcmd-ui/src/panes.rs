@@ -1137,7 +1137,7 @@ fn empty(ui: &mut Ui, tab: &Tab, side: Side, actions: &mut Vec<Action>) {
             if let Some(message) = tab.error.as_deref() {
                 ui.label(label(error_title, 13., TEXT))
                     .on_hover_text(message);
-            } else if tab.loading && tab.entry_count() == 0 {
+            } else if tab.listing_pending() && tab.entry_count() == 0 {
                 ui.label(label("Loading files…", 13., SUB));
             } else {
                 ui.label(label(empty_message, 13., TEXT));
@@ -1192,7 +1192,7 @@ fn empty(ui: &mut Ui, tab: &Tab, side: Side, actions: &mut Vec<Action>) {
             } else {
                 buttons(ui);
             }
-        } else if tab.loading && tab.entry_count() == 0 {
+        } else if tab.listing_pending() && tab.entry_count() == 0 {
             ui.spinner();
             ui.label(label("Loading files…", 13., SUB));
         } else {

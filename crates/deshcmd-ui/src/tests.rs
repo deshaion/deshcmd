@@ -921,3 +921,58 @@ fn a_blocked_dialog_read_does_not_stall_frames_and_cannot_update_a_new_location(
     }
     assert!(applications.try_recv().is_err());
 }
+
+#[test]
+fn review_startup_home_resolution_preserves_defaults_and_valid_cli_arguments() {
+    let fixture = tempfile::tempdir().unwrap();
+    let root = fixture.path().canonicalize().unwrap();
+    let cwd = root.join("cwd");
+    std::fs::create_dir(&cwd).unwrap();
+    let home = root.join("home");
+    let cli = root.join("arg");
+    std::fs::create_dir(&home).unwrap();
+    std::fs::create_dir(&cli).unwrap();
+    for (configured, argument, expected_home, expected_right) in [
+        (
+            root.join("missing-home"),
+            Some(root.join("missing-argument")),
+            &cwd,
+            &cwd,
+        ),
+        (root.join("missing-home"), None, &cwd, &cwd),
+        (home.join("..").join("home"), None, &home, &home),
+        (home.clone(), Some(cli.clone()), &home, &cli),
+    ] {
+        let ctx = egui::Context::default();
+        let creation = eframe::CreationContext::_new_kittest(ctx.clone());
+        let mut app = App::new(
+            &creation,
+            Box::new(TestDesktop::default()),
+            configured,
+            [cwd.clone(), cwd.clone()],
+            true,
+        );
+        app.open_initial_directories(&ctx, [None, argument]);
+        let mut frame = eframe::Frame::_new_kittest();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            app.logic(&ctx, &mut frame);
+            if app.startup_home.is_none()
+                && Side::ALL
+                    .into_iter()
+                    .all(|side| !app.engine.tab(side).busy())
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "startup kept home at {}",
+                app.engine.home.display()
+            );
+            std::thread::yield_now();
+        }
+        assert_eq!(&app.engine.home, expected_home);
+        assert_eq!(app.engine.tab(Side::Right).base(), expected_right);
+        assert!(!app.engine.tab(Side::Right).can_back());
+    }
+}

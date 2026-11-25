@@ -42,11 +42,20 @@ struct Peer {
     path: Option<PathBuf>,
 }
 
-fn validate_path(path: &Path, cancel: &Cancellation) -> io::Result<Location> {
+fn validate_directory(path: &Path, cancel: &Cancellation) -> io::Result<Option<Location>> {
     cancel.check()?;
     if path.is_dir() {
         cancel.check()?;
-        return path.canonicalize().map(Location::Directory);
+        return path
+            .canonicalize()
+            .map(|path| Some(Location::Directory(path)));
+    }
+    Ok(None)
+}
+
+fn validate_path(path: &Path, cancel: &Cancellation) -> io::Result<Location> {
+    if let Some(location) = validate_directory(path, cancel)? {
+        return Ok(location);
     }
     for file in path.ancestors() {
         cancel.check()?;
@@ -72,6 +81,13 @@ fn validate_path(path: &Path, cancel: &Cancellation) -> io::Result<Location> {
 }
 
 impl Engine {
+    /// Install a startup directory already resolved by a filesystem worker.
+    pub fn apply_initial_directory(&mut self, side: Side, path: PathBuf) {
+        self.tab_mut(side)
+            .set_initial_location(Location::Directory(path));
+        self.start_scans();
+    }
+
     pub fn request_initial_directory(&mut self, side: Side, path: PathBuf) {
         let intent = Intent {
             lock: TabLock::Normal,
@@ -153,7 +169,7 @@ impl Engine {
         background: bool,
         peer: Option<Peer>,
         focus: bool,
-        quiet: bool,
+        linked_directory: bool,
     ) -> io::Result<()> {
         if focus && !background {
             self.focus_revision += 1;
@@ -165,11 +181,17 @@ impl Engine {
             background,
             path: self.resolve_path(side, path),
             peer,
-            quiet,
+            quiet: linked_directory,
             startup: false,
         };
-        self.submit_navigation(side, intent, |intent, cancel| {
-            validate_path(&intent.path, cancel).map(|location| Some(Destination::Path(location)))
+        self.submit_navigation(side, intent, move |intent, cancel| {
+            if linked_directory {
+                validate_directory(&intent.path, cancel)
+                    .map(|location| location.map(Destination::Path))
+            } else {
+                validate_path(&intent.path, cancel)
+                    .map(|location| Some(Destination::Path(location)))
+            }
         })
     }
 
@@ -317,7 +339,12 @@ impl Engine {
                 self.tab_mut(side).pending_navigation = None;
             }
             match result {
-                Ok(Some(destination)) => self.commit_navigation(side, intent, destination),
+                Ok(Some(destination)) => {
+                    if !key.independent {
+                        self.tab_mut(side).deferred_recovery = None;
+                    }
+                    self.commit_navigation(side, intent, destination);
+                }
                 Err(error) if !intent.quiet => self.notice = Some(error.to_string()),
                 _ => {}
             }
@@ -327,11 +354,7 @@ impl Engine {
     fn commit_navigation(&mut self, side: Side, intent: Intent, destination: Destination) {
         if intent.startup {
             if let Destination::Path(location) = destination {
-                let tab = self.tab_mut(side);
-                tab.saved.home = location.base().to_owned();
-                tab.history = vec![HistoryEntry::new(location.clone())];
-                tab.history_index = 0;
-                tab.set_location(location, false);
+                self.tab_mut(side).set_initial_location(location);
             }
             return;
         }
@@ -408,7 +431,16 @@ impl Engine {
             if history.is_none() || matches!(location, Location::Archive { .. }) {
                 saved.location = location;
             }
-            self.add_tab(side, saved, intent.background || !can_focus)
+            let index = self.pane(side).tabs.len();
+            self.add_tab(side, saved, true);
+            if !intent.background {
+                if can_focus {
+                    self.switch_tab(side, index);
+                } else if intent.focus.is_none() {
+                    self.select_tab(side, index);
+                }
+            }
+            &mut self.pane_mut(side).tabs[index]
         } else {
             if can_focus {
                 self.settings.active = side;
@@ -426,8 +458,16 @@ impl Engine {
         if opens_tab || history.is_none() && changed {
             tab.history[tab.history_index].entered_via = entered_via;
         }
-        if let Some((path, quiet)) = peer_path {
-            let _ = self.request_path(side.other(), &path, false, false, None, false, quiet);
+        if let Some((path, linked_directory)) = peer_path {
+            let _ = self.request_path(
+                side.other(),
+                &path,
+                false,
+                false,
+                None,
+                false,
+                linked_directory,
+            );
         }
     }
 }
@@ -624,5 +664,160 @@ mod tests {
         assert!(!engine.tab(Side::Left).can_back());
         assert_eq!(engine.tab(Side::Right).base(), root);
         assert!(engine.notice.is_none());
+    }
+    #[test]
+    fn review_matching_locked_pane_selects_the_destination_without_stealing_focus() {
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path().canonicalize().unwrap();
+        let left = root.join("left");
+        let right = root.join("right");
+        for path in [&left, &right] {
+            std::fs::create_dir(path).unwrap();
+        }
+        let mut engine = Engine::new(
+            root,
+            [left.clone(), right.clone()],
+            Settings::default(),
+            || {},
+        );
+        engine.dispatch(Command::LockTab(Side::Right, 0, TabLock::Locked));
+        engine.dispatch(Command::MatchPanes);
+        wait(&mut engine, |e| {
+            Side::ALL.into_iter().all(|side| !e.tab(side).busy())
+        });
+        assert_eq!(engine.pane(Side::Right).tabs.len(), 2);
+        assert_eq!(engine.tab(Side::Right).base(), left);
+        assert_eq!(engine.pane(Side::Right).tabs[0].base(), right);
+        assert_eq!(engine.settings.active, Side::Left);
+    }
+
+    #[test]
+    fn review_paired_bookmark_selects_the_new_tab_in_a_locked_peer() {
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path().canonicalize().unwrap();
+        let left = root.join("left");
+        let right = root.join("right");
+        std::fs::create_dir(&left).unwrap();
+        std::fs::create_dir(&right).unwrap();
+        let mut engine = Engine::new(
+            root.clone(),
+            [root.clone(), root],
+            Settings::default(),
+            || {},
+        );
+        engine.dispatch(Command::LockTab(Side::Right, 0, TabLock::NewTab));
+        engine.dispatch(Command::AddBookmark(Bookmark {
+            name: "Pair".into(),
+            path: left.clone(),
+            opposite: Some(right.clone()),
+            group: String::new(),
+        }));
+        engine.dispatch(Command::OpenBookmark(0));
+        wait(&mut engine, |e| {
+            Side::ALL.into_iter().all(|side| !e.tab(side).busy())
+        });
+        assert_eq!(engine.tab(Side::Left).base(), left);
+        assert_eq!(engine.tab(Side::Right).base(), right);
+        assert_eq!(engine.settings.active, Side::Left);
+    }
+
+    #[test]
+    fn review_linked_directory_navigation_does_not_open_a_peer_archive() {
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path().canonicalize().unwrap();
+        let left = root.join("left");
+        let right = root.join("right");
+        std::fs::create_dir_all(left.join("reports.zip")).unwrap();
+        std::fs::create_dir(&right).unwrap();
+        std::fs::write(right.join("reports.zip"), []).unwrap();
+        let mut engine = Engine::new(
+            root,
+            [left.clone(), right.clone()],
+            Settings {
+                linked: true,
+                ..Settings::default()
+            },
+            || {},
+        );
+        engine.dispatch(Command::Navigate {
+            side: Side::Left,
+            path: "reports.zip".into(),
+            new_tab: false,
+            background: false,
+        });
+        wait(&mut engine, |e| {
+            Side::ALL.into_iter().all(|side| !e.tab(side).busy())
+        });
+        assert_eq!(engine.tab(Side::Left).base(), left.join("reports.zip"));
+        assert_eq!(
+            engine.tab(Side::Right).location(),
+            &Location::Directory(right.clone())
+        );
+
+        engine.dispatch(Command::Navigate {
+            side: Side::Right,
+            path: "reports.zip".into(),
+            new_tab: false,
+            background: false,
+        });
+        wait(&mut engine, |e| !e.tab(Side::Right).busy());
+        assert!(
+            matches!(engine.tab(Side::Right).location(), Location::Archive { file, .. } if file == &right.join("reports.zip"))
+        );
+    }
+
+    #[test]
+    fn review_scan_recovery_waits_for_navigation_and_only_applies_on_failure() {
+        for valid in [true, false] {
+            let fixture = tempfile::tempdir().unwrap();
+            let root = fixture.path().canonicalize().unwrap();
+            let current = root.join("current");
+            let next = root.join("next");
+            std::fs::create_dir(&current).unwrap();
+            std::fs::write(current.join("marked.txt"), "selected").unwrap();
+            if valid {
+                std::fs::create_dir(&next).unwrap();
+            }
+            let mut engine = Engine::new(
+                root.clone(),
+                [current.clone(), root.clone()],
+                Settings::default(),
+                || {},
+            );
+            let side = Side::Left;
+            wait(&mut engine, |e| !e.tab(side).busy());
+            engine.dispatch(Command::MarkAll(side));
+
+            let (release, gate) = mpsc::channel();
+            engine
+                .submit_navigation(
+                    side,
+                    Intent {
+                        lock: TabLock::Normal,
+                        focus: None,
+                        open_tab: false,
+                        background: false,
+                        path: next.clone(),
+                        peer: None,
+                        quiet: false,
+                        startup: false,
+                    },
+                    move |intent, cancel| {
+                        gate.recv_timeout(Duration::from_secs(5)).unwrap();
+                        validate_path(&intent.path, cancel)
+                            .map(|path| Some(Destination::Path(path)))
+                    },
+                )
+                .unwrap();
+            std::fs::remove_dir_all(&current).unwrap();
+            engine.dispatch(Command::Refresh);
+            wait(&mut engine, |e| !e.tab(side).loading);
+            assert_eq!(engine.tab(side).pending_navigation(), Some(next.as_path()));
+            assert_eq!(engine.tab(side).base(), current);
+            assert_eq!(engine.tab(side).marked_count(), 1);
+            release.send(()).unwrap();
+            wait(&mut engine, |e| !e.tab(side).busy());
+            assert_eq!(engine.tab(side).base(), if valid { next } else { root });
+        }
     }
 }
