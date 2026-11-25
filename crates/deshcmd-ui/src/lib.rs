@@ -20,6 +20,11 @@ use dialogs::{Dialog, Tool};
 use panes::PanelUi;
 use theme::*;
 
+const COPY_PATH_SHORTCUT: egui::KeyboardShortcut = egui::KeyboardShortcut::new(
+    egui::Modifiers::COMMAND.plus(egui::Modifiers::SHIFT),
+    Key::C,
+);
+
 #[derive(Clone)]
 pub struct Place {
     pub name: String,
@@ -811,13 +816,27 @@ impl App {
 
     fn clipboard_shortcuts(&mut self, ctx: &egui::Context, actions: &mut Vec<Action>) {
         let (copy, cut, paste) = ctx.input_mut(|input| {
+            let copy_paths = input.events.iter().any(|event| {
+                matches!(
+                    event,
+                    egui::Event::Key { key, modifiers, pressed: true, .. }
+                        if *key == COPY_PATH_SHORTCUT.logical_key
+                            && modifiers.matches_exact(COPY_PATH_SHORTCUT.modifiers)
+                )
+            });
             (
-                input.consume_key(egui::Modifiers::COMMAND, Key::C),
+                input
+                    .consume_key(egui::Modifiers::COMMAND, Key::C)
+                    .then_some(if copy_paths {
+                        Tool::CopyPaths
+                    } else {
+                        Tool::CopyClipboard
+                    }),
                 input.consume_key(egui::Modifiers::COMMAND, Key::X),
                 input.consume_key(egui::Modifiers::COMMAND, Key::V),
             )
         });
-        if !(copy || cut || paste) {
+        if !(copy.is_some() || cut || paste) {
             return;
         }
         let text_context = self.text_field_focused(ctx)
@@ -826,7 +845,7 @@ impl App {
             || self.interface.show_help
             || self.engine.jobs.iter().any(|job| job.conflict.is_some());
         if text_context {
-            let event = if copy {
+            let event = if copy.is_some() {
                 Some(egui::Event::Copy)
             } else if cut {
                 Some(egui::Event::Cut)
@@ -839,8 +858,8 @@ impl App {
                 ctx.input_mut(|input| input.events.push(event));
             }
         } else {
-            let tool = if copy {
-                Tool::CopyClipboard
+            let tool = if let Some(tool) = copy {
+                tool
             } else if cut {
                 Tool::CutClipboard
             } else {
@@ -940,6 +959,20 @@ impl App {
 
         if just(Key::Tab) {
             actions.push(Action::Command(Command::Focus(side.other())));
+        }
+        let pane = self.engine.pane(side);
+        let tab_count = pane.tabs.len();
+        for (modifiers, offset) in [
+            (egui::Modifiers::CTRL, 1),
+            (
+                egui::Modifiers::CTRL | egui::Modifiers::SHIFT,
+                tab_count - 1,
+            ),
+        ] {
+            if exact(modifiers, Key::Tab) && tab_count > 1 {
+                let index = (pane.active + offset) % tab_count;
+                actions.push(Action::Command(Command::Tab(side, index)));
+            }
         }
         let initial_press = |modifiers, key| {
             ctx.input_mut(|input| {
@@ -1100,6 +1133,7 @@ impl App {
     }
 
     fn shortcuts(&mut self, ctx: &egui::Context) {
+        let copy_path = ctx.format_shortcut(&COPY_PATH_SHORTCUT);
         egui::Window::new("Keyboard shortcuts")
             .open(&mut self.interface.show_help)
             .collapsible(false)
@@ -1115,6 +1149,8 @@ impl App {
                     .body(|mut body| {
                         for (keys, purpose) in [
                             ("Tab", "Switch active panel"),
+                            ("Ctrl + Tab", "Switch to next tab"),
+                            ("Ctrl + Shift + Tab", "Switch to previous tab"),
                             ("Alt + Left / Right", "Go back or forward"),
                             ("Left / Alt + Up", "Go to parent"),
                             ("Right", "Open focused directory"),
@@ -1140,6 +1176,7 @@ impl App {
                             ("F9", "Open terminal in active folder"),
                             ("Shift + Delete", "Delete permanently"),
                             ("Ctrl + C / X / V", "Copy, cut, or paste files"),
+                            (&copy_path, "Copy full paths"),
                         ] {
                             body.row(26., |mut row| {
                                 row.col(|ui| {

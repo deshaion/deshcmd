@@ -261,6 +261,29 @@ fn panel_navigation_and_preview_shortcuts() {
     assert_eq!(app.engine.tab(side).marked_count(), 0);
     focus_outline(draw(&mut app, &mut frame, vec![]));
 
+    app.engine.dispatch(Command::NewTab(side));
+    app.engine.dispatch(Command::NewTab(side));
+    for (modifiers, index) in [
+        (ctrl, 0),
+        (ctrl | egui::Modifiers::SHIFT, 2),
+        (ctrl | egui::Modifiers::SHIFT, 1),
+        (ctrl | alt, 1),
+        (ctrl, 2),
+        (ctrl, 0),
+    ] {
+        press(&mut app, &mut frame, Key::Tab, modifiers);
+        assert_eq!(app.engine.pane(side).active, index);
+        assert_eq!(app.engine.settings.active, side);
+        assert_eq!(app.engine.pane(side.other()).active, 0);
+    }
+    press(&mut app, &mut frame, Key::Tab, plain);
+    assert_eq!(app.engine.settings.active, side.other());
+    press(&mut app, &mut frame, Key::Tab, ctrl);
+    assert_eq!(app.engine.settings.active, side.other());
+    assert_eq!(app.engine.pane(side.other()).active, 0);
+    press(&mut app, &mut frame, Key::Tab, plain);
+    assert_eq!(app.engine.settings.active, side);
+
     let menu_button = draw(&mut app, &mut frame, vec![])
         .into_iter()
         .find_map(|shape| match shape.shape {
@@ -719,10 +742,14 @@ fn quick_view_changes_between_a_large_log_image_and_unavailable_file() {
 fn clipboard_shortcuts_route_to_files_or_text_based_on_focus_context() {
     let fixture = tempfile::tempdir().unwrap();
     let root = fixture.path().to_path_buf();
+    let first = root.join("first.txt");
+    let second = root.join("second.txt");
+    std::fs::write(&first, "").unwrap();
+    std::fs::write(&second, "").unwrap();
     let ctx = egui::Context::default();
     let creation = eframe::CreationContext::_new_kittest(ctx.clone());
     let desktop = TestDesktop::default();
-    desktop.state.borrow_mut().text = Some("first\r\nsecond".into());
+    let clipboard = desktop.state.clone();
     let mut app = App::new(
         &creation,
         Box::new(desktop),
@@ -730,8 +757,7 @@ fn clipboard_shortcuts_route_to_files_or_text_based_on_focus_context() {
         [root.clone(), root],
         true,
     );
-    let route = |app: &mut App, key| {
-        let modifiers = egui::Modifiers::COMMAND;
+    let route = |app: &mut App, key, modifiers| {
         let mut actions = Vec::new();
         let mut events = Vec::new();
         let mut output = ctx.run_ui(
@@ -755,19 +781,53 @@ fn clipboard_shortcuts_route_to_files_or_text_based_on_focus_context() {
         output.textures_delta.clear();
         (actions, events)
     };
-    let (actions, _) = route(&mut app, Key::C);
+    let command = egui::Modifiers::COMMAND;
+    let copy_path = COPY_PATH_SHORTCUT.modifiers;
+    let (actions, _) = route(&mut app, Key::C, command);
     assert!(matches!(
         actions.as_slice(),
         [Action::Tool(Side::Left, Tool::CopyClipboard)]
     ));
 
+    settle(&mut app);
+    let side = Side::Left;
+    app.engine
+        .dispatch(Command::Select(side, first.clone(), engine::Select::Focus));
+    let copy_paths = |app: &mut App| {
+        let (actions, _) = route(app, Key::C, copy_path);
+        assert!(matches!(
+            actions.as_slice(),
+            [Action::Tool(Side::Left, Tool::CopyPaths)]
+        ));
+        let mut actions = actions.into_iter();
+        let mut output = ctx.run_ui(egui::RawInput::default(), |_| {
+            for action in actions.by_ref() {
+                app.apply(action, &ctx);
+            }
+            app.publish_text_clipboard(&ctx);
+        });
+        output.textures_delta.clear();
+        clipboard.borrow().text.clone().unwrap()
+    };
+    assert_eq!(copy_paths(&mut app), first.display().to_string());
+    for path in [first.clone(), second.clone()] {
+        app.engine
+            .dispatch(Command::Select(side, path, engine::Select::Toggle));
+    }
+    assert_eq!(
+        copy_paths(&mut app),
+        format!("{}\n{}", first.display(), second.display())
+    );
+
+    clipboard.borrow_mut().text = Some("first\r\nsecond".into());
     app.open_settings(&ctx);
-    for (key, expected) in [
-        (Key::C, egui::Event::Copy),
-        (Key::X, egui::Event::Cut),
-        (Key::V, egui::Event::Paste("first\nsecond".into())),
+    for (key, modifiers, expected) in [
+        (Key::C, command, egui::Event::Copy),
+        (Key::C, copy_path, egui::Event::Copy),
+        (Key::X, command, egui::Event::Cut),
+        (Key::V, command, egui::Event::Paste("first\nsecond".into())),
     ] {
-        let (actions, events) = route(&mut app, key);
+        let (actions, events) = route(&mut app, key, modifiers);
         assert!(actions.is_empty());
         assert!(events.contains(&expected), "{events:?}");
     }
