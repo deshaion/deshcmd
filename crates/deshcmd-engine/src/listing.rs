@@ -393,13 +393,14 @@ impl Scan {
 
 #[cfg(test)]
 fn scan(location: &Location, recursive: bool) -> io::Result<Scan> {
-    scan_cancellable(location, recursive, &Default::default())
+    scan_cancellable(location, recursive, &Default::default(), |_| {})
 }
 
 pub(crate) fn scan_cancellable(
     location: &Location,
     recursive: bool,
     cancel: &Cancellation,
+    mut observe: impl FnMut(&Entry),
 ) -> io::Result<Scan> {
     cancel.check()?;
     #[cfg(feature = "perf")]
@@ -441,6 +442,9 @@ pub(crate) fn scan_cancellable(
             let result = timing.entry(load);
             #[cfg(not(feature = "perf"))]
             let result = load();
+            if let Ok(entry) = &result {
+                observe(entry);
+            }
             scan.push(result);
         }
         #[cfg(feature = "perf")]
@@ -526,15 +530,23 @@ pub(crate) fn scan_cancellable(
     Ok(scan)
 }
 
-pub(crate) fn sort(entries: &mut [Entry], columns: &[Sort], dirs_first: bool, natural: bool) {
+pub(crate) fn sorted_order_from(
+    entries: &[Entry],
+    columns: &[Sort],
+    dirs_first: bool,
+    natural: bool,
+    previous: Option<&[usize]>,
+    cancel: &Cancellation,
+) -> io::Result<Vec<usize>> {
     #[cfg(feature = "perf")]
     let started = crate::perf::timestamp();
-    let names: Vec<_> = entries
-        .iter()
-        .map(|entry| fold(&entry.name, false))
-        .collect();
-    let mut order: Vec<_> = (0..entries.len()).collect();
-    order.sort_by(|&left, &right| {
+    let mut names = Vec::with_capacity(entries.len());
+    for entry in entries {
+        cancel.check()?;
+        names.push(fold(&entry.name, false));
+    }
+    let mut order = previous.map_or_else(|| (0..entries.len()).collect(), <[usize]>::to_vec);
+    let compare = |&left: &usize, &right: &usize| {
         let (a, b) = (&entries[left], &entries[right]);
         let by_name = || compare_names(&names[left], &names[right], natural);
         if dirs_first && a.is_dir() != b.is_dir() {
@@ -560,8 +572,54 @@ pub(crate) fn sort(entries: &mut [Entry], columns: &[Sort], dirs_first: bool, na
             }
         }
         by_name().then_with(|| a.path.cmp(&b.path))
-    });
-    drop(names);
+    };
+    const RUN: usize = 8192;
+    for run in order.chunks_mut(RUN) {
+        cancel.check()?;
+        run.sort_by(compare);
+    }
+    if order.len() > RUN {
+        let mut merged = Vec::with_capacity(order.len());
+        let mut width = RUN;
+        while width < order.len() {
+            merged.clear();
+            for pair in order.chunks(width * 2) {
+                let (left, right) = pair.split_at(width.min(pair.len()));
+                let (mut a, mut b) = (0, 0);
+                while a < left.len() && b < right.len() {
+                    cancel.check()?;
+                    if compare(&left[a], &right[b]).is_gt() {
+                        merged.push(right[b]);
+                        b += 1;
+                    } else {
+                        merged.push(left[a]);
+                        a += 1;
+                    }
+                }
+                merged.extend_from_slice(&left[a..]);
+                merged.extend_from_slice(&right[b..]);
+            }
+            std::mem::swap(&mut order, &mut merged);
+            width *= 2;
+        }
+    }
+    cancel.check()?;
+    #[cfg(feature = "perf")]
+    crate::perf::elapsed("sort", started);
+    Ok(order)
+}
+
+#[cfg(test)]
+fn sort(entries: &mut [Entry], columns: &[Sort], dirs_first: bool, natural: bool) {
+    let mut order = sorted_order_from(
+        entries,
+        columns,
+        dirs_first,
+        natural,
+        None,
+        &Default::default(),
+    )
+    .unwrap();
     // Each cycle moves entries into their final positions without a second row buffer.
     for start in 0..order.len() {
         let mut position = start;
@@ -573,8 +631,6 @@ pub(crate) fn sort(entries: &mut [Entry], columns: &[Sort], dirs_first: bool, na
         }
         order[position] = position;
     }
-    #[cfg(feature = "perf")]
-    crate::perf::elapsed("sort", started);
 }
 
 fn compare_names(a: &str, b: &str, natural: bool) -> Ordering {

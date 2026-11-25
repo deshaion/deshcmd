@@ -166,11 +166,14 @@ impl PanelUi {
         }
         let mut contents = child(
             root,
-            Id::unique(("file-list", side.index(), tab.id)),
+            Id::unique(("file-list", side.index(), tab.id, tab.listing_generation())),
             body,
             Layout::top_down(Align::Min),
         );
         contents.spacing_mut().item_spacing = vec2(0., 0.);
+        if tab.provisional() && !show_status {
+            contents.label(label("Loading more files…", 11., SUB));
+        }
         match tab.saved.view {
             View::Gallery => gallery(&mut contents, tab, side, reveal_cursor, previews, actions),
             View::Compact => rows(
@@ -750,10 +753,30 @@ fn crumbs(path: &Path, home: &Path) -> Vec<(String, PathBuf)> {
     result
 }
 
-fn file_scroll_area(ui: &Ui, salt: &str, target: Option<usize>, height: f32) -> egui::ScrollArea {
+fn file_scroll_area(
+    ui: &Ui,
+    salt: &str,
+    target: Option<usize>,
+    height: f32,
+    tab: &Tab,
+    columns: usize,
+) -> egui::ScrollArea {
     let area = egui::ScrollArea::vertical()
         .id_salt(salt)
         .auto_shrink([false, false]);
+    if !tab.provisional() {
+        let id = ui.make_persistent_id(("provisional-scroll", salt));
+        let anchor = ui.data_mut(|data| data.remove_temp::<PathBuf>(id));
+        if target.is_none()
+            && let Some(index) = anchor
+                .as_deref()
+                .and_then(|path| tab.visible_position(path))
+        {
+            return area.vertical_scroll_offset(
+                (index / columns) as f32 * (height + ui.spacing().item_spacing.y),
+            );
+        }
+    }
     if let Some(index) = target {
         // Match the persistent ID ScrollArea builds from its stored salt.
         let id = ui.make_persistent_id(egui::IdSalt::new(salt));
@@ -770,6 +793,47 @@ fn file_scroll_area(ui: &Ui, salt: &str, target: Option<usize>, height: f32) -> 
         }
     }
     area
+}
+
+fn remember_provisional_scroll(
+    ui: &Ui,
+    salt: &str,
+    tab: &Tab,
+    offset: f32,
+    stride: f32,
+    columns: usize,
+) {
+    if tab.provisional() {
+        let id = ui.make_persistent_id(("provisional-scroll", salt));
+        let row = (offset / stride).floor() as usize;
+        ui.data_mut(|data| {
+            if row != 0
+                && let Some(entry) = tab.visible_entry(row * columns)
+            {
+                data.insert_temp(id, entry.path.clone());
+            } else {
+                data.remove::<PathBuf>(id);
+            }
+        });
+    }
+}
+
+fn file_row(
+    ui: &mut Ui,
+    size: egui::Vec2,
+    side: Side,
+    tab: &Tab,
+    entry: &Entry,
+) -> (Rect, Response) {
+    let (_, rect) = ui.allocate_space(size);
+    let id = Id::unique((
+        "file-row",
+        side.index(),
+        tab.id,
+        tab.listing_generation(),
+        &entry.path,
+    ));
+    (rect, ui.interact(rect, id, Sense::click_and_drag()))
 }
 
 fn rows(
@@ -849,88 +913,101 @@ fn rows(
     }
     let h = if details { 36. } else { 29. };
     let target = if reveal { tab.cursor_position() } else { None };
-    file_scroll_area(ui, "rows", target, h).show_rows(ui, h, tab.visible_count(), |ui, range| {
-        for index in range {
-            let entry = tab.visible_entry(index).unwrap();
-            let (rect, response) = ui.allocate_exact_size(vec2(width, h), Sense::click_and_drag());
-            row_interaction(ui, &response, entry, tab, side, actions);
-            let marked = tab.is_marked(&entry.path);
-            let focused = tab.cursor_position() == Some(index);
-            let background = if marked {
-                ACCENT_DARK
-            } else if response.hovered() {
-                HOVER
-            } else if index % 2 == 1 {
-                Color32::from_rgb(20, 26, 32)
-            } else {
-                SURFACE
-            };
-            ui.painter().rect_filled(rect, 0., background);
-            if marked {
-                ui.painter().vline(
-                    rect.left() + 1.,
-                    rect.top() + 6. ..=rect.bottom() - 6.,
-                    Stroke::new(2., ACCENT),
-                );
-            }
-            if focused {
-                ui.painter().rect_stroke(
-                    rect.shrink2(vec2(3., 2.)),
-                    4.,
-                    Stroke::new(2., ACCENT),
-                    egui::StrokeKind::Inside,
-                );
-            }
-            ui.painter().hline(
-                rect.x_range(),
-                rect.bottom() - 0.5,
-                Stroke::new(1., Color32::from_rgb(28, 35, 43)),
-            );
-            let (icon, ink) = icon_for(entry.kind);
-            let mut x = rect.left();
-            for &(column, width) in &columns {
-                let cell = Rect::from_min_size(pos2(x, rect.top()), vec2(width, h));
-                let painter = ui
-                    .painter()
-                    .with_clip_rect(cell.shrink2(vec2(5., 0.)).intersect(ui.clip_rect()));
-                if column == Column::Name {
-                    let icon_rect =
-                        Rect::from_center_size(pos2(x + 23., rect.center().y), vec2(25., 25.));
-                    if details {
-                        ui.painter()
-                            .rect_filled(icon_rect, 6., ink.gamma_multiply(0.13));
-                    }
-                    icon.draw(ui, icon_rect.center(), 15., ink);
-                    if entry.link {
-                        Icon::Link.draw(ui, pos2(x + 33., rect.center().y + 7.), 8., SUB);
-                    }
-                    painter.text(
-                        pos2(x + 41., rect.center().y),
-                        Align2::LEFT_CENTER,
-                        &entry.name,
-                        FontId::proportional(14.),
-                        if marked {
-                            TEXT
-                        } else if entry.hidden {
-                            SUB
-                        } else {
-                            TEXT
-                        },
-                    );
+    let output = file_scroll_area(ui, "rows", target, h, tab, 1).show_rows(
+        ui,
+        h,
+        tab.visible_count(),
+        |ui, range| {
+            for index in range {
+                let entry = tab.visible_entry(index).unwrap();
+                let (rect, response) = file_row(ui, vec2(width, h), side, tab, entry);
+                row_interaction(ui, &response, entry, tab, side, actions);
+                let marked = tab.is_marked(&entry.path);
+                let focused = tab.cursor_position() == Some(index);
+                let background = if marked {
+                    ACCENT_DARK
+                } else if response.hovered() {
+                    HOVER
+                } else if index % 2 == 1 {
+                    Color32::from_rgb(20, 26, 32)
                 } else {
-                    painter.text(
-                        pos2(x + 13., rect.center().y),
-                        Align2::LEFT_CENTER,
-                        value(entry, column, show_modified_time),
-                        FontId::proportional(12.),
-                        if marked { TEXT } else { SUB },
+                    SURFACE
+                };
+                ui.painter().rect_filled(rect, 0., background);
+                if marked {
+                    ui.painter().vline(
+                        rect.left() + 1.,
+                        rect.top() + 6. ..=rect.bottom() - 6.,
+                        Stroke::new(2., ACCENT),
                     );
                 }
-                x += width;
+                if focused {
+                    ui.painter().rect_stroke(
+                        rect.shrink2(vec2(3., 2.)),
+                        4.,
+                        Stroke::new(2., ACCENT),
+                        egui::StrokeKind::Inside,
+                    );
+                }
+                ui.painter().hline(
+                    rect.x_range(),
+                    rect.bottom() - 0.5,
+                    Stroke::new(1., Color32::from_rgb(28, 35, 43)),
+                );
+                let (icon, ink) = icon_for(entry.kind);
+                let mut x = rect.left();
+                for &(column, width) in &columns {
+                    let cell = Rect::from_min_size(pos2(x, rect.top()), vec2(width, h));
+                    let painter = ui
+                        .painter()
+                        .with_clip_rect(cell.shrink2(vec2(5., 0.)).intersect(ui.clip_rect()));
+                    if column == Column::Name {
+                        let icon_rect =
+                            Rect::from_center_size(pos2(x + 23., rect.center().y), vec2(25., 25.));
+                        if details {
+                            ui.painter()
+                                .rect_filled(icon_rect, 6., ink.gamma_multiply(0.13));
+                        }
+                        icon.draw(ui, icon_rect.center(), 15., ink);
+                        if entry.link {
+                            Icon::Link.draw(ui, pos2(x + 33., rect.center().y + 7.), 8., SUB);
+                        }
+                        painter.text(
+                            pos2(x + 41., rect.center().y),
+                            Align2::LEFT_CENTER,
+                            &entry.name,
+                            FontId::proportional(14.),
+                            if marked {
+                                TEXT
+                            } else if entry.hidden {
+                                SUB
+                            } else {
+                                TEXT
+                            },
+                        );
+                    } else {
+                        painter.text(
+                            pos2(x + 13., rect.center().y),
+                            Align2::LEFT_CENTER,
+                            value(entry, column, show_modified_time),
+                            FontId::proportional(12.),
+                            if marked { TEXT } else { SUB },
+                        );
+                    }
+                    x += width;
+                }
+                folder_drop(ui, &response, entry, side, actions);
             }
-            folder_drop(ui, &response, entry, side, actions);
-        }
-    });
+        },
+    );
+    remember_provisional_scroll(
+        ui,
+        "rows",
+        tab,
+        output.state.clamped_offset().y,
+        h + ui.spacing().item_spacing.y,
+        1,
+    );
 }
 
 fn row_interaction(
@@ -1041,7 +1118,7 @@ fn gallery(
     } else {
         None
     };
-    file_scroll_area(ui, "gallery", target, height).show_rows(
+    let output = file_scroll_area(ui, "gallery", target, height, tab, columns).show_rows(
         ui,
         height,
         tab.visible_count().div_ceil(columns),
@@ -1051,8 +1128,7 @@ fn gallery(
                     ui.add_space(5.);
                     for index in row * columns..(row * columns + columns).min(tab.visible_count()) {
                         let entry = tab.visible_entry(index).unwrap();
-                        let (outer, response) =
-                            ui.allocate_exact_size(vec2(width, height), Sense::click_and_drag());
+                        let (outer, response) = file_row(ui, vec2(width, height), side, tab, entry);
                         row_interaction(ui, &response, entry, tab, side, actions);
                         let rect = outer.shrink(4.);
                         let marked = tab.is_marked(&entry.path);
@@ -1109,6 +1185,14 @@ fn gallery(
             }
         },
     );
+    remember_provisional_scroll(
+        ui,
+        "gallery",
+        tab,
+        output.state.clamped_offset().y,
+        height + ui.spacing().item_spacing.y,
+        columns,
+    );
 }
 
 fn empty(ui: &mut Ui, tab: &Tab, side: Side, actions: &mut Vec<Action>) {
@@ -1137,7 +1221,7 @@ fn empty(ui: &mut Ui, tab: &Tab, side: Side, actions: &mut Vec<Action>) {
             if let Some(message) = tab.error.as_deref() {
                 ui.label(label(error_title, 13., TEXT))
                     .on_hover_text(message);
-            } else if tab.listing_pending() && tab.entry_count() == 0 {
+            } else if tab.incomplete_listing() || tab.listing_pending() && tab.entry_count() == 0 {
                 ui.label(label("Loading files…", 13., SUB));
             } else {
                 ui.label(label(empty_message, 13., TEXT));
@@ -1192,7 +1276,7 @@ fn empty(ui: &mut Ui, tab: &Tab, side: Side, actions: &mut Vec<Action>) {
             } else {
                 buttons(ui);
             }
-        } else if tab.listing_pending() && tab.entry_count() == 0 {
+        } else if tab.incomplete_listing() || tab.listing_pending() && tab.entry_count() == 0 {
             ui.spinner();
             ui.label(label("Loading files…", 13., SUB));
         } else {
@@ -1307,8 +1391,18 @@ fn panel_status(root: &mut Ui, rect: Rect, side: Side, tab: &Tab, space: Option<
             .on_hover_text(path.display().to_string());
     }
     let shown = tab.visible_count();
+    if tab.provisional() {
+        ui.spinner();
+        ui.label(mono(format!("{shown} shown · loading…"), 11., ACCENT));
+    } else if tab.listing_pending() && shown != 0 {
+        ui.spinner();
+    }
     let title = if tab.marked_count() == 0 {
-        format!("{shown} items")
+        if tab.provisional() {
+            String::new()
+        } else {
+            format!("{shown} items")
+        }
     } else {
         format!(
             "{} selected · {}",
@@ -1316,11 +1410,13 @@ fn panel_status(root: &mut Ui, rect: Rect, side: Side, tab: &Tab, space: Option<
             metric(tab.selected_bytes())
         )
     };
-    ui.label(mono(
-        title,
-        11.,
-        if tab.marked_count() == 0 { SUB } else { ACCENT },
-    ));
+    if !title.is_empty() {
+        ui.label(mono(
+            title,
+            11.,
+            if tab.marked_count() == 0 { SUB } else { ACCENT },
+        ));
+    }
     if tab.filter().is_active() {
         ui.label(label("Filtered", 11., ACCENT))
             .on_hover_text("Ctrl+F to open filter options");

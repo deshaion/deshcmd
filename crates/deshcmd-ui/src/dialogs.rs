@@ -484,6 +484,13 @@ impl App {
             return;
         }
         let tab = self.engine.tab(side);
+        if matches!(tool, Tool::ExportDetails)
+            && tab.marked_count() == 0
+            && tab.incomplete_listing()
+        {
+            self.notice("Wait for the directory to finish loading before exporting all details");
+            return;
+        }
         let base = tab.base().to_owned();
         let other_tab = self.engine.tab(side.other());
         let other = other_tab.base().to_owned();
@@ -2599,8 +2606,16 @@ mod tests {
                 .unwrap();
             engine.poll();
         }
+        let settle = |engine: &mut engine::Engine| {
+            while engine.tab(Side::Left).busy() {
+                wake.recv_timeout(std::time::Duration::from_secs(5))
+                    .unwrap();
+                engine.poll();
+            }
+        };
         let side = Side::Left;
         engine.dispatch(Command::Filter(side, MatchOptions::filename("file")));
+        settle(&mut engine);
         let columns = &[Column::Name, Column::Comment];
         assert_eq!(
             details_text(engine.tab(side), columns, true, true),
@@ -2641,6 +2656,7 @@ mod tests {
             "file2.txt\tone two\nfile10.txt\t"
         );
         engine.dispatch(Command::Sort(side, Column::Name, false));
+        settle(&mut engine);
         assert_eq!(
             details_text(engine.tab(side), columns, true, true),
             "file10.txt\t\nfile2.txt\tone two"

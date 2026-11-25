@@ -103,25 +103,55 @@ fn phase1_engine() {
             settle(&mut engine, &wakes, &label, start);
             assert_eq!(engine.tab(LEFT).visible_entries().count(), expected);
             if size != "plain" {
+                let started = Instant::now();
                 measure(&format!("{size}/sort_size"), || {
                     engine.dispatch(Command::Sort(LEFT, Column::Size, false))
                 });
+                settle(&mut engine, &wakes, &format!("{size}/sort_size"), started);
+                let started = Instant::now();
                 measure(&format!("{size}/sort_name"), || {
                     engine.dispatch(Command::Sort(LEFT, Column::Name, false))
                 });
+                settle(&mut engine, &wakes, &format!("{size}/sort_name"), started);
+                let started = Instant::now();
                 measure(&format!("{size}/filter"), || {
                     engine.dispatch(Command::Filter(
                         LEFT,
                         MatchOptions::filename("file1*.txt;child?.txt"),
                     ));
                 });
+                settle(&mut engine, &wakes, &format!("{size}/filter"), started);
                 assert!(engine.tab(LEFT).visible_entries().count() < expected);
+                let started = Instant::now();
                 measure(&format!("{size}/clear_filter"), || {
                     engine.dispatch(Command::Filter(LEFT, MatchOptions::filename("")))
                 });
+                settle(
+                    &mut engine,
+                    &wakes,
+                    &format!("{size}/clear_filter"),
+                    started,
+                );
                 measure(&format!("{size}/mark_all"), || {
                     engine.dispatch(Command::MarkAll(LEFT))
                 });
+                let started = Instant::now();
+                measure(&format!("{size}/marked_sort"), || {
+                    engine.dispatch(Command::Sort(LEFT, Column::Name, false))
+                });
+                settle(&mut engine, &wakes, &format!("{size}/marked_sort"), started);
+                assert_eq!(engine.tab(LEFT).marked_count(), expected);
+                if std::env::var_os("DESHCMD_PERF_MARKED_REFRESH").is_some() {
+                    let started = Instant::now();
+                    engine.dispatch(Command::Refresh);
+                    settle(
+                        &mut engine,
+                        &wakes,
+                        &format!("{size}/marked_refresh"),
+                        started,
+                    );
+                    assert_eq!(engine.tab(LEFT).marked_count(), expected);
+                }
                 engine.dispatch(Command::Step(LEFT, Step::Last, false));
                 measure(&format!("{size}/step_marked"), || {
                     for _ in 0..100 {

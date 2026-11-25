@@ -11,7 +11,9 @@ fn sample(label: &str, elapsed: Duration) {
 #[test]
 #[ignore = "requires the generated performance fixture and a release build"]
 fn phase1_ui() {
-    let root = PathBuf::from(std::env::var_os("DESHCMD_PERF_ROOT").expect("set fixture path"));
+    let root = PathBuf::from(std::env::var_os("DESHCMD_PERF_ROOT").expect("set fixture path"))
+        .canonicalize()
+        .unwrap();
     let empty = root.join("empty");
     let ctx = egui::Context::default();
     let cc = eframe::CreationContext::_new_kittest(ctx.clone());
@@ -41,17 +43,29 @@ fn phase1_ui() {
         app.logic(&ctx, &mut frame);
         let _ = draw(&mut app, &mut frame, vec![]);
         let start = Instant::now();
+        let target = root.join(size.to_string());
         app.engine.dispatch(Command::Navigate {
             side,
-            path: root.join(size.to_string()),
+            path: target.clone(),
             new_tab: false,
             background: false,
         });
         let mut feedback = false;
+        let mut first_draw = false;
         loop {
+            let frame_start = Instant::now();
             app.logic(&ctx, &mut frame);
             let _ = draw(&mut app, &mut frame, vec![]);
+            sample(&format!("ui/{size}/loading_frame"), frame_start.elapsed());
+            if !first_draw
+                && app.engine.tab(side).base() == target
+                && app.engine.tab(side).visible_count() > 0
+            {
+                first_draw = true;
+                sample(&format!("ui/{size}/first_draw"), start.elapsed());
+            }
             if !app.engine.tab(side).busy() {
+                assert!(first_draw);
                 assert!(app.engine.tab(side).visible_entries().count() >= size);
                 sample(&format!("ui/{size}/populated_draw"), start.elapsed());
                 break;
@@ -211,4 +225,155 @@ fn phase2_blocked_listing_ui() {
         assert!(app.engine.tab(Side::Left).loading);
     }
     drop(hold);
+}
+
+#[test]
+fn provisional_rows_render_in_every_view_and_keep_pointer_identity_during_reorder() {
+    let fixture = tempfile::tempdir().unwrap();
+    let (root, target, expected) = if let Some(root) = std::env::var_os("DESHCMD_PERF_LARGE_TEST") {
+        let root = PathBuf::from(root).canonicalize().unwrap();
+        let target = root.join("plain");
+        (root, target, 100_000)
+    } else {
+        let root = fixture.path().canonicalize().unwrap();
+        let target = root.join("large");
+        std::fs::create_dir(root.join("empty")).unwrap();
+        std::fs::create_dir(&target).unwrap();
+        for number in 0..256 {
+            std::fs::write(target.join(format!("file{number:03}.txt")), "Preview text").unwrap();
+        }
+        (root, target, 256)
+    };
+    let empty = root.join("empty");
+    let ctx = egui::Context::default();
+    let cc = eframe::CreationContext::_new_kittest(ctx.clone());
+    let mut app = App::new(
+        &cc,
+        Box::new(TestDesktop::default()),
+        root,
+        [empty.clone(), empty],
+        true,
+    );
+    app.engine.settings.auto_refresh = false;
+    crate::tests::settle(&mut app);
+    let (release, gate) = mpsc::channel();
+    let gate = std::sync::Mutex::new(gate);
+    app.engine.set_first_page_test_hook(move || {
+        gate.lock()
+            .unwrap()
+            .recv_timeout(Duration::from_secs(5))
+            .map_err(std::io::Error::other)
+    });
+    let side = Side::Left;
+    app.engine.dispatch(Command::Navigate {
+        side,
+        path: target,
+        new_tab: false,
+        background: false,
+    });
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !app.engine.tab(side).provisional() {
+        app.engine.poll();
+        assert!(Instant::now() < deadline);
+        std::thread::yield_now();
+    }
+
+    let mut frame = eframe::Frame::_new_kittest();
+    let mut draw = |app: &mut App, events| {
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, vec2(1280., 800.))),
+                events,
+                ..Default::default()
+            },
+            |ui| app.ui(ui, &mut frame),
+        );
+        output.textures_delta.clear();
+        output
+            .shapes
+            .into_iter()
+            .filter_map(|shape| match shape.shape {
+                egui::Shape::Text(text) => Some((
+                    text.galley.text().to_owned(),
+                    text.pos + text.galley.size() / 2.,
+                )),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+    app.invoke(side, Tool::ExportDetails, &ctx);
+    assert!(
+        app.interface
+            .notice
+            .as_ref()
+            .is_some_and(|(text, _)| text.contains("finish loading"))
+    );
+    app.engine.dispatch(Command::Filter(
+        side,
+        engine::MatchOptions::filename("no-match"),
+    ));
+    while app.engine.tab(side).visible_count() != 0 {
+        app.engine.poll();
+        assert!(Instant::now() < deadline);
+        std::thread::yield_now();
+    }
+    let drawn = draw(&mut app, vec![]);
+    assert!(drawn.iter().any(|(label, _)| label == "Loading files…"));
+    assert!(!drawn.iter().any(|(label, _)| label == "No matching items"));
+    app.engine
+        .dispatch(Command::Filter(side, engine::MatchOptions::filename("")));
+    while app.engine.tab(side).visible_count() == 0 {
+        app.engine.poll();
+        assert!(Instant::now() < deadline);
+        std::thread::yield_now();
+    }
+    let first_name = app.engine.tab(side).visible_entry(0).unwrap().name.clone();
+    for view in [
+        engine::View::Gallery,
+        engine::View::Compact,
+        engine::View::Details,
+    ] {
+        app.engine.dispatch(Command::View(side, view));
+        let drawn = draw(&mut app, vec![]);
+        assert!(
+            drawn
+                .iter()
+                .any(|(label, _)| label.contains("shown · loading"))
+        );
+        assert!(drawn.iter().any(|(label, _)| label == &first_name));
+    }
+    let pointer = draw(&mut app, vec![])
+        .into_iter()
+        .find_map(|(label, point)| (label == first_name).then_some(point))
+        .unwrap();
+    let pointer_event = |pressed| egui::Event::PointerButton {
+        pos: pointer,
+        button: egui::PointerButton::Primary,
+        pressed,
+        modifiers: egui::Modifiers::NONE,
+    };
+    draw(
+        &mut app,
+        vec![egui::Event::PointerMoved(pointer), pointer_event(true)],
+    );
+    app.engine
+        .dispatch(Command::Sort(side, Column::Name, false));
+    while app.engine.tab(side).visible_entry(0).unwrap().name == first_name {
+        app.engine.poll();
+        assert!(Instant::now() < deadline);
+        std::thread::yield_now();
+    }
+    draw(&mut app, vec![pointer_event(false)]);
+    assert!(
+        app.engine
+            .tab(side)
+            .marked_entries()
+            .all(|entry| entry.name == first_name)
+    );
+    app.apply(Action::ToggleQuick(side), &ctx);
+    let drawn = draw(&mut app, vec![]);
+    assert!(drawn.iter().any(|(label, _)| label == "Quick View"));
+    release.send(()).unwrap();
+    crate::tests::settle(&mut app);
+    assert_eq!(app.engine.tab(side).visible_count(), expected);
 }

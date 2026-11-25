@@ -8,6 +8,7 @@ pub mod read_pool;
 #[cfg(test)]
 mod tests;
 mod text_preview;
+mod views;
 
 use std::collections::{HashMap, HashSet};
 use std::io;
@@ -158,9 +159,15 @@ impl HistoryEntry {
 pub struct Tab {
     pub saved: SavedTab,
     pub id: u64,
-    entries: Vec<Entry>,
-    visible: Vec<usize>,
-    selected: HashSet<PathBuf>,
+    view: views::View,
+    raw: Option<Arc<views::Raw>>,
+    raw_revision: u64,
+    view_revision: u64,
+    sort_revision: u64,
+    eligibility_revision: u64,
+    installed_view: Option<views::ViewKey>,
+    preparing: Option<views::ViewKey>,
+    selected: views::Marks,
     selected_bytes: u128,
     cursor: Option<PathBuf>,
     cursor_position: Option<usize>,
@@ -168,12 +175,15 @@ pub struct Tab {
     cursor_restored: bool,
     anchor: Option<PathBuf>,
     anchor_position: Option<usize>,
-    saved_marks: HashSet<PathBuf>,
-    filter: MatchOptions,
-    filter_query: listing::MatchQuery,
+    saved_marks: views::Marks,
+    filter: Arc<MatchOptions>,
+    filter_query: Arc<listing::MatchQuery>,
     history: Vec<HistoryEntry>,
     history_index: usize,
     pub loading: bool,
+    scanning: bool,
+    scan_serial: u64,
+    provisional_focus: bool,
     pub error: Option<String>,
     pub archive_locked: bool,
     pub skipped: usize,
@@ -191,8 +201,14 @@ impl Tab {
             id,
             history: vec![HistoryEntry::new(saved.location.clone())],
             saved,
-            entries: Vec::new(),
-            visible: Vec::new(),
+            view: Default::default(),
+            raw: None,
+            raw_revision: 0,
+            view_revision: 0,
+            sort_revision: 0,
+            eligibility_revision: 0,
+            installed_view: None,
+            preparing: None,
             selected: Default::default(),
             selected_bytes: 0,
             cursor: None,
@@ -202,10 +218,13 @@ impl Tab {
             anchor: None,
             anchor_position: None,
             saved_marks: Default::default(),
-            filter: MatchOptions::filename(""),
+            filter: Arc::new(MatchOptions::filename("")),
             filter_query: Default::default(),
             history_index: 0,
             loading: false,
+            scanning: false,
+            scan_serial: 0,
+            provisional_focus: false,
             error: None,
             archive_locked: false,
             skipped: 0,
@@ -250,7 +269,7 @@ impl Tab {
         self.listing_pending() || self.pending_navigation.is_some()
     }
     pub fn listing_pending(&self) -> bool {
-        self.loading || self.waiting_for_archive
+        self.loading || self.waiting_for_archive || self.preparing.is_some()
     }
     fn cancel_navigation(&mut self) {
         self.nav_revision += 1;
@@ -268,19 +287,38 @@ impl Tab {
     pub fn filter(&self) -> &MatchOptions {
         &self.filter
     }
+    pub fn provisional(&self) -> bool {
+        self.view.raw.partial
+    }
+    pub fn incomplete_listing(&self) -> bool {
+        self.provisional()
+            || (self.loading && self.installed_view.is_none())
+            || (self.installed_view.is_some()
+                && self.view.eligibility_revision != self.eligibility_revision)
+    }
+    pub fn listing_generation(&self) -> u64 {
+        self.generation
+    }
+    pub fn visible_position(&self, path: &Path) -> Option<usize> {
+        self.view.position(path)
+    }
+    fn scan_key(&self) -> ScanKey {
+        (self.id, self.generation, self.scan_serial)
+    }
     pub fn entry_count(&self) -> usize {
-        self.entries.len()
+        self.view.raw.entries.len()
     }
     pub fn visible_count(&self) -> usize {
-        self.visible.len()
+        self.view.visible.len()
     }
     pub fn visible_entry(&self, position: usize) -> Option<&Entry> {
-        self.visible
+        self.view
+            .visible
             .get(position)
-            .map(|&index| &self.entries[index])
+            .map(|&index| &self.view.raw.entries[index])
     }
     pub fn visible_entries(&self) -> impl ExactSizeIterator<Item = &Entry> {
-        self.visible.iter().map(|&i| &self.entries[i])
+        self.view.visible.iter().map(|&i| &self.view.raw.entries[i])
     }
     pub fn cursor_position(&self) -> Option<usize> {
         self.cursor_position
@@ -293,7 +331,7 @@ impl Tab {
         self.selected.contains(path)
     }
     pub fn marked_count(&self) -> usize {
-        if self.visible.is_empty() {
+        if self.view.visible.is_empty() {
             0
         } else {
             self.selected.len()
@@ -351,42 +389,46 @@ impl Tab {
         self.selected_bytes.min(u128::from(u64::MAX)) as u64
     }
     fn clear_view(&mut self) {
-        self.entries.clear();
-        self.visible.clear();
+        self.view = Default::default();
+        self.provisional_focus = false;
+        self.raw = None;
+        self.installed_view = None;
+        self.preparing = None;
         self.selected_bytes = 0;
         self.cursor_position = None;
         self.anchor_position = None;
     }
     fn clear_marks(&mut self) {
-        self.selected.clear();
+        self.selected = Default::default();
         self.selected_bytes = 0;
     }
-    fn collect_marks<'a>(entries: impl Iterator<Item = &'a Entry>) -> (HashSet<PathBuf>, u128) {
+    fn collect_marks<'a>(entries: impl Iterator<Item = &'a Entry>) -> (views::Marks, u128) {
         let mut bytes = 0;
         let paths = entries
             .map(|entry| {
                 bytes += Self::mark_size(entry);
-                entry.path.clone()
+                Arc::<Path>::from(entry.path.as_path())
             })
             .collect();
-        (paths, bytes)
+        (Arc::new(paths), bytes)
     }
     fn mark_size(entry: &Entry) -> u128 {
         if entry.is_dir() { 0 } else { entry.size.into() }
     }
-    fn set_mark(selected: &mut HashSet<PathBuf>, bytes: &mut u128, entry: &Entry, mark: bool) {
+    fn set_mark(selected: &mut views::Marks, bytes: &mut u128, entry: &Entry, mark: bool) {
         if mark {
-            if !selected.contains(&entry.path) {
-                selected.insert(entry.path.clone());
+            if !selected.contains(entry.path.as_path()) {
+                Arc::make_mut(selected).insert(Arc::from(entry.path.as_path()));
                 *bytes += Self::mark_size(entry);
             }
-        } else if selected.remove(&entry.path) {
+        } else if selected.contains(entry.path.as_path()) {
+            Arc::make_mut(selected).remove(entry.path.as_path());
             *bytes -= Self::mark_size(entry);
         }
     }
     fn mark_entries(&mut self, mark: bool, matches: impl Fn(&Entry) -> bool) {
-        for &index in &self.visible {
-            let entry = &self.entries[index];
+        for &index in &self.view.visible {
+            let entry = &self.view.raw.entries[index];
             if matches(entry) {
                 Self::set_mark(&mut self.selected, &mut self.selected_bytes, entry, mark);
             }
@@ -417,9 +459,10 @@ impl Tab {
         self.pending_cursor = None;
         self.cursor_restored = false;
         self.anchor = None;
-        self.filter.text.clear();
+        let filter = Arc::make_mut(&mut self.filter);
+        filter.text.clear();
+        filter.recursive = false;
         self.filter_query = Default::default();
-        self.filter.recursive = false;
         self.invalidate_scan();
     }
 
@@ -439,10 +482,19 @@ impl Tab {
 
     fn invalidate_scan(&mut self) {
         self.waiting_for_archive = false;
+        self.raw = self.installed_view.map(|_| self.view.raw.clone());
+        self.preparing = None;
         self.error = None;
         self.archive_locked = false;
         self.generation += 1;
+        if let (Some(installed), Some(key)) = (self.installed_view, self.view_key()) {
+            self.installed_view = Some(views::ViewKey {
+                revision: installed.revision,
+                ..key
+            });
+        }
         self.loading = false;
+        self.scanning = false;
         self.dirty = true;
     }
     fn entry_in_parent(&self, parent: &Path) -> Option<&Path> {
@@ -457,70 +509,60 @@ impl Tab {
             .filter(|path| path.parent() == Some(parent))
             .or_else(|| (directory.parent() == Some(parent)).then_some(directory.as_path()))
     }
-    fn filter_entries(&mut self, hidden: bool, ignore: Option<&globset::GlobSet>) {
-        #[cfg(feature = "perf")]
-        let started = perf::timestamp();
-        let shown = |entry: &Entry| {
-            (hidden || !entry.hidden)
-                && !ignore.is_some_and(|ignore| {
-                    ignore.is_match(listing::fold(&entry.name, false).as_ref())
-                })
-        };
-        let mut excluded_dirs = HashSet::new();
-        if self.filter.recursive {
-            excluded_dirs.extend(
-                self.entries
-                    .iter()
-                    .filter(|entry| entry.is_dir() && !shown(entry))
-                    .map(|entry| entry.path.as_path()),
-            );
-        }
+    fn view_key(&self) -> Option<views::ViewKey> {
+        self.raw.as_ref().map(|_| views::ViewKey {
+            tab: self.id,
+            generation: self.generation,
+            raw: self.raw_revision,
+            revision: self.view_revision,
+        })
+    }
 
-        self.visible.clear();
-        self.cursor_position = None;
-        self.anchor_position = None;
-        self.selected_bytes = 0;
-        let mut surviving_marks = Vec::new();
-        for (index, entry) in self.entries.iter().enumerate() {
-            let path = entry.path.as_path();
-            let shown = if self.filter.recursive && entry.is_dir() {
-                !excluded_dirs.contains(path)
-            } else {
-                shown(entry)
-            };
-            if !shown
-                || (!excluded_dirs.is_empty()
-                    && path
-                        .ancestors()
-                        .skip(1)
-                        .any(|ancestor| excluded_dirs.contains(ancestor)))
-                || !self.filter_query.matches(&self.filter, entry)
-            {
-                continue;
-            }
-            let position = self.visible.len();
-            self.visible.push(index);
-            if self.cursor_position.is_none() && self.cursor.as_deref() == Some(path) {
-                self.cursor_position = Some(position);
-            }
-            if self.anchor_position.is_none() && self.anchor.as_deref() == Some(path) {
-                self.anchor_position = Some(position);
-            }
-            if !self.selected.is_empty() && self.selected.contains(path) {
-                surviving_marks.push(path);
-                self.selected_bytes += Self::mark_size(entry);
-            }
+    fn install_view(
+        &mut self,
+        key: views::ViewKey,
+        view: views::View,
+        marks: Option<views::Reconciled>,
+    ) {
+        let finishing = self.provisional() && !view.raw.partial;
+        if finishing && !self.provisional_focus {
+            self.cursor = None;
+            self.anchor = None;
         }
-        if surviving_marks.is_empty() {
-            self.selected.clear();
-        } else if surviving_marks.len() != self.selected.len() {
-            let surviving: HashSet<_> = surviving_marks.into_iter().collect();
-            self.selected
-                .retain(|path| surviving.contains(path.as_path()));
+        let pending_cursor = if view.raw.partial {
+            self.pending_cursor
+                .as_ref()
+                .filter(|path| view.position(path).is_some())
+                .cloned()
+        } else if self.scanning {
+            None
+        } else {
+            self.pending_cursor.take()
+        };
+        if let Some(path) = &pending_cursor {
+            self.cursor = Some(path.clone());
         }
+        if let Some(marks) = marks {
+            self.selected = marks.retained;
+            self.selected_bytes = marks.bytes;
+        }
+        self.cursor_position = self.cursor.as_deref().and_then(|path| view.position(path));
+        self.anchor_position = self.anchor.as_deref().and_then(|path| view.position(path));
+        self.skipped = view.raw.skipped;
+        self.view = view;
         self.finish_view();
-        #[cfg(feature = "perf")]
-        perf::elapsed("projection", started);
+        if pending_cursor.is_some() && pending_cursor == self.cursor {
+            self.anchor.clone_from(&self.cursor);
+            self.anchor_position = self.cursor_position;
+            self.cursor_restored = true;
+        }
+        self.preparing = None;
+        self.installed_view = Some(key);
+        self.loading = self.scanning || self.provisional();
+        if finishing {
+            self.cursor_restored |= self.provisional_focus && self.cursor_position.is_some();
+            self.provisional_focus = false;
+        }
     }
     fn finish_view(&mut self) {
         if self.cursor_position.is_none() {
@@ -529,28 +571,35 @@ impl Tab {
         }
     }
     fn select(&mut self, path: &Path, mode: Select, mark: bool) {
-        let position = self.visible_entries().position(|entry| entry.path == path);
+        let position = self.view.position(path);
         if let Some(position) = position {
             self.select_position(position, mode, mark);
         }
     }
+    fn choose_provisional_cursor(&mut self) {
+        if self.provisional() {
+            self.provisional_focus = true;
+            self.pending_cursor = None;
+        }
+    }
     fn select_position(&mut self, position: usize, mode: Select, mark: bool) {
-        let index = self.visible[position];
-        let path = self.entries[index].path.clone();
+        self.choose_provisional_cursor();
+        let index = self.view.visible[position];
+        let path = self.view.raw.entries[index].path.clone();
         match mode {
             Select::Replace | Select::Focus => {
                 self.clear_marks();
                 if mark {
-                    let entry = &self.entries[index];
-                    self.selected.insert(path.clone());
+                    let entry = &self.view.raw.entries[index];
+                    Arc::make_mut(&mut self.selected).insert(Arc::from(path.as_path()));
                     self.selected_bytes = Self::mark_size(entry);
                 }
                 self.anchor = Some(path.clone());
                 self.anchor_position = Some(position);
             }
             Select::Toggle => {
-                let entry = &self.entries[index];
-                let mark = !self.selected.contains(&entry.path);
+                let entry = &self.view.raw.entries[index];
+                let mark = !self.selected.contains(entry.path.as_path());
                 Self::set_mark(&mut self.selected, &mut self.selected_bytes, entry, mark);
                 self.anchor = Some(path.clone());
                 self.anchor_position = Some(position);
@@ -566,9 +615,9 @@ impl Tab {
                 }
                 let range = start.min(position)..=start.max(position);
                 (self.selected, self.selected_bytes) = Self::collect_marks(
-                    self.visible[range]
+                    self.view.visible[range]
                         .iter()
-                        .map(|&index| &self.entries[index]),
+                        .map(|&index| &self.view.raw.entries[index]),
                 );
             }
         }
@@ -731,8 +780,10 @@ enum Event {
     },
 }
 
-type ScanKey = (u64, u64);
-type ScanResult = (io::Result<listing::Scan>, Option<PathBuf>);
+type ScanKey = (u64, u64, u64);
+#[cfg(any(test, feature = "perf"))]
+type FirstPageHook = Arc<dyn Fn(ScanKey) -> io::Result<()> + Send + Sync>;
+type ScanResult = (io::Result<Arc<views::Raw>>, Option<PathBuf>);
 
 pub struct Engine {
     pub settings: Settings,
@@ -741,7 +792,7 @@ pub struct Engine {
     pub home: PathBuf,
     pub notice: Option<String>,
     ids: u64,
-    ignore: Option<globset::GlobSet>,
+    ignore: Option<Arc<globset::GlobSet>>,
     sender: mpsc::Sender<Event>,
     receiver: mpsc::Receiver<Event>,
     wake: Arc<dyn Fn() + Send + Sync>,
@@ -750,6 +801,11 @@ pub struct Engine {
     archive_cache: Arc<archives::ArchiveCache>,
     scans: read_pool::ReadPool<ScanKey, ScanResult>,
     navigation: navigation::Navigation,
+    views: read_pool::ReadPool<views::ViewKey, io::Result<views::Prepared>>,
+    retire: views::Retire,
+    pages: Arc<views::FirstPages>,
+    #[cfg(any(test, feature = "perf"))]
+    first_page_hook: Option<FirstPageHook>,
     focus_revision: u64,
 }
 
@@ -771,7 +827,9 @@ impl Engine {
             .try_into()
             .ok()
             .unwrap();
-        let ignore = listing::compile_mask(&settings.ignore, false).unwrap_or_default();
+        let ignore = listing::compile_mask(&settings.ignore, false)
+            .unwrap_or_default()
+            .map(Arc::new);
         let wake: Arc<dyn Fn() + Send + Sync> = Arc::new(wake);
         let mut engine = Self {
             settings,
@@ -785,6 +843,11 @@ impl Engine {
             receiver,
             scans: read_pool::ReadPool::new(2, 2, wake.clone()),
             navigation: navigation::Navigation::new(wake.clone()),
+            views: read_pool::ReadPool::new(2, 2, wake.clone()),
+            retire: views::reclaimer(),
+            pages: Default::default(),
+            #[cfg(any(test, feature = "perf"))]
+            first_page_hook: None,
             focus_revision: 0,
             wake,
             last_refresh: Instant::now(),
@@ -802,6 +865,18 @@ impl Engine {
     }
     pub fn archive_password(&self, file: &Path) -> Option<Arc<str>> {
         self.archive_cache.password(file)
+    }
+    #[cfg(feature = "perf")]
+    #[doc(hidden)]
+    pub fn set_first_page_test_hook(
+        &mut self,
+        hook: impl Fn() -> io::Result<()> + Send + Sync + 'static,
+    ) {
+        self.first_page_hook = Some(Arc::new(move |_| hook()));
+    }
+    pub fn keep_provisional_focus(&mut self, side: Side) {
+        let tab = self.tab_mut(side);
+        tab.provisional_focus |= tab.provisional();
     }
     /// Report a restored cursor once so a view can scroll it into sight.
     pub fn take_cursor_restored(&mut self, side: Side) -> bool {
@@ -840,19 +915,35 @@ impl Engine {
         }
         self.retain_navigation();
         self.start_scans();
+        self.start_views();
         self.start_job();
     }
 
     pub fn set_ignore(&mut self, mask: String) -> io::Result<()> {
-        self.ignore = listing::compile_mask(&mask, false)?;
+        self.ignore = listing::compile_mask(&mask, false)?.map(Arc::new);
         self.settings.ignore = mask;
-        for side in Side::ALL {
-            self.refilter(side);
-        }
+        self.invalidate_views(false);
+        self.start_views();
         Ok(())
     }
 
     fn execute(&mut self, command: Command) -> io::Result<()> {
+        let needs_complete = match &command {
+            Command::Select(side, _, Select::Extend)
+            | Command::Step(side, _, true)
+            | Command::MarkAll(side)
+            | Command::Invert(side)
+            | Command::Find(side, _)
+            | Command::MarkMask(side, ..)
+            | Command::MarkLike(side, ..)
+            | Command::RestoreMarks(side)
+            | Command::LoadMarks(side, _) => Some(*side),
+            _ => None,
+        };
+        if needs_complete.is_some_and(|side| self.tab(side).incomplete_listing()) {
+            return Err(io::Error::other("Wait for the directory to finish loading"));
+        }
+
         match command {
             Command::Focus(side) => self.settings.active = side,
             Command::UnlockArchive {
@@ -1044,7 +1135,9 @@ impl Engine {
                         descending: false,
                     }];
                 }
-                self.resort(side);
+                let tab = self.tab_mut(side);
+                tab.view_revision += 1;
+                tab.sort_revision += 1;
             }
             Command::Filter(side, mut criteria) => {
                 let query = criteria.compile()?;
@@ -1054,13 +1147,13 @@ impl Engine {
                     Location::Directory(_) | Location::Archive { .. }
                 );
                 let scope_changed = tab.filter.recursive != criteria.recursive;
-                tab.filter = criteria;
-                tab.filter_query = query;
+                tab.filter = Arc::new(criteria);
+                tab.filter_query = Arc::new(query);
+                tab.view_revision += 1;
+                tab.eligibility_revision += 1;
                 if scope_changed {
                     tab.clear_view();
                     tab.invalidate_scan();
-                } else {
-                    self.refilter(side);
                 }
             }
             Command::Find(side, criteria) => {
@@ -1081,9 +1174,7 @@ impl Engine {
             Command::Ignore(mask) => self.set_ignore(mask)?,
             Command::ToggleHidden => {
                 self.settings.show_hidden = !self.settings.show_hidden;
-                for side in Side::ALL {
-                    self.refilter(side);
-                }
+                self.invalidate_views(false);
             }
             Command::Select(side, path, mode) => {
                 self.settings.active = side;
@@ -1092,8 +1183,8 @@ impl Engine {
             }
             Command::Step(side, step, extend) => {
                 let tab = self.tab_mut(side);
-                if !tab.visible.is_empty() {
-                    let last = tab.visible.len() - 1;
+                if !tab.view.visible.is_empty() {
+                    let last = tab.view.visible.len() - 1;
                     let index = tab.cursor_position().unwrap_or(0);
                     let next = match step {
                         Step::Previous => index.saturating_sub(1),
@@ -1103,10 +1194,11 @@ impl Engine {
                         Step::PageUp => index.saturating_sub(12),
                         Step::PageDown => (index + 12).min(last),
                     };
+                    tab.choose_provisional_cursor();
                     if extend {
                         tab.select_position(next, Select::Extend, false);
                     } else {
-                        let path = tab.entries[tab.visible[next]].path.clone();
+                        let path = tab.view.raw.entries[tab.view.visible[next]].path.clone();
                         tab.cursor = Some(path.clone());
                         tab.cursor_position = Some(next);
                         tab.anchor = Some(path);
@@ -1128,7 +1220,8 @@ impl Engine {
             }
             Command::MarkMask(side, criteria, mark) => {
                 let tab = self.tab_mut(side);
-                let matches = criteria.matching(tab.visible.iter().map(|&i| &tab.entries[i]))?;
+                let matches = criteria
+                    .matching(tab.view.visible.iter().map(|&i| &tab.view.raw.entries[i]))?;
                 for entry in matches {
                     Tab::set_mark(&mut tab.selected, &mut tab.selected_bytes, entry, mark);
                 }
@@ -1154,7 +1247,7 @@ impl Engine {
                 let tab = self.tab_mut(side);
                 (tab.selected, tab.selected_bytes) = Tab::collect_marks(
                     tab.visible_entries()
-                        .filter(|entry| tab.saved_marks.contains(&entry.path)),
+                        .filter(|entry| tab.saved_marks.contains(entry.path.as_path())),
                 );
             }
             Command::LoadMarks(side, text) => {
@@ -1383,18 +1476,113 @@ impl Engine {
         }
         pane.active = pane.active.min(pane.tabs.len() - 1);
     }
-    fn resort(&mut self, side: Side) {
-        let hidden = self.settings.show_hidden;
-        let first = self.settings.directories_first;
-        let natural = self.settings.natural_sort;
-        let tab = self.panes[side.index()].tab_mut();
-        listing::sort(&mut tab.entries, &tab.saved.sort, first, natural);
-        tab.filter_entries(hidden, self.ignore.as_ref());
+    pub fn set_sort_preferences(&mut self, natural: bool, directories_first: bool) {
+        if self.settings.natural_sort != natural
+            || self.settings.directories_first != directories_first
+        {
+            self.settings.natural_sort = natural;
+            self.settings.directories_first = directories_first;
+            self.invalidate_views(true);
+            self.start_views();
+        }
     }
-    fn refilter(&mut self, side: Side) {
-        self.panes[side.index()]
-            .tab_mut()
-            .filter_entries(self.settings.show_hidden, self.ignore.as_ref());
+
+    fn invalidate_views(&mut self, sort: bool) {
+        for pane in &mut self.panes {
+            for tab in &mut pane.tabs {
+                tab.view_revision += 1;
+                if sort {
+                    tab.sort_revision += 1;
+                } else {
+                    tab.eligibility_revision += 1;
+                }
+            }
+        }
+    }
+
+    fn start_views(&mut self) {
+        let keys = self.panes.each_ref().map(|pane| pane.tab().view_key());
+        self.views.retain(|key| keys.contains(&Some(key)));
+        for pane in &mut self.panes {
+            for (index, tab) in pane.tabs.iter_mut().enumerate() {
+                if index != pane.active {
+                    tab.preparing = None;
+                }
+            }
+            let tab = pane.tab_mut();
+            let Some(key) = tab.view_key() else { continue };
+            if tab.installed_view == Some(key) || tab.preparing == Some(key) {
+                continue;
+            }
+            let raw = tab.raw.as_ref().unwrap().clone();
+            let order = Arc::ptr_eq(&tab.view.raw, &raw).then(|| {
+                (
+                    tab.view.order.clone(),
+                    tab.view.sort_revision == tab.sort_revision,
+                )
+            });
+            let options = view_options(&self.settings, &self.ignore, tab);
+            let marks = (!Arc::ptr_eq(&tab.view.raw, &raw)
+                || tab.view.eligibility_revision != tab.eligibility_revision)
+                .then(|| tab.selected.clone());
+            if self.views.submit(key, move |cancel| {
+                let view = options.prepare(raw, order, cancel)?;
+                views::Prepared::new(view, marks, cancel)
+            }) {
+                tab.preparing = Some(key);
+            }
+        }
+    }
+
+    fn install_views(&mut self) {
+        for (key, result) in self.views.drain() {
+            for pane in &mut self.panes {
+                let tab = pane.tab_mut();
+                if tab.view_key() != Some(key) || tab.preparing != Some(key) {
+                    continue;
+                }
+                #[cfg(feature = "perf")]
+                let install = perf::timestamp();
+                match result {
+                    Ok(views::Prepared { view, mut marks }) => {
+                        #[cfg(feature = "perf")]
+                        let label = if view.raw.partial {
+                            "partial_install"
+                        } else {
+                            "install"
+                        };
+                        if marks
+                            .as_ref()
+                            .is_some_and(|marks| !Arc::ptr_eq(&marks.source, &tab.selected))
+                        {
+                            let current = tab.selected.clone();
+                            if current.len() > 2048 {
+                                tab.preparing = self
+                                    .views
+                                    .submit(key, move |cancel| {
+                                        views::Prepared::new(view, Some(current), cancel)
+                                    })
+                                    .then_some(key);
+                                break;
+                            }
+                            marks = Some(
+                                view.reconcile(current, &Default::default())
+                                    .expect("a fresh token cannot cancel mark reconciliation"),
+                            );
+                        }
+                        tab.install_view(key, view, marks);
+                        #[cfg(feature = "perf")]
+                        perf::elapsed(label, install);
+                    }
+                    Err(error) => {
+                        tab.preparing = None;
+                        tab.loading = tab.scanning || tab.provisional();
+                        tab.error = Some(error.to_string());
+                    }
+                }
+                break;
+            }
+        }
     }
     fn mark_dirty(&mut self) {
         for pane in &mut self.panes {
@@ -1442,12 +1630,10 @@ impl Engine {
                 tab.recover_directory(parent);
             }
         }
-        let active = self
-            .panes
-            .each_ref()
-            .map(|pane| (pane.tab().id, pane.tab().generation));
+        let active = self.panes.each_ref().map(|pane| pane.tab().scan_key());
         self.scans.retain(|key| active.contains(&key));
-        for pane in &mut self.panes {
+        self.pages.set_active(active);
+        for (slot, pane) in self.panes.iter_mut().enumerate() {
             let active = pane.active;
             for (index, tab) in pane.tabs.iter_mut().enumerate() {
                 if index != active {
@@ -1458,7 +1644,7 @@ impl Engine {
                 }
             }
             let tab = pane.tab_mut();
-            if tab.loading || !tab.dirty {
+            if tab.loading || tab.preparing.is_some() || !tab.dirty {
                 continue;
             }
             // An archive reservation survives cancellation until its worker leaves
@@ -1474,19 +1660,81 @@ impl Engine {
             };
             let location = tab.saved.location.clone();
             let recursive = tab.filter.recursive;
+            // Retained marks need the complete scope for reconciliation.
+            let first_page = (tab.installed_view.is_none()
+                && tab.selected.is_empty()
+                && matches!(location, Location::Directory(_))
+                && !recursive)
+                .then(|| view_options(&self.settings, &self.ignore, tab));
+            tab.scan_serial += 1;
+            let key = tab.scan_key();
+            self.pages.expect(slot, key);
+            let pages = self.pages.clone();
+            #[cfg(any(test, feature = "perf"))]
+            let first_page_hook = self.first_page_hook.clone();
             let archive_cache = self.archive_cache.clone();
             let wake = self.wake.clone();
+            let retire = self.retire.clone();
             #[cfg(feature = "perf")]
             let scheduled = perf::timestamp();
-            let accepted = self.scans.submit((tab.id, tab.generation), move |cancel| {
+            let accepted = self.scans.submit(key, move |cancel| {
                 #[cfg(feature = "perf")]
                 perf::elapsed("worker_start", scheduled);
+                let mut did_publish = false;
+                #[cfg(any(test, feature = "perf"))]
+                let mut page_error = Ok(());
                 let result = match &location {
                     Location::Archive { file, folder } => {
                         archives::scan(&archive_cache, file, folder, recursive, cancel)
                     }
-                    _ => listing::scan_cancellable(&location, recursive, cancel),
+                    _ => {
+                        let mut sample = Vec::new();
+                        let first_deadline = Instant::now() + Duration::from_millis(16);
+                        listing::scan_cancellable(&location, recursive, cancel, |entry| {
+                            if did_publish || cancel.cancelled() {
+                                return;
+                            }
+                            let Some(options) = &first_page else { return };
+                            if options.shown(entry)
+                                && options.query.matches(&options.criteria, entry)
+                            {
+                                sample.push(entry.clone());
+                            }
+                            if !sample.is_empty()
+                                && (sample.len() >= 64 || Instant::now() >= first_deadline)
+                            {
+                                let scan = listing::Scan {
+                                    entries: std::mem::take(&mut sample),
+                                    skipped: 0,
+                                };
+                                if let Ok(raw) = views::Raw::new(scan, true, retire.clone(), cancel)
+                                    && pages.publish(key, Arc::new(raw), cancel)
+                                {
+                                    did_publish = true;
+                                    wake();
+                                    #[cfg(any(test, feature = "perf"))]
+                                    if let Some(hook) = &first_page_hook {
+                                        page_error = hook(key);
+                                    }
+                                }
+                            }
+                        })
+                    }
                 };
+                #[cfg(any(test, feature = "perf"))]
+                let result = result.and_then(|scan| page_error.map(|()| scan));
+                let result = result.and_then(|scan| {
+                    if did_publish && let Location::Directory(path) = &location {
+                        cancel.check()?;
+                        if !path.metadata()?.is_dir() {
+                            return Err(io::Error::new(
+                                io::ErrorKind::NotADirectory,
+                                "Directory was replaced while loading",
+                            ));
+                        }
+                    }
+                    Ok(scan)
+                });
                 let fallback = match (&location, &result) {
                     (Location::Directory(path), Err(error))
                         if matches!(
@@ -1502,6 +1750,9 @@ impl Engine {
                     }
                     _ => None,
                 };
+                let result = result
+                    .and_then(|scan| views::Raw::new(scan, false, retire, cancel))
+                    .map(Arc::new);
                 #[cfg(feature = "perf")]
                 if cancel.cancelled() {
                     perf::elapsed("listing_cancel_observed", cancel.cancelled_at());
@@ -1519,6 +1770,7 @@ impl Engine {
             if accepted {
                 tab.waiting_for_archive = false;
                 tab.loading = true;
+                tab.scanning = true;
                 tab.dirty = false;
             }
         }
@@ -1570,44 +1822,41 @@ impl Engine {
         });
     }
 
-    fn install_scans(&mut self) {
-        for ((id, generation), (result, fallback)) in self.scans.drain() {
+    fn install_pages(&mut self) {
+        for (key, raw) in self.pages.drain() {
             for pane in &mut self.panes {
                 let tab = pane.tab_mut();
-                if tab.id != id || tab.generation != generation {
+                if tab.scan_key() == key && tab.scanning {
+                    tab.raw_revision += 1;
+                    tab.raw = Some(raw);
+                    break;
+                }
+            }
+        }
+    }
+
+    fn install_scans(&mut self) {
+        for (key, (result, fallback)) in self.scans.drain() {
+            for pane in &mut self.panes {
+                let tab = pane.tab_mut();
+                if tab.scan_key() != key {
                     continue;
                 }
-                tab.loading = false;
+                tab.scanning = false;
                 tab.deferred_recovery = fallback;
                 match result {
-                    Ok(listing) => {
-                        let pending_cursor = tab.pending_cursor.take();
-                        #[cfg(feature = "perf")]
-                        let install = perf::timestamp();
-                        tab.entries = listing.entries;
-                        tab.skipped = listing.skipped;
+                    Ok(raw) => {
+                        tab.raw_revision += 1;
+                        tab.raw = Some(raw);
                         tab.error = None;
                         tab.archive_locked = false;
-                        listing::sort(
-                            &mut tab.entries,
-                            &tab.saved.sort,
-                            self.settings.directories_first,
-                            self.settings.natural_sort,
-                        );
-                        if let Some(path) = &pending_cursor {
-                            tab.cursor = Some(path.clone());
-                        }
-                        tab.filter_entries(self.settings.show_hidden, self.ignore.as_ref());
-                        if pending_cursor.is_some() && pending_cursor == tab.cursor {
-                            tab.anchor.clone_from(&tab.cursor);
-                            tab.anchor_position = tab.cursor_position;
-                            tab.cursor_restored = true;
-                        }
-                        #[cfg(feature = "perf")]
-                        perf::elapsed("install", install);
                     }
                     Err(error) => {
-                        if tab.deferred_recovery.is_some() {
+                        tab.loading = false;
+                        if tab.deferred_recovery.is_some() && !tab.provisional() {
+                            if tab.raw.as_ref().is_some_and(|raw| raw.partial) {
+                                tab.clear_view();
+                            }
                             break;
                         }
                         tab.pending_cursor = None;
@@ -1699,7 +1948,9 @@ impl Engine {
                 }
             }
         }
+        self.install_pages();
         self.install_scans();
+        self.install_views();
         if self.settings.auto_refresh && self.last_refresh.elapsed() >= Duration::from_secs(4) {
             self.last_refresh = Instant::now();
             for pane in &mut self.panes {
@@ -1715,6 +1966,7 @@ impl Engine {
             }
         }
         self.start_scans();
+        self.start_views();
         self.start_job();
     }
 }
@@ -1724,6 +1976,24 @@ impl Drop for Engine {
         for job in &self.jobs {
             job.control.cancel();
         }
+    }
+}
+
+fn view_options(
+    settings: &Settings,
+    ignore: &Option<Arc<globset::GlobSet>>,
+    tab: &Tab,
+) -> views::Options {
+    views::Options {
+        sort: tab.saved.sort.clone(),
+        directories_first: settings.directories_first,
+        natural: settings.natural_sort,
+        hidden: settings.show_hidden,
+        ignore: ignore.clone(),
+        criteria: tab.filter.clone(),
+        query: tab.filter_query.clone(),
+        sort_revision: tab.sort_revision,
+        eligibility_revision: tab.eligibility_revision,
     }
 }
 

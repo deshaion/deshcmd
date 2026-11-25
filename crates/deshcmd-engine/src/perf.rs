@@ -109,3 +109,30 @@ impl Drop for ScanTiming {
         }
     }
 }
+
+static SNAPSHOT_BYTES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+pub(crate) fn snapshot_created(capacity: usize) -> usize {
+    if !enabled() {
+        return 0;
+    }
+    let bytes = capacity * std::mem::size_of::<super::Entry>();
+    let previous = SNAPSHOT_BYTES.fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
+    eprintln!("snapshot,inline_bytes_live,{}", previous + bytes);
+    bytes
+}
+
+pub(crate) fn snapshot_dropped(bytes: usize) {
+    if bytes != 0 {
+        SNAPSHOT_BYTES.fetch_sub(bytes, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+pub(crate) fn view_sort(partial: bool, rows: usize) {
+    if enabled() {
+        eprintln!(
+            "view_sort,{},{rows}",
+            if partial { "partial" } else { "full" }
+        );
+    }
+}

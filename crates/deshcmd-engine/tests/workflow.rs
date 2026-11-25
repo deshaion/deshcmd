@@ -144,12 +144,14 @@ fn pane_navigation_filters_and_restores_marks() {
     ));
     engine.dispatch(Command::RememberMarks(side));
     engine.dispatch(Command::Filter(side, MatchOptions::filename("REPORT?.TXT")));
+    pump(&mut engine, |engine| !engine.tab(side).busy());
     assert_eq!(
         engine.tab(side).visible_entries().next().unwrap().name,
         "report3.txt"
     );
     assert!(engine.tab(side).marked_count() == 0);
     engine.dispatch(Command::Filter(side, MatchOptions::filename("")));
+    pump(&mut engine, |engine| !engine.tab(side).busy());
     engine.dispatch(Command::RestoreMarks(side));
     assert!(engine.tab(side).is_marked(&root.join("café.txt")));
 
@@ -379,6 +381,7 @@ fn recursive_filter_applies_to_nested_items_and_can_be_cleared() {
     criteria.files = false;
     criteria.directories = true;
     engine.dispatch(Command::Filter(side, criteria));
+    pump(&mut engine, |engine| !engine.tab(side).busy());
     assert_eq!(visible_paths(&engine), [root.join("sub/Match folder")]);
 
     engine.dispatch(Command::Filter(side, MatchOptions::filename("")));
@@ -855,6 +858,7 @@ fn cursor_and_mark_totals_follow_the_visible_view() {
     engine.dispatch(Command::Step(side, Step::Next, true));
     check(engine.tab(side), Some("file10.txt"), 7, 2);
     engine.dispatch(Command::Sort(side, Column::Size, false));
+    pump(&mut engine, |engine| !engine.tab(side).busy());
     check(engine.tab(side), Some("file10.txt"), 7, 2);
     engine.dispatch(Command::Step(side, Step::Next, true));
     check(engine.tab(side), Some("report.csv"), 14, 3);
@@ -874,8 +878,10 @@ fn cursor_and_mark_totals_follow_the_visible_view() {
     check(engine.tab(side), Some("file2.txt"), 14, 4);
     engine.dispatch(Command::RememberMarks(side));
     engine.dispatch(Command::Filter(side, MatchOptions::filename("file10")));
+    pump(&mut engine, |engine| !engine.tab(side).busy());
     check(engine.tab(side), Some("file10.txt"), 5, 1);
     engine.dispatch(Command::Filter(side, MatchOptions::filename("")));
+    pump(&mut engine, |engine| !engine.tab(side).busy());
     engine.dispatch(Command::RestoreMarks(side));
     check(engine.tab(side), Some("file10.txt"), 14, 4);
     engine.dispatch(Command::LoadMarks(side, "file2.txt\nfile10.txt".into()));
@@ -925,6 +931,7 @@ fn recursive_projection_excludes_hidden_and_ignored_ancestors() {
     };
     assert_eq!(file_paths(&engine), [Path::new("keep/item.txt")]);
     engine.dispatch(Command::ToggleHidden);
+    pump(&mut engine, |engine| !engine.tab(side).busy());
     assert_eq!(
         file_paths(&engine),
         [Path::new(".private/item.txt"), Path::new("keep/item.txt")]
@@ -1202,10 +1209,13 @@ fn find_navigation_and_mark_commands_follow_the_visible_list() {
     engine.dispatch(Command::Step(side, Step::First, true));
     assert_eq!(engine.tab(side).marked_count(), 3);
     engine.dispatch(Command::ToggleHidden);
+    pump(&mut engine, |engine| !engine.tab(side).busy());
     assert_eq!(engine.tab(side).visible_count(), 4);
     engine.dispatch(Command::Ignore("*.md".into()));
+    pump(&mut engine, |engine| !engine.tab(side).busy());
     assert_eq!(engine.tab(side).visible_count(), 3);
     engine.dispatch(Command::ToggleHidden);
+    pump(&mut engine, |engine| !engine.tab(side).busy());
     engine.dispatch(Command::MarkAll(side));
     assert_eq!(marked(&engine), ["alpha.txt", "beta.txt"]);
 }

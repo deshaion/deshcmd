@@ -294,6 +294,7 @@ impl App {
             }
             Action::Tool(side, tool) => self.invoke(side, tool, ctx),
             Action::Open(side, entry, background) => {
+                self.engine.keep_provisional_focus(side);
                 if entry.archive.is_some() && !entry.is_dir() {
                     self.interface.quick = Some(side);
                 } else if entry.is_dir() || entry.kind == engine::Kind::Archive {
@@ -339,6 +340,7 @@ impl App {
                 self.interface.quick = if self.interface.quick == Some(side) {
                     None
                 } else {
+                    self.engine.keep_provisional_focus(side);
                     Some(side)
                 }
             }
