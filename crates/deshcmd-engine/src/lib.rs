@@ -1,3 +1,4 @@
+mod archives;
 mod listing;
 mod operations;
 #[cfg(feature = "perf")]
@@ -11,6 +12,10 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
+pub use archives::{
+    ArchiveOperation, ArchiveSelection, ArchiveSource, ExtractLayout, ExtractOptions, PackOptions,
+    is_archive, preview_member,
+};
 pub use listing::{Column, Entry, Kind, Location, MatchOptions, Preview, Sort, View, preview};
 pub use operations::{
     Algorithm, Collision, Conflict, ManifestMode, Operation, Progress, TransferOptions,
@@ -202,6 +207,13 @@ impl Tab {
         }
         match self.location() {
             Location::Directory(path) => display_name(path),
+            Location::Archive { file, folder } => {
+                if folder.as_os_str().is_empty() {
+                    display_name(file)
+                } else {
+                    display_name(folder)
+                }
+            }
             Location::Flat { .. } => "Flat view".into(),
             Location::List { .. } => "File list".into(),
         }
@@ -283,6 +295,20 @@ impl Tab {
             .map(|entry| entry.path.clone())
             .collect()
     }
+    pub fn archive_selection(&self) -> Option<ArchiveSelection> {
+        let Location::Archive { file, folder } = self.location() else {
+            return None;
+        };
+        Some(ArchiveSelection {
+            file: file.clone(),
+            folder: folder.clone(),
+            members: self
+                .operands()
+                .into_iter()
+                .filter_map(|path| path.strip_prefix(file).ok().map(Path::to_owned))
+                .collect(),
+        })
+    }
     pub fn selected_bytes(&self) -> u64 {
         self.selected_bytes.min(u128::from(u64::MAX)) as u64
     }
@@ -356,6 +382,9 @@ impl Tab {
         self.dirty = true;
     }
     fn entry_in_parent(&self, parent: &Path) -> Option<&Path> {
+        if let Location::Archive { file, .. } = self.location() {
+            return (file.parent() == Some(parent)).then_some(file.as_path());
+        }
         let Location::Directory(directory) = self.location() else {
             return None;
         };
@@ -516,6 +545,11 @@ pub enum Step {
 
 pub enum Command {
     Focus(Side),
+    UnlockArchive {
+        side: Side,
+        file: PathBuf,
+        password: String,
+    },
     Navigate {
         side: Side,
         path: PathBuf,
@@ -641,6 +675,7 @@ pub struct Engine {
     wake: Arc<dyn Fn() + Send + Sync>,
     last_refresh: Instant,
     running: Option<u64>,
+    archive_cache: Arc<archives::ArchiveCache>,
 }
 
 impl Engine {
@@ -675,6 +710,7 @@ impl Engine {
             wake: Arc::new(wake),
             last_refresh: Instant::now(),
             running: None,
+            archive_cache: Arc::default(),
         };
         engine.start_scans();
         engine
@@ -684,6 +720,9 @@ impl Engine {
     }
     pub fn tab(&self, side: Side) -> &Tab {
         self.pane(side).tab()
+    }
+    pub fn archive_password(&self, file: &Path) -> Option<Arc<str>> {
+        self.archive_cache.password(file)
     }
     /// Report a restored cursor once so a view can scroll it into sight.
     pub fn take_parent_focus_restored(&mut self, side: Side) -> bool {
@@ -726,6 +765,26 @@ impl Engine {
     fn execute(&mut self, command: Command) -> io::Result<()> {
         match command {
             Command::Focus(side) => self.settings.active = side,
+            Command::UnlockArchive {
+                side,
+                file,
+                password,
+            } => {
+                if !matches!(self.tab(side).location(), Location::Archive { file: current, .. } if current == &file)
+                {
+                    return Err(io::Error::other("The selected archive is no longer open"));
+                }
+                self.archive_cache.set_password(&file, password);
+                for pane in &mut self.panes {
+                    for tab in &mut pane.tabs {
+                        if matches!(tab.location(), Location::Archive { file: current, .. } if current == &file)
+                        {
+                            tab.clear_view();
+                            tab.invalidate_scan();
+                        }
+                    }
+                }
+            }
             Command::Navigate {
                 side,
                 path,
@@ -746,15 +805,33 @@ impl Engine {
             Command::Parent(side) => {
                 let path = match self.tab(side).location() {
                     Location::Directory(path) => path.parent().map(Path::to_path_buf),
+                    Location::Archive { file, folder } => folder
+                        .parent()
+                        .map(|parent| {
+                            if parent.as_os_str().is_empty() {
+                                file.clone()
+                            } else {
+                                file.join(parent)
+                            }
+                        })
+                        .or_else(|| file.parent().map(Path::to_owned)),
                     other => Some(other.base().to_path_buf()),
                 };
                 if let Some(path) = path {
-                    self.navigate(side, &path, false, false, true)?;
+                    let linked = !matches!(self.tab(side).location(), Location::Archive { .. });
+                    self.navigate(side, &path, false, false, linked)?;
                 }
             }
-            Command::Refresh => self.mark_dirty(),
+            Command::Refresh => {
+                self.archive_cache.clear_inventories();
+                self.mark_dirty();
+            }
             Command::NewTab(side) => {
-                let saved = default_tab(self.tab(side).base().to_path_buf());
+                let tab = self.tab(side);
+                let mut saved = default_tab(tab.base().to_path_buf());
+                if matches!(tab.location(), Location::Archive { .. }) {
+                    saved.location = tab.location().clone();
+                }
                 self.add_tab(side, saved, false);
             }
             Command::OpenFocusedDirectoryInTab {
@@ -848,6 +925,9 @@ impl Engine {
             }
             Command::Flat(side, selection) => {
                 let tab = self.tab_mut(side);
+                if matches!(tab.location(), Location::Archive { .. }) {
+                    return Err(io::Error::other("Flat view needs a local folder"));
+                }
                 let base = tab.base().to_path_buf();
                 let roots = if selection {
                     tab.operands()
@@ -886,7 +966,10 @@ impl Engine {
             Command::Filter(side, mut criteria) => {
                 let query = criteria.compile()?;
                 let tab = self.tab_mut(side);
-                criteria.recursive &= matches!(tab.location(), Location::Directory(_));
+                criteria.recursive &= matches!(
+                    tab.location(),
+                    Location::Directory(_) | Location::Archive { .. }
+                );
                 let scope_changed = tab.filter.recursive != criteria.recursive;
                 tab.filter = criteria;
                 tab.filter_query = query;
@@ -1198,6 +1281,47 @@ impl Engine {
             base.join(path)
         };
         if !resolved.is_dir() {
+            if let Some(file) = resolved
+                .ancestors()
+                .find(|path| is_archive(path) && path.is_file())
+            {
+                let folder = resolved.strip_prefix(file).map_err(io::Error::other)?;
+                if folder
+                    .components()
+                    .any(|component| !matches!(component, std::path::Component::Normal(_)))
+                {
+                    return Err(io::Error::other("Invalid archive folder"));
+                }
+                let file = file.to_owned();
+                let tab = self.tab(side);
+                let previous_folder = match tab.location() {
+                    Location::Archive {
+                        file: previous_file,
+                        folder: previous_folder,
+                    } if previous_file == &file && previous_folder.parent() == Some(folder) => {
+                        Some(previous_file.join(previous_folder))
+                    }
+                    _ => None,
+                };
+                let location = Location::Archive {
+                    file,
+                    folder: folder.into(),
+                };
+                let opens_tab = new_tab
+                    || matches!(tab.saved.lock, TabLock::Locked | TabLock::NewTab)
+                        && tab.location() != &location;
+                if opens_tab {
+                    let mut saved = default_tab(location.base().to_owned());
+                    saved.location = location;
+                    self.add_tab(side, saved, background);
+                } else {
+                    let tab = self.tab_mut(side);
+                    tab.set_location(location, true);
+                    tab.pending_parent_focus = previous_folder;
+                    self.settings.active = side;
+                }
+                return Ok(());
+            }
             return Err(io::Error::other(format!(
                 "{} is unavailable or is not a directory",
                 resolved.display()
@@ -1214,8 +1338,9 @@ impl Engine {
         let location = Location::Directory(path.clone());
         let location_changed = tab.location() != &location;
         let lock = tab.saved.lock;
-        let opens_tab =
-            new_tab || matches!(lock, TabLock::Locked | TabLock::NewTab) && path != previous;
+        let opens_tab = new_tab
+            || matches!(lock, TabLock::Locked | TabLock::NewTab)
+                && (path != previous || matches!(tab.location(), Location::Archive { .. }));
         let tab = if opens_tab {
             self.add_tab(side, default_tab(path.clone()), background)
         } else {
@@ -1228,7 +1353,12 @@ impl Engine {
         if opens_tab || location_changed {
             tab.history[tab.history_index].entered_via = Some(resolved);
         }
-        if self.settings.linked && linked && !background && !opens_tab {
+        if self.settings.linked
+            && linked
+            && !background
+            && !opens_tab
+            && !matches!(self.tab(side.other()).location(), Location::Archive { .. })
+        {
             let target = self.tab(side.other()).base();
             let paired = if let Some(parent) = previous.parent().filter(|parent| parent == &path) {
                 let _ = parent;
@@ -1254,7 +1384,10 @@ impl Engine {
             entered_via,
         }) = tab.history.get(index).cloned()
         {
-            if !location.base().is_dir() {
+            if !match &location {
+                Location::Archive { file, .. } => file.is_file(),
+                _ => location.base().is_dir(),
+            } {
                 return Err(io::Error::other("This history location is unavailable"));
             }
             let parent_focus = match &location {
@@ -1262,9 +1395,16 @@ impl Engine {
                 _ => None,
             };
             let tab = if matches!(tab.saved.lock, TabLock::Locked | TabLock::NewTab)
-                && location.base() != tab.base()
+                && (location.base() != tab.base()
+                    || (matches!(&location, Location::Archive { .. })
+                        || matches!(tab.location(), Location::Archive { .. }))
+                        && &location != tab.location())
             {
-                let tab = self.add_tab(side, default_tab(location.base().to_path_buf()), false);
+                let mut saved = default_tab(location.base().to_path_buf());
+                if matches!(&location, Location::Archive { .. }) {
+                    saved.location = location;
+                }
+                let tab = self.add_tab(side, saved, false);
                 tab.history[0].entered_via = entered_via;
                 tab
             } else {
@@ -1342,13 +1482,19 @@ impl Engine {
             tab.dirty = false;
             let (id, generation, location) = (tab.id, tab.generation, tab.saved.location.clone());
             let recursive = tab.filter.recursive;
+            let archive_cache = self.archive_cache.clone();
             let (sender, wake) = (self.sender.clone(), self.wake.clone());
             #[cfg(feature = "perf")]
             let scheduled = perf::timestamp();
             std::thread::spawn(move || {
                 #[cfg(feature = "perf")]
                 perf::elapsed("worker_start", scheduled);
-                let result = listing::scan(&location, recursive);
+                let result = match &location {
+                    Location::Archive { file, folder } => {
+                        archives::scan(&archive_cache, file, folder, recursive)
+                    }
+                    _ => listing::scan(&location, recursive),
+                };
                 let _ = sender.send(Event::Listed(id, generation, result));
                 #[cfg(feature = "perf")]
                 perf::elapsed("publication", scheduled);
@@ -1508,7 +1654,12 @@ impl Engine {
             self.last_refresh = Instant::now();
             for pane in &mut self.panes {
                 let tab = pane.tab_mut();
-                if !tab.filter.recursive && !matches!(tab.location(), Location::Flat { .. }) {
+                if !tab.filter.recursive
+                    && !matches!(
+                        tab.location(),
+                        Location::Flat { .. } | Location::Archive { .. }
+                    )
+                {
                     tab.dirty = true;
                 }
             }

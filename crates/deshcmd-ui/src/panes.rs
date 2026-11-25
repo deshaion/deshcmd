@@ -96,10 +96,11 @@ impl PanelUi {
             show_preview(root, rect, side, source, entry, previews, actions);
             return;
         }
-        if self.tab_id != tab.id || self.base != tab.base() {
+        let display_path = tab.location().display_path();
+        if self.tab_id != tab.id || self.base != display_path {
             self.tab_id = tab.id;
-            self.base = tab.base().to_path_buf();
-            self.path_draft = tab.base().display().to_string();
+            self.path_draft = display_path.display().to_string();
+            self.base = display_path;
             self.filter.clone_from(&tab.filter().text);
         }
         let short = rect.height() < 225.;
@@ -190,7 +191,7 @@ impl PanelUi {
                 actions.push(Action::Drop {
                     side,
                     paths: payload.0.clone(),
-                    destination: tab.base().to_path_buf(),
+                    destination: tab.location().display_path(),
                     moving,
                 });
             }
@@ -363,7 +364,7 @@ impl PanelUi {
                             actions.push(Action::Drop {
                                 side,
                                 paths: payload.0.clone(),
-                                destination: tab.base().to_path_buf(),
+                                destination: tab.location().display_path(),
                                 moving,
                             });
                         }
@@ -375,7 +376,7 @@ impl PanelUi {
                                 if pinned {
                                     ui.label("Pinned tab");
                                 }
-                                ui.label(tab.base().display().to_string());
+                                ui.label(tab.location().display_path().display().to_string());
                             })
                             .context_menu(|ui| {
                                 let pin_label = if pinned { "Unpin tab" } else { "Pin tab" };
@@ -476,7 +477,10 @@ impl PanelUi {
                 .max_height(250.)
                 .show(ui, |ui| {
                     for (index, location) in tab.history().enumerate().rev() {
-                        if ui.button(location.base().display().to_string()).clicked() {
+                        if ui
+                            .button(location.display_path().display().to_string())
+                            .clicked()
+                        {
                             actions.push(Action::Command(Command::History(side, index)));
                             ui.close();
                         }
@@ -542,11 +546,12 @@ impl PanelUi {
                 self.editing_path = false;
             }
             if root.input(|input| input.key_pressed(egui::Key::Escape)) {
-                self.path_draft = tab.base().display().to_string();
+                self.path_draft = tab.location().display_path().display().to_string();
                 self.editing_path = false;
             }
         } else {
-            let crumbs = crumbs(tab.base(), home);
+            let display_path = tab.location().display_path();
+            let crumbs = crumbs(&display_path, home);
             let label_width = |text: &str| {
                 path_ui
                     .painter()
@@ -600,7 +605,7 @@ impl PanelUi {
             if path_response.clicked() {
                 self.start_path();
             }
-            path_response.on_hover_text(tab.base().display().to_string());
+            path_response.on_hover_text(display_path.display().to_string());
         }
         if icon_button(&mut ui, Icon::More, "Location and view options", true).clicked() {
             self.start_path();
@@ -941,7 +946,7 @@ fn row_interaction(
             },
         )));
     }
-    if response.drag_started() {
+    if response.drag_started() && entry.archive.is_none() {
         let paths = if marked {
             tab.operands()
         } else {
@@ -970,7 +975,7 @@ fn row_interaction(
             ui.close();
         }
         ui.separator();
-        dialogs::entry_menu(ui, side, actions);
+        dialogs::entry_menu(ui, side, entry, actions);
     });
 }
 
@@ -1115,6 +1120,11 @@ fn empty(ui: &mut Ui, tab: &Tab, side: Side, actions: &mut Vec<Action>) {
             ui.label(label(message, 12., SUB));
             if ui.small_button("Retry").clicked() {
                 actions.push(Action::Command(Command::Refresh));
+            }
+            if matches!(tab.location(), Location::Archive { .. })
+                && ui.small_button("Unlock archive…").clicked()
+            {
+                actions.push(Action::Tool(side, Tool::UnlockArchive));
             }
         } else if tab.loading && tab.entry_count() == 0 {
             ui.spinner();
@@ -1324,6 +1334,9 @@ fn show_preview(
             }
             Some(CachedPreview::None) => {
                 ui.label(label("Preview unavailable for this file.", 13., SUB));
+                if entry.archive.is_some() && ui.button("Unlock archive…").clicked() {
+                    actions.push(Action::Tool(source, Tool::UnlockArchive));
+                }
                 if ui.button("Open file").clicked() {
                     actions.push(Action::Open(source, entry.clone(), false));
                 }

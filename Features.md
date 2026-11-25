@@ -57,6 +57,8 @@ This inventory covers dual-panel file management for local files, archives, netw
 
 ## Archives and packages
 
+See [Archives and packages in the DeShCmd README](README.md#archives-and-packages) for the available handlers, commands, and configuration.
+
 - **Browse archives as directories.** Open supported archives in either panel, navigate folders inside them, preview or extract individual members, and copy files between archives and regular folders. Add or delete members where supported and test archive integrity.
 - **Pack and unpack.** Create or update archives through the Pack dialog. Extract by mask, preserve paths or flatten them, choose overwrite behavior, and use a separate folder for each archive or Smart Extract, which creates a containing folder when the archive has multiple top-level items. Compression settings, encryption, and multi-volume handling depend on the archiver and format.
 - **ZIP and compressed streams.** The Zip plugin handles ZIP/ZIPX and ZIP-based formats such as JAR, EPUB, Office Open XML, and OpenDocument. It also handles TAR and compressed streams or tarballs using gzip, bzip2, LZMA/XZ, Zstandard, and Brotli, subject to available libraries. Brotli support is for decompression.

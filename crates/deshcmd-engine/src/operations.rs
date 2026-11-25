@@ -189,6 +189,7 @@ pub enum ManifestMode {
 
 #[derive(Clone, Debug)]
 pub enum Operation {
+    Archive(crate::ArchiveOperation),
     Transfer {
         paths: Vec<PathBuf>,
         destination: PathBuf,
@@ -257,6 +258,7 @@ pub enum Operation {
 impl Operation {
     pub fn label(&self) -> &'static str {
         match self {
+            Self::Archive(operation) => operation.label(),
             Self::Transfer { moving: true, .. } => "Move",
             Self::Transfer { .. } => "Copy",
             Self::Rename { .. } => "Rename",
@@ -312,7 +314,7 @@ impl Control {
         self.0.lock().unwrap().answer = Some((choice, all));
         self.1.notify_all();
     }
-    fn check(&self) -> io::Result<()> {
+    pub(crate) fn check(&self) -> io::Result<()> {
         let state = self
             .1
             .wait_while(self.0.lock().unwrap(), |s| s.paused && !s.cancelled)
@@ -328,6 +330,10 @@ impl Control {
     }
     pub fn is_cancelled(&self) -> bool {
         self.cancelled()
+    }
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub(crate) fn is_paused(&self) -> bool {
+        self.0.lock().unwrap().paused
     }
     fn wait_answer(&self) -> io::Result<(Collision, bool)> {
         let mut state = self
@@ -357,7 +363,7 @@ pub(crate) struct Worker<'a> {
 }
 
 impl Worker<'_> {
-    fn update(&mut self, path: &Path, total: u64) {
+    pub(crate) fn update(&mut self, path: &Path, total: u64) {
         self.progress.current = path.display().to_string();
         self.progress.file_bytes = 0;
         self.progress.file_total = total;
@@ -390,7 +396,7 @@ impl Worker<'_> {
         }
     }
 
-    fn finish_item(&mut self) {
+    pub(crate) fn finish_item(&mut self) {
         self.progress.items += 1;
         self.emit();
     }
@@ -409,6 +415,7 @@ impl Worker<'_> {
     pub(crate) fn run(&mut self, operation: Operation) -> io::Result<String> {
         self.control.check()?;
         let message = match operation {
+            Operation::Archive(operation) => self.archive(operation)?,
             Operation::Transfer {
                 paths,
                 destination,
@@ -585,7 +592,7 @@ fn name(path: &Path) -> String {
         .to_string_lossy()
         .into_owned()
 }
-fn parent(path: &Path) -> io::Result<&Path> {
+pub(crate) fn parent(path: &Path) -> io::Result<&Path> {
     path.parent()
         .filter(|p| !p.as_os_str().is_empty())
         .ok_or_else(|| io::Error::other("The path needs a parent directory"))
@@ -797,7 +804,7 @@ struct Transfer<'a, 'worker> {
 }
 
 impl Worker<'_> {
-    fn transfer(
+    pub(crate) fn transfer(
         &mut self,
         paths: Vec<PathBuf>,
         destination: &Path,
