@@ -345,6 +345,7 @@ fn move_conflicts_keep_skipped_files_and_never_clobber_on_rename() {
     assert_eq!(fs::read(&target).unwrap(), b"kept");
     assert_eq!(fs::read(right.join("folder/fresh.txt")).unwrap(), b"fresh");
     assert!(!engine.jobs[0].warnings.is_empty());
+    assert!(engine.jobs[0].message.contains("Skipped "));
 
     assert!(!left.join("folder/fresh.txt").exists());
     let protected = left.join("folder/guard.txt");
@@ -359,6 +360,208 @@ fn move_conflicts_keep_skipped_files_and_never_clobber_on_rename() {
     assert_eq!(engine.jobs.last().unwrap().state, JobState::Failed);
     assert_eq!(fs::read(source).unwrap(), b"incoming");
     assert_eq!(fs::read(protected).unwrap(), b"protected");
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+#[test]
+fn rename_existing_moves_the_incoming_file_and_reports_the_original() {
+    let fixture = tempfile::tempdir().unwrap();
+    let cross_volume = std::env::var_os("DESHCMD_TEST_DESTINATION");
+    let destination = tempfile::tempdir_in(
+        cross_volume
+            .as_deref()
+            .map(Path::new)
+            .unwrap_or(fixture.path()),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    if cross_volume.is_some() {
+        use std::os::unix::fs::MetadataExt;
+        assert_ne!(
+            fixture.path().metadata().unwrap().dev(),
+            destination.path().metadata().unwrap().dev()
+        );
+    }
+    let source = fixture.path().join("example.txt");
+    let target = destination.path().join("example.txt");
+    let taken = destination.path().join("example (1).txt");
+    let backup = destination.path().join("example (2).txt");
+    fs::write(&source, b"incoming").unwrap();
+    fs::write(&target, b"existing").unwrap();
+    fs::write(&taken, b"already taken").unwrap();
+
+    let mut engine = open(fixture.path(), destination.path());
+    run(
+        &mut engine,
+        Operation::Transfer {
+            paths: vec![source.clone()],
+            destination: destination.path().to_path_buf(),
+            moving: true,
+            options: TransferOptions {
+                collision: Collision::RenameExisting,
+                verify: true,
+                ..TransferOptions::default()
+            },
+        },
+    );
+    let job = engine.jobs.last().unwrap();
+    assert_eq!(job.state, JobState::Done, "{:?}", job.warnings);
+    assert!(job.message.contains("Moved 1 of 1"));
+    assert!(job.message.contains("example (2).txt"));
+    assert!(!source.exists());
+    assert_eq!(fs::read(target).unwrap(), b"incoming");
+    assert_eq!(fs::read(taken).unwrap(), b"already taken");
+    assert_eq!(fs::read(backup).unwrap(), b"existing");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn rename_existing_leaves_the_destination_in_place_when_space_check_fails() {
+    let fixture = tempfile::tempdir().unwrap();
+    let destination = fixture.path().join("destination");
+    fs::create_dir(&destination).unwrap();
+    let source = fixture.path().join("example.txt");
+    let target = destination.join("example.txt");
+    let length = fs2::total_space(&destination).unwrap() + 1;
+    fs::File::create(&source).unwrap().set_len(length).unwrap();
+    fs::write(&target, b"existing").unwrap();
+
+    let mut engine = open(fixture.path(), &destination);
+    run(
+        &mut engine,
+        Operation::Transfer {
+            paths: vec![source.clone()],
+            destination: destination.clone(),
+            moving: false,
+            options: TransferOptions {
+                collision: Collision::RenameExisting,
+                ..TransferOptions::default()
+            },
+        },
+    );
+    let job = engine.jobs.last().unwrap();
+    assert_eq!(job.state, JobState::Failed);
+    assert!(
+        job.warnings
+            .iter()
+            .any(|warning| warning.contains("Insufficient free space"))
+    );
+    assert_eq!(source.metadata().unwrap().len(), length);
+    assert_eq!(fs::read(target).unwrap(), b"existing");
+    assert_eq!(fs::read_dir(destination).unwrap().count(), 1);
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_failed_staged_folder_move_keeps_the_destination_and_source_tree() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+
+    let fixture = tempfile::tempdir().unwrap();
+    let left = fixture.path().join("left");
+    let right = fixture.path().join("right");
+    let source = left.join("outer/folder");
+    let target = right.join("outer/folder");
+    fs::create_dir_all(source.join("readonly")).unwrap();
+    fs::create_dir_all(&target).unwrap();
+    fs::write(source.join("readonly/incoming.txt"), b"incoming").unwrap();
+    fs::set_permissions(source.join("readonly"), fs::Permissions::from_mode(0o500)).unwrap();
+    fs::write(target.join("existing.txt"), b"existing").unwrap();
+    let blocked = source.join("blocked");
+    fs::write(&blocked, b"blocked").unwrap();
+    fs::set_permissions(&blocked, fs::Permissions::from_mode(0o000)).unwrap();
+    let source_is_readable = fs::File::open(&blocked).is_ok();
+    if source_is_readable {
+        fs::remove_file(&blocked).unwrap();
+        symlink("missing", &blocked).unwrap();
+    }
+    let mut engine = open(&left, &right);
+    engine.dispatch(Command::Queue(
+        Operation::Transfer {
+            paths: vec![left.join("outer")],
+            destination: right.clone(),
+            moving: true,
+            options: TransferOptions {
+                follow_links: true,
+                ..TransferOptions::default()
+            },
+        },
+        false,
+    ));
+    for (conflict_target, choice) in [
+        (right.join("outer"), Collision::Merge),
+        (target.clone(), Collision::RenameExisting),
+    ] {
+        pump(&mut engine, |engine| {
+            engine.jobs[0]
+                .conflict
+                .as_ref()
+                .is_some_and(|conflict| conflict.target == conflict_target.canonicalize().unwrap())
+        });
+        engine.dispatch(Command::Resolve(engine.jobs[0].id, choice, false));
+    }
+    pump(&mut engine, |engine| engine.jobs[0].state.finished());
+    fs::set_permissions(source.join("readonly"), fs::Permissions::from_mode(0o700)).unwrap();
+    let job = &engine.jobs[0];
+    assert_eq!(job.state, JobState::Failed);
+    assert!(
+        job.warnings
+            .iter()
+            .any(|warning| warning.contains("blocked")),
+        "{:?}",
+        job.warnings
+    );
+    assert_eq!(
+        fs::read(source.join("readonly/incoming.txt")).unwrap(),
+        b"incoming"
+    );
+    assert_eq!(fs::read(target.join("existing.txt")).unwrap(), b"existing");
+    assert!(blocked.symlink_metadata().is_ok());
+    assert_eq!(fs::read_dir(target.parent().unwrap()).unwrap().count(), 1);
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn rename_existing_preserves_adjusted_relative_links_in_a_filtered_folder_move() {
+    use std::os::unix::fs::symlink;
+
+    let fixture = tempfile::tempdir().unwrap();
+    let left = fixture.path().join("left");
+    let right = fixture.path().join("right");
+    let source = left.join("folder");
+    let target = right.join("folder");
+    fs::create_dir_all(source.join("nested")).unwrap();
+    fs::create_dir_all(&target).unwrap();
+    fs::write(left.join("original"), b"referenced").unwrap();
+    fs::write(source.join("keep.bin"), b"excluded").unwrap();
+    fs::write(target.join("existing"), b"existing").unwrap();
+    symlink("../../original", source.join("nested/link.txt")).unwrap();
+
+    let mut engine = open(&left, &right);
+    run(
+        &mut engine,
+        Operation::Transfer {
+            paths: vec![source.clone()],
+            destination: right.clone(),
+            moving: true,
+            options: TransferOptions {
+                directory_collision: Collision::RenameExisting,
+                adjust_links: true,
+                mask: "*.txt".into(),
+                ..TransferOptions::default()
+            },
+        },
+    );
+    assert!(engine.jobs.last().unwrap().message.contains("folder (1)"));
+    assert_eq!(fs::read(source.join("keep.bin")).unwrap(), b"excluded");
+    assert!(!source.join("nested").exists());
+    assert_eq!(
+        fs::read(target.join("nested/link.txt")).unwrap(),
+        b"referenced"
+    );
+    assert_eq!(
+        fs::read(right.join("folder (1)/existing")).unwrap(),
+        b"existing"
+    );
 }
 
 #[test]
