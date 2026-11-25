@@ -84,6 +84,27 @@ impl Session {
 }
 
 #[test]
+fn new_text_file_uses_first_free_suffix_and_focuses_the_created_file() {
+    let mut session = Session::new();
+    for name in ["untitled.txt", "untitled1.txt", "untitled3.txt"] {
+        std::fs::write(session.left.join(name), "existing").unwrap();
+    }
+
+    let file = session.dialog(Tool::NewFile);
+    assert_eq!(file.primary, "untitled2.txt");
+    session.submit(&file);
+    assert_eq!(
+        session.app.engine.tab(Side::Left).current().unwrap().path,
+        session.left.join("untitled2.txt")
+    );
+    assert_eq!(
+        std::fs::read_to_string(session.left.join("untitled1.txt")).unwrap(),
+        "existing"
+    );
+    assert_eq!(session.dialog(Tool::NewFile).primary, "untitled4.txt");
+}
+
+#[test]
 fn create_rename_link_and_comment_dialogs_validate_and_apply() {
     let mut session = Session::new();
     let mut folder = session.dialog(Tool::NewFolder);
@@ -101,7 +122,10 @@ fn create_rename_link_and_comment_dialogs_validate_and_apply() {
     session.submit(&file);
     let created = session.left.join("created.txt");
     std::fs::write(&created, "new content").unwrap();
-    session.focus(&created);
+    assert_eq!(
+        session.app.engine.tab(Side::Left).current().unwrap().path,
+        created
+    );
 
     let mut rename = session.dialog(Tool::Rename);
     assert_eq!(rename.primary, "created.txt");

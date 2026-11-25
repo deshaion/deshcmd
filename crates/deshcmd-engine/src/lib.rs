@@ -589,19 +589,38 @@ impl Tab {
         } else {
             self.pending_cursor.take()
         };
-        if let Some(path) = &pending_cursor {
+        if let Some(path) = &pending_cursor
+            && view.position(path).is_some()
+        {
             self.cursor = Some(path.clone());
         }
         if let Some(marks) = marks {
             self.selected = marks.retained;
             self.selected_bytes = marks.bytes;
         }
+        let previous_position = self.cursor_position;
         self.cursor_position = self.cursor.as_deref().and_then(|path| view.position(path));
+        let mut neighbor_restored = false;
+        if self.cursor_position.is_none()
+            && !view.visible.is_empty()
+            && !view.raw.partial
+            && let Some(path) = self.cursor.as_deref()
+            && view.raw.index(path).is_none()
+            && let Some(position) = previous_position
+            && let Some((path, new_position)) = (position + 1..self.visible_count())
+                .chain((0..position).rev())
+                .filter_map(|index| self.visible_entry(index))
+                .find_map(|entry| view.position(&entry.path).map(|pos| (&entry.path, pos)))
+        {
+            self.cursor = Some(path.clone());
+            self.cursor_position = Some(new_position);
+            neighbor_restored = true;
+        }
         self.anchor_position = self.anchor.as_deref().and_then(|path| view.position(path));
         self.skipped = view.raw.skipped;
         self.view = view;
         self.finish_view();
-        if pending_cursor.is_some() && pending_cursor == self.cursor {
+        if neighbor_restored || (pending_cursor.is_some() && pending_cursor == self.cursor) {
             self.anchor.clone_from(&self.cursor);
             self.anchor_position = self.cursor_position;
             self.cursor_restored = true;
@@ -768,6 +787,11 @@ pub enum Command {
     LoadFavorite(usize, bool),
     RemoveFavorite(usize),
     Queue(Operation, bool),
+    CreateFile {
+        side: Side,
+        path: PathBuf,
+        hold: bool,
+    },
     PauseJob(u64),
     ResumeJob(u64),
     CancelJob(u64),
@@ -815,6 +839,7 @@ pub struct Job {
     pub warnings: Vec<String>,
     pub conflict: Option<Conflict>,
     operation: Option<Operation>,
+    focus_on_success: Option<(u64, PathBuf)>,
     control: Arc<Control>,
 }
 
@@ -1414,24 +1439,10 @@ impl Engine {
                     self.settings.favorites.remove(index);
                 }
             }
-            Command::Queue(operation, hold) => {
-                self.ids += 1;
-                self.jobs.push(Job {
-                    id: self.ids,
-                    title: operation.label(),
-                    state: if hold {
-                        JobState::Held
-                    } else {
-                        JobState::Queued
-                    },
-                    progress: Progress::default(),
-                    started: None,
-                    message: String::new(),
-                    warnings: Vec::new(),
-                    conflict: None,
-                    operation: Some(operation),
-                    control: Arc::default(),
-                });
+            Command::Queue(operation, hold) => self.queue_job(operation, hold, None),
+            Command::CreateFile { side, path, hold } => {
+                let focus = (self.tab(side).id, path.clone());
+                self.queue_job(Operation::Create(path), hold, Some(focus));
             }
             Command::PauseJob(id) => {
                 if let Some(job) = self.jobs.iter_mut().find(|job| job.id == id) {
@@ -2067,6 +2078,32 @@ impl Engine {
             }
         }
     }
+    fn queue_job(
+        &mut self,
+        operation: Operation,
+        hold: bool,
+        focus_on_success: Option<(u64, PathBuf)>,
+    ) {
+        self.ids += 1;
+        self.jobs.push(Job {
+            id: self.ids,
+            title: operation.label(),
+            state: if hold {
+                JobState::Held
+            } else {
+                JobState::Queued
+            },
+            progress: Progress::default(),
+            started: None,
+            message: String::new(),
+            warnings: Vec::new(),
+            conflict: None,
+            operation: Some(operation),
+            focus_on_success,
+            control: Arc::default(),
+        });
+    }
+
     fn start_job(&mut self) {
         if self.running.is_some() {
             return;
@@ -2298,7 +2335,12 @@ impl Engine {
                     {
                         self.apply_rename_to_tabs(&source, &target);
                     }
+                    let mut created_focus = None;
                     if let Some(job) = self.jobs.iter_mut().find(|job| job.id == id) {
+                        let focus = job.focus_on_success.take();
+                        if result.is_ok() && warnings.is_empty() {
+                            created_focus = focus;
+                        }
                         job.conflict = None;
                         job.warnings = warnings;
                         match result {
@@ -2326,6 +2368,18 @@ impl Engine {
                             job.title,
                             job.message.lines().next().unwrap_or_default()
                         ));
+                    }
+                    if let Some((tab_id, path)) = created_focus
+                        && let Some(tab) = self
+                            .panes
+                            .iter_mut()
+                            .flat_map(|pane| &mut pane.tabs)
+                            .find(|tab| tab.id == tab_id)
+                        && path.parent() == Some(tab.base())
+                        && effects.listing(tab.location(), tab.filter.recursive)
+                    {
+                        tab.pending_cursor = Some(path);
+                        tab.invalidate_scan();
                     }
                     self.running = None;
                     self.invalidate_effects(&effects);

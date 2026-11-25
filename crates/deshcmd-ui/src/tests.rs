@@ -336,6 +336,33 @@ fn panel_navigation_and_preview_shortcuts() {
     press(&mut app, &mut frame, Key::Tab, plain);
     assert_eq!(app.engine.settings.active, side);
 
+    press(&mut app, &mut frame, Key::L, egui::Modifiers::COMMAND);
+    let path_field = panes::path_id(side);
+    assert!(ctx.memory(|memory| memory.has_focus(path_field)));
+    let pos = ctx.read_response(path_field).unwrap().rect.center() + vec2(0., 60.);
+    click(&mut app, &mut frame, pos);
+    draw(&mut app, &mut frame, vec![]);
+    assert!(!ctx.memory(|memory| memory.has_focus(path_field)));
+    draw(&mut app, &mut frame, vec![]);
+    assert!(ctx.read_response(path_field).is_none());
+    assert_eq!(app.engine.tab(side).base(), parent);
+
+    let initially_hidden = app.engine.settings.show_hidden;
+    press(&mut app, &mut frame, Key::Period, ctrl);
+    assert_eq!(app.engine.settings.show_hidden, !initially_hidden);
+    press(&mut app, &mut frame, Key::Period, ctrl);
+    assert_eq!(app.engine.settings.show_hidden, initially_hidden);
+    wait_for_listing(&mut app);
+
+    press(&mut app, &mut frame, Key::F4, egui::Modifiers::SHIFT);
+    assert!(app.dialog.is_some(), "Shift+F4 did not open New text file");
+    app.dialog = None;
+    ctx.memory_mut(|memory| {
+        if let Some(id) = memory.focused() {
+            memory.surrender_focus(id);
+        }
+    });
+
     let menu_button = draw(&mut app, &mut frame, vec![])
         .into_iter()
         .find_map(|shape| match shape.shape {

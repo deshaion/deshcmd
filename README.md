@@ -75,7 +75,7 @@ Update signing authenticates files to DeshCmd. macOS Gatekeeper and Windows Smar
 - Background copy and move with conflict choices, symlink options, masks, and copy verification. Create, rename, trash, delete, link, or change file attributes, and inspect logs and progress from **Queue**.
 - Split and join files, generate and verify checksum manifests, compare a file with a pasted digest, and benchmark supported hash algorithms.
 
-Press **F1** for shortcuts. **Right** opens the focused directory, **Left** goes up one directory, and **Ctrl+Q** toggles the focused file’s preview in the opposite panel. **Tab** switches panels, **Ctrl+L** edits the location, and **F5** and **F6** copy and move to the opposite panel.
+Open **Help → Keyboard shortcuts** or press **F1**. Press **Shift+F4** to create a text file and **Ctrl+.** to toggle hidden files. **Right** opens the focused directory, **Left** goes up one directory, and **Ctrl+Q** toggles the focused file’s preview in the opposite panel. **Tab** switches panels, **Ctrl+L** edits the location, and **F5** and **F6** copy and move to the opposite panel.
 
 Double-click a file or press **Enter** to open it. On Linux and macOS, executable binaries and scripts with a shebang run from their containing folder. Windows uses the system’s default action to launch programs. Images, documents, and other files open in the application associated with their type by the desktop.
 

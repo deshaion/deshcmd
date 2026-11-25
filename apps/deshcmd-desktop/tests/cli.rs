@@ -75,10 +75,10 @@ fn menu_install_writes_and_replaces_the_launcher_in_an_isolated_data_dir() {
     let launcher = data.join("applications/deshcmd.desktop");
     let contents = std::fs::read_to_string(&launcher).unwrap();
     assert!(contents.contains(&format!("Exec=\"{}\"\n", binary.display())));
-    assert!(contents.contains("Icon=deshcmd"));
     assert!(String::from_utf8_lossy(&output.stdout).contains(launcher.to_str().unwrap()));
 
     let installed_icon = data.join("icons/hicolor/scalable/apps/deshcmd.svg");
+    assert!(contents.contains(&format!("Icon={}\n", installed_icon.display())));
     assert_eq!(
         std::fs::read(&installed_icon).unwrap(),
         include_bytes!("../../../packaging/linux/deshcmd.svg")

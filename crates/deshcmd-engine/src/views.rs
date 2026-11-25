@@ -83,7 +83,7 @@ impl Raw {
         self.bytes
     }
 
-    fn index(&self, path: &Path) -> Option<usize> {
+    pub fn index(&self, path: &Path) -> Option<usize> {
         let &index = self.by_path.get(&self.hash.hash_one(path))?;
         if index == ABSENT {
             // Native path equality remains authoritative in the event of a collision.

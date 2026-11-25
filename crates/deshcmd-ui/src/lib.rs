@@ -103,6 +103,7 @@ struct Interface {
     focus_scroll: Option<Side>,
     closing: bool,
     show_help: bool,
+    show_about: bool,
 }
 
 type DialogRead = Box<dyn FnOnce(&mut App, &egui::Context) + Send>;
@@ -418,18 +419,6 @@ impl App {
             Layout::left_to_right(Align::Center),
         );
         toolbar.spacing_mut().item_spacing.x = 5.;
-        if action(
-            &mut toolbar,
-            Icon::Plus,
-            if compact { "" } else { "New" },
-            "Create a folder or file",
-            true,
-            true,
-        )
-        .clicked()
-        {
-            actions.push(Action::Tool(side, Tool::NewFolder));
-        }
         toolbar.menu_button("File", |ui| dialogs::file_menu(ui, side, actions));
         toolbar.menu_button("Select", |ui| dialogs::selection_menu(ui, side, actions));
         toolbar.menu_button("View", |ui| self.view_menu(ui, side, actions));
@@ -437,6 +426,16 @@ impl App {
             dialogs::tools_menu(ui, side, actions);
             if self.desktop.supports_updates() && ui.button("Check for Updates…").clicked() {
                 actions.push(Action::CheckForUpdates);
+                ui.close();
+            }
+        });
+        toolbar.menu_button("Help", |ui| {
+            if ui.button("Keyboard shortcuts · F1").clicked() {
+                self.interface.show_help = true;
+                ui.close();
+            }
+            if ui.button("About DeshCmd").clicked() {
+                self.interface.show_about = true;
                 ui.close();
             }
         });
@@ -565,7 +564,7 @@ impl App {
             ui.close();
         }
         if ui
-            .selectable_label(self.engine.settings.show_hidden, "Hidden files")
+            .selectable_label(self.engine.settings.show_hidden, "Hidden files · Ctrl+.")
             .clicked()
         {
             actions.push(Action::Command(Command::ToggleHidden));
@@ -795,10 +794,6 @@ impl App {
                 actions.push(command);
             }
         }
-        footer.separator();
-        if footer.button(label("Shortcuts", 12., SUB)).clicked() {
-            self.interface.show_help = true;
-        }
         footer.with_layout(Layout::right_to_left(Align::Center), |ui| {
             if let Some((message, _)) = &self.interface.notice {
                 let response = ui.add(egui::Label::new(label(message, 12., AMBER)).truncate());
@@ -977,6 +972,7 @@ impl App {
             || self.update.is_some()
             || self.preferences.is_some()
             || self.interface.show_help
+            || self.interface.show_about
             || self.engine.jobs.iter().any(|job| job.conflict.is_some());
         if text_context {
             let event = if copy.is_some() {
@@ -1028,6 +1024,7 @@ impl App {
             || self.update.is_some()
             || self.preferences.is_some()
             || self.interface.show_help
+            || self.interface.show_about
             || egui::Popup::is_any_open(ctx)
             || self.engine.jobs.iter().any(|job| job.conflict.is_some())
         {
@@ -1247,6 +1244,12 @@ impl App {
         if just(Key::F3) || exact(egui::Modifiers::CTRL, Key::Q) {
             actions.push(Action::ToggleQuick(side));
         }
+        if initial_press(egui::Modifiers::CTRL, Key::Period) {
+            actions.push(Action::Command(Command::ToggleHidden));
+        }
+        if initial_press(egui::Modifiers::SHIFT, Key::F4) {
+            actions.push(Action::Tool(side, Tool::NewFile));
+        }
         if shift(Key::F5) {
             actions.push(Action::Tool(side, Tool::CopyHere));
         }
@@ -1307,8 +1310,10 @@ impl App {
                             ("Shift + Up / Down", "Extend selection"),
                             ("Ctrl + A / I", "Mark all or invert marks"),
                             ("Ctrl + F / R", "Open filter options or refresh"),
+                            ("Ctrl + .", "Toggle hidden files"),
                             ("F2", "Rename"),
                             ("Ctrl + Q / F3", "Toggle Quick View"),
+                            ("Shift + F4", "Create text file"),
                             ("F5 / F6", "Copy or move to opposite panel"),
                             ("Shift + F5", "Copy in same folder"),
                             ("F7 / F8", "Create folder or move to Trash"),
@@ -1590,6 +1595,17 @@ impl eframe::App for App {
         }
         if self.interface.show_help {
             self.shortcuts(&ctx);
+        }
+        if self.interface.show_about {
+            egui::Window::new("About DeshCmd")
+                .open(&mut self.interface.show_about)
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0., 0.])
+                .show(&ctx, |ui| {
+                    ui.label(format!("Version {}", env!("CARGO_PKG_VERSION")));
+                    ui.label("Dual-pane file manager");
+                });
         }
         self.update_dialog(&ctx);
         self.publish_text_clipboard(&ctx);
