@@ -16,6 +16,9 @@ impl Desktop for TestDesktop {
             .unwrap();
         Ok(())
     }
+    fn open_terminal(&mut self, _: &Path) -> Result<(), String> {
+        unreachable!()
+    }
     fn pick_file(&mut self, _: &Path, _: &str) -> Option<PathBuf> {
         unreachable!()
     }

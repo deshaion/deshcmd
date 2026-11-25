@@ -38,6 +38,8 @@ Press **F1** for shortcuts. **Right** opens the focused directory, **Left** goes
 
 Double-click a file or press **Enter** to open it. On Linux and macOS, executable binaries and scripts with a shebang run from their containing folder. Windows uses the system’s default action to launch programs. Images, documents, and other files open in the application associated with their type by the desktop.
 
+Press **F9** or choose **Tools → Open Terminal** to start an external terminal in the active panel's folder.
+
 This version supports local files, mounted locations, and virtual path lists. Archive and plugin-backed volumes in [Features.md](Features.md). The deshcmd workspace and bookmark interchange format is JSON. The integrity tools support 22 checksum options, including SFV. HAVAL and native ACL editing remain outside this version. Trash, volume discovery, and system clipboard behavior depend on the desktop. Linux/X11 is the verified desktop target.
 
 ## Workspace

@@ -11,6 +11,7 @@ use crate::{Action, App, FileClipboard, theme::*};
 
 #[derive(Clone, Copy)]
 pub(crate) enum Tool {
+    OpenTerminal,
     NewFolder,
     NewFile,
     Copy,
@@ -272,6 +273,7 @@ pub(crate) fn selection_menu(ui: &mut Ui, side: Side, actions: &mut Vec<Action>)
 pub(crate) fn tools_menu(ui: &mut Ui, side: Side, actions: &mut Vec<Action>) {
     menu_item(ui, side, "Settings…", Tool::Settings, actions);
     ui.separator();
+    menu_item(ui, side, "Open Terminal · F9", Tool::OpenTerminal, actions);
     ui.menu_button("Workspace", |ui| {
         cmd(
             ui,
@@ -384,6 +386,15 @@ impl App {
         let missing = || "Select one file or folder to use this command";
         let empty = || "Select a file or folder first";
         let mut result = match tool {
+            Tool::OpenTerminal => {
+                if let Err(error) = self.desktop.open_terminal(&base) {
+                    self.notice(format!(
+                        "Could not open terminal in {}. {error}",
+                        base.display()
+                    ));
+                }
+                None
+            }
             Tool::Copy | Tool::CopyHere | Tool::Move if tab.has_operands() => {
                 Some(Dialog::transfer(
                     side,

@@ -29,6 +29,7 @@ pub struct Place {
 
 pub trait Desktop {
     fn open(&mut self, path: &Path) -> Result<(), String>;
+    fn open_terminal(&mut self, directory: &Path) -> Result<(), String>;
     fn pick_file(&mut self, initial: &Path, title: &str) -> Option<PathBuf>;
     fn save_file(&mut self, initial: &Path, name: &str, title: &str) -> Option<PathBuf>;
     fn pick_directory(&mut self, initial: &Path, title: &str) -> Option<PathBuf>;
@@ -882,6 +883,22 @@ impl App {
             self.interface.show_help = true;
             return;
         }
+        if ctx.input(|input| {
+            input.events.iter().any(|event| {
+                matches!(
+                    event,
+                    egui::Event::Key {
+                        key: Key::F9,
+                        modifiers: egui::Modifiers::NONE,
+                        pressed: true,
+                        repeat: false,
+                        ..
+                    }
+                )
+            })
+        }) {
+            actions.push(Action::Tool(side, Tool::OpenTerminal));
+        }
         if command(Key::L) {
             self.interface.panes[side.index()].start_path();
             return;
@@ -1044,6 +1061,7 @@ impl App {
                             ("F5 / F6", "Copy or move to opposite panel"),
                             ("Shift + F5", "Copy in same folder"),
                             ("F7 / F8", "Create folder or move to Trash"),
+                            ("F9", "Open terminal in active folder"),
                             ("Shift + Delete", "Delete permanently"),
                             ("Ctrl + C / X / V", "Copy, cut, or paste files"),
                         ] {
