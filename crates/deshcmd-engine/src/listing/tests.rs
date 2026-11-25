@@ -361,3 +361,91 @@ fn enumeration_metadata_keeps_windows_hidden_and_system_attributes() {
     assert_eq!(listing.entries.len(), 2);
     assert!(listing.entries.iter().all(|entry| entry.hidden));
 }
+
+#[test]
+fn quick_preview_distinguishes_text_images_and_unavailable_content() {
+    let fixture = tempfile::tempdir().unwrap();
+    let root = fixture.path();
+    let text = root.join("text.txt");
+    fs::write(&text, "Café\n").unwrap();
+    assert!(
+        matches!(preview(&text, Kind::Text, 16), Preview::Text(content) if content == "Café\n")
+    );
+    for bytes in [b"a\0b".as_slice(), b"a\xffb"] {
+        fs::write(&text, bytes).unwrap();
+        assert!(matches!(
+            preview(&text, Kind::Text, 16),
+            Preview::Unavailable
+        ));
+    }
+    let mut truncated = vec![b'a'; TEXT_PREVIEW_BYTES as usize - 1];
+    truncated.extend_from_slice("é".as_bytes());
+    fs::write(&text, truncated).unwrap();
+    assert!(
+        matches!(preview(&text, Kind::Text, 16), Preview::Text(content) if content.len() == TEXT_PREVIEW_BYTES as usize - 1)
+    );
+    for path in [root.join("missing"), root.to_path_buf()] {
+        assert!(matches!(
+            preview(&path, Kind::Text, 16),
+            Preview::Unavailable
+        ));
+    }
+
+    let picture = root.join("picture.png");
+    let color = image::Rgba([19, 36, 57, 255]);
+    image::RgbaImage::from_pixel(2, 2, color)
+        .save(&picture)
+        .unwrap();
+    assert!(
+        matches!(preview(&picture, Kind::Image, 1), Preview::Image { size: [1, 1], rgba } if rgba == color.0)
+    );
+    assert!(matches!(
+        preview(&text, Kind::Image, 16),
+        Preview::Unavailable
+    ));
+}
+
+#[test]
+fn listing_labels_and_archive_display_paths_distinguish_entry_kinds() {
+    assert_eq!(
+        [
+            Kind::Folder,
+            Kind::Image,
+            Kind::Audio,
+            Kind::Video,
+            Kind::Archive,
+            Kind::Code,
+            Kind::Text,
+            Kind::Other
+        ]
+        .map(Kind::label),
+        [
+            "Folder", "Image", "Audio", "Video", "Archive", "Code", "Document", "File"
+        ],
+    );
+    assert_eq!(
+        Column::ALL.map(Column::label),
+        [
+            "Name",
+            "Size",
+            "Modified",
+            "Kind",
+            "Extension",
+            "Path",
+            "Permissions",
+            "Comment"
+        ]
+    );
+    let file = PathBuf::from("folder/sample.zip");
+    for (folder, display_path) in [
+        (PathBuf::new(), file.clone()),
+        (PathBuf::from("contents"), file.join("contents")),
+    ] {
+        let location = Location::Archive {
+            file: file.clone(),
+            folder,
+        };
+        assert_eq!(location.base(), Path::new("folder"));
+        assert_eq!(location.display_path(), display_path);
+    }
+}

@@ -496,7 +496,7 @@ impl Worker<'_> {
             } => {
                 if symbolic {
                     let points_to = if relative {
-                        relative_to(parent(&target)?, &source)?
+                        relative_to(&parent(&target)?.canonicalize()?, &source)?
                     } else {
                         source.clone()
                     };
@@ -1928,9 +1928,10 @@ impl Worker<'_> {
         let count = by_output.len();
         for (manifest, paths) in by_output {
             let folder = parent(&manifest)?;
+            let relative_base = folder.canonicalize()?;
             let mut temporary = NamedTempFile::new_in(folder)?;
             for path in paths {
-                let relative = relative_to(folder, &path)?;
+                let relative = relative_to(&relative_base, &path)?;
                 let path_text = relative
                     .to_str()
                     .ok_or_else(|| io::Error::other("Checksum manifests require UTF-8 paths"))?;
