@@ -1,3 +1,4 @@
+mod about;
 mod dialogs;
 mod panes;
 mod probes;
@@ -103,7 +104,7 @@ struct Interface {
     focus_scroll: Option<Side>,
     closing: bool,
     show_help: bool,
-    show_about: bool,
+    about: Option<about::About>,
 }
 
 type DialogRead = Box<dyn FnOnce(&mut App, &egui::Context) + Send>;
@@ -440,7 +441,7 @@ impl App {
                 ui.close();
             }
             if ui.button("About DeshCmd").clicked() {
-                self.interface.show_about = true;
+                self.interface.about = Some(about::About::new());
                 ui.close();
             }
         });
@@ -977,7 +978,7 @@ impl App {
             || self.update.is_some()
             || self.preferences.is_some()
             || self.interface.show_help
-            || self.interface.show_about
+            || self.interface.about.is_some()
             || self.engine.jobs.iter().any(|job| job.conflict.is_some());
         if text_context {
             let event = if copy.is_some() {
@@ -1029,7 +1030,7 @@ impl App {
             || self.update.is_some()
             || self.preferences.is_some()
             || self.interface.show_help
-            || self.interface.show_about
+            || self.interface.about.is_some()
             || egui::Popup::is_any_open(ctx)
             || self.engine.jobs.iter().any(|job| job.conflict.is_some())
         {
@@ -1601,16 +1602,10 @@ impl eframe::App for App {
         if self.interface.show_help {
             self.shortcuts(&ctx);
         }
-        if self.interface.show_about {
-            egui::Window::new("About DeshCmd")
-                .open(&mut self.interface.show_about)
-                .collapsible(false)
-                .resizable(false)
-                .anchor(egui::Align2::CENTER_CENTER, [0., 0.])
-                .show(&ctx, |ui| {
-                    ui.label(format!("Version {}", env!("CARGO_PKG_VERSION")));
-                    ui.label("Dual-pane file manager");
-                });
+        if let Some(about) = &mut self.interface.about
+            && !about.show(&ctx)
+        {
+            self.interface.about = None;
         }
         self.update_dialog(&ctx);
         self.publish_text_clipboard(&ctx);
