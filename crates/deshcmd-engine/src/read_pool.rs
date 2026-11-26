@@ -29,7 +29,7 @@ impl Cancellation {
         }
     }
 
-    fn cancel(&self) {
+    pub fn cancel(&self) {
         #[cfg(feature = "perf")]
         if let Some(at) = crate::perf::timestamp() {
             let _ = self.1.set(at);
@@ -138,6 +138,33 @@ impl<K: Copy + Eq + Send + 'static, R: Send + 'static> ReadPool<K, R> {
         state.pending.push_back((key, Box::new(run)));
         self.0.changed.notify_all();
         true
+    }
+
+    /// Remove a request that has not started so a higher-priority worker can take it.
+    pub fn remove_pending(&self, key: K) -> bool {
+        let mut state = self.0.state.lock().unwrap();
+        if let Some(index) = state
+            .pending
+            .iter()
+            .position(|(pending, _)| *pending == key)
+        {
+            state.pending.remove(index);
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn prioritize(&self, key: K) {
+        let mut state = self.0.state.lock().unwrap();
+        if let Some(index) = state
+            .pending
+            .iter()
+            .position(|(pending, _)| *pending == key)
+        {
+            let request = state.pending.remove(index).unwrap();
+            state.pending.push_front(request);
+        }
     }
 
     pub fn retain(&self, keep: impl Fn(K) -> bool) {

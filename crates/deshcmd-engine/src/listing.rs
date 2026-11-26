@@ -778,49 +778,67 @@ pub enum Preview {
     Unavailable,
 }
 pub fn preview(path: &Path, kind: Kind, pixels: u32) -> Preview {
-    if kind == Kind::Image {
-        let result = (|| {
-            let mut reader = image::ImageReader::open(path)
-                .ok()?
-                .with_guessed_format()
-                .ok()?;
+    preview_cancellable(path, kind, pixels, &Default::default())
+}
+
+pub fn preview_cancellable(
+    path: &Path,
+    kind: Kind,
+    pixels: u32,
+    cancel: &crate::read_pool::Cancellation,
+) -> Preview {
+    let result = (|| -> io::Result<Preview> {
+        cancel.check()?;
+        if kind == Kind::Image {
+            let mut reader = image::ImageReader::open(path)?.with_guessed_format()?;
             let mut limits = image::Limits::default();
             limits.max_image_width = Some(12_000);
             limits.max_image_height = Some(12_000);
             limits.max_alloc = Some(128 * 1024 * 1024);
             reader.limits(limits);
-            let image = reader.decode().ok()?.thumbnail(pixels, pixels).into_rgba8();
-            Some(Preview::Image {
+            cancel.check()?;
+            let decoded = reader.decode().map_err(io::Error::other)?;
+            cancel.check()?;
+            let thumbnail = decoded.thumbnail(pixels, pixels);
+            drop(decoded);
+            cancel.check()?;
+            let image = thumbnail.into_rgba8();
+            return Ok(Preview::Image {
                 size: [image.width() as usize, image.height() as usize],
                 rgba: image.into_raw(),
-            })
-        })();
-        return result.unwrap_or(Preview::Unavailable);
-    }
-    let Ok(meta) = path.metadata() else {
-        return Preview::Unavailable;
-    };
-    if !meta.is_file() {
-        return Preview::Unavailable;
-    }
-    let mut bytes = Vec::new();
-    if File::open(path)
-        .and_then(|file| file.take(TEXT_PREVIEW_BYTES).read_to_end(&mut bytes))
-        .is_err()
-    {
-        return Preview::Unavailable;
-    }
-    if bytes.contains(&0) {
-        return Preview::Unavailable;
-    }
-    match String::from_utf8(bytes) {
-        Ok(text) => Preview::Text(text),
-        Err(error) if error.utf8_error().error_len().is_none() => {
-            let end = error.utf8_error().valid_up_to();
-            Preview::Text(String::from_utf8_lossy(&error.as_bytes()[..end]).to_string())
+            });
         }
-        Err(_) => Preview::Unavailable,
-    }
+
+        if !path.metadata()?.is_file() {
+            return Ok(Preview::Unavailable);
+        }
+        let mut file = File::open(path)?.take(TEXT_PREVIEW_BYTES);
+        let mut bytes = Vec::new();
+        let mut block = [0; 8192];
+        loop {
+            cancel.check()?;
+            let count = match file.read(&mut block) {
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                result => result?,
+            };
+            if count == 0 {
+                break;
+            }
+            bytes.extend_from_slice(&block[..count]);
+        }
+        if bytes.contains(&0) {
+            return Ok(Preview::Unavailable);
+        }
+        Ok(match String::from_utf8(bytes) {
+            Ok(text) => Preview::Text(text),
+            Err(error) if error.utf8_error().error_len().is_none() => {
+                let end = error.utf8_error().valid_up_to();
+                Preview::Text(String::from_utf8_lossy(&error.as_bytes()[..end]).into_owned())
+            }
+            Err(_) => Preview::Unavailable,
+        })
+    })();
+    result.unwrap_or(Preview::Unavailable)
 }
 
 #[cfg(test)]

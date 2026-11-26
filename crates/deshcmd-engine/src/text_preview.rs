@@ -32,6 +32,15 @@ impl TextPreviewReader {
     }
 
     pub fn read_window(&mut self, block: u64) -> io::Result<TextPreviewWindow> {
+        self.read_window_cancellable(block, &Default::default())
+    }
+
+    pub fn read_window_cancellable(
+        &mut self,
+        block: u64,
+        cancel: &crate::read_pool::Cancellation,
+    ) -> io::Result<TextPreviewWindow> {
+        cancel.check()?;
         if block > Self::block(self.len.saturating_sub(1)) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -44,7 +53,10 @@ impl TextPreviewReader {
         let end = (last * BLOCK_BYTES + MAX_ROW_BYTES as u64 + 4).min(self.len);
         let mut bytes = vec![0; end.saturating_sub(base) as usize];
         self.file.seek(SeekFrom::Start(base))?;
-        self.file.read_exact(&mut bytes)?;
+        for buffer in bytes.chunks_mut(32 * 1024) {
+            cancel.check()?;
+            self.file.read_exact(buffer)?;
+        }
 
         // Neighboring windows use the same block boundaries so their rows agree.
         let mut start = if first == 0 { 0 } else { boundary(&bytes, 0) };
@@ -53,6 +65,7 @@ impl TextPreviewReader {
             rows: Vec::new(),
         };
         for block in first + 1..=last {
+            cancel.check()?;
             let nominal = ((block - first) * BLOCK_BYTES) as usize;
             let end = boundary(&bytes, nominal);
             for line in bytes[start..end].split_inclusive(|&byte| byte == b'\n') {

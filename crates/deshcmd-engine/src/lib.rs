@@ -5,6 +5,7 @@ mod navigation;
 mod operations;
 #[cfg(feature = "perf")]
 mod perf;
+mod preview_cache;
 pub mod read_pool;
 mod snapshots;
 #[cfg(test)]
@@ -27,11 +28,13 @@ pub use archives::{
 };
 pub use listing::{
     Column, Entry, Kind, Location, MatchOptions, Preview, Sort, TEXT_PREVIEW_BYTES, View, preview,
+    preview_cancellable,
 };
 pub use operations::{
     Algorithm, Collision, Conflict, ManifestMode, Operation, Progress, TransferOptions,
 };
 use operations::{Control, Worker};
+pub use preview_cache::PreviewDiskCache;
 pub use snapshots::ListingStats;
 pub use text_preview::{TextPreviewReader, TextPreviewWindow};
 

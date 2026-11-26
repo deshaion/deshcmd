@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::sync::mpsc;
 use std::time::SystemTime;
 
-use deshcmd_engine::{Entry, TextPreviewReader, TextPreviewWindow};
+use deshcmd_engine::{Entry, TextPreviewReader, TextPreviewWindow, read_pool::Cancellation};
 use eframe::egui::{self, FontId, Rect, Sense, Ui, pos2, vec2};
 
 use crate::{child, theme::*};
@@ -15,6 +15,7 @@ pub(crate) struct LargeTextView {
     modified: Option<SystemTime>,
     len: u64,
     requests: mpsc::Sender<u64>,
+    cancel: Cancellation,
     results: mpsc::Receiver<io::Result<TextPreviewWindow>>,
     loading: bool,
     requested: Option<u64>,
@@ -25,21 +26,36 @@ pub(crate) struct LargeTextView {
     thumb_grab: f32,
 }
 
+impl Drop for LargeTextView {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+    }
+}
+
 impl LargeTextView {
     pub fn new(entry: &Entry, ctx: egui::Context) -> Self {
         let (requests, read) = mpsc::channel();
         let (write, results) = mpsc::channel();
         let path = entry.path.clone();
         let len = entry.size;
+        let cancel = Cancellation::default();
+        let read_cancel = cancel.clone();
         std::thread::spawn(move || {
             let mut reader = None;
             while let Ok(block) = read.recv() {
                 let result = (|| {
+                    read_cancel.check()?;
                     if reader.is_none() {
                         reader = Some(TextPreviewReader::open(&path, len)?);
                     }
-                    reader.as_mut().unwrap().read_window(block)
+                    reader
+                        .as_mut()
+                        .unwrap()
+                        .read_window_cancellable(block, &read_cancel)
                 })();
+                if read_cancel.cancelled() {
+                    break;
+                }
                 let failed = result.is_err();
                 if write.send(result).is_err() {
                     break;
@@ -55,6 +71,7 @@ impl LargeTextView {
             modified: entry.modified,
             len,
             requests,
+            cancel,
             results,
             loading: false,
             requested: None,

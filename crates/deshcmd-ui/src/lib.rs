@@ -1,5 +1,6 @@
 mod dialogs;
 mod panes;
+mod previews;
 mod probes;
 mod settings;
 mod text_preview;
@@ -7,19 +8,20 @@ mod theme;
 mod updates;
 mod window;
 
-use std::collections::{HashMap, HashSet};
+#[cfg(test)]
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+#[cfg(test)]
 use std::sync::mpsc;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 
 use deshcmd_engine::{self as engine, Command, Engine, Entry, JobState, Settings, Side, Step};
 use eframe::egui;
-use egui::{
-    Align, ColorImage, Id, Key, Layout, Rect, Sense, TextureHandle, Ui, UiBuilder, pos2, vec2,
-};
+use egui::{Align, Id, Key, Layout, Rect, Sense, Ui, UiBuilder, pos2, vec2};
 
 use dialogs::{Dialog, Tool};
 use panes::PanelUi;
+use previews::Previews;
 use theme::*;
 pub use updates::{DesktopUpdate, UpdateCheck};
 
@@ -37,6 +39,9 @@ pub struct Place {
 }
 
 pub trait Desktop {
+    fn preview_cache_directory(&self) -> Option<PathBuf> {
+        None
+    }
     fn supports_updates(&self) -> bool {
         false
     }
@@ -169,6 +174,7 @@ impl App {
             initial[0].clone(),
             settings.panes[Side::Right.index()].tabs.is_empty(),
         );
+        let preview_cache = desktop.preview_cache_directory();
         let ctx = context.egui_ctx.clone();
         let engine = Engine::new(home, initial, settings, move || ctx.request_repaint());
         Self {
@@ -207,7 +213,7 @@ impl App {
             dialog_revision: 0,
             startup_defaults: Some(startup_defaults),
             startup_home: None,
-            previews: Previews::new(context.egui_ctx.clone()),
+            previews: Previews::new(context.egui_ctx.clone(), preview_cache),
             update: None,
             update_check: None,
         }
@@ -1467,6 +1473,11 @@ impl App {
             );
         }
 
+        let source = self.interface.quick.unwrap_or(self.engine.settings.active);
+        let source_tab = self.engine.tab(source);
+        let page = self.interface.panes[source.index()].preview_page(source_tab);
+        self.previews
+            .update(source_tab, self.interface.quick.is_some(), page);
         for (side, rect) in Side::ALL.into_iter().zip([panel1, panel2]) {
             let quick = self.interface.quick.filter(|source| source.other() == side);
             let cursor_restored = quick.is_none() && self.engine.take_cursor_restored(side);
@@ -1503,6 +1514,7 @@ impl App {
                 actions,
             );
         }
+        self.previews.finish_frame();
         self.interface.focus_scroll = None;
         let dropped = ui.ctx().input(|input| {
             input
@@ -1544,7 +1556,6 @@ impl eframe::App for App {
         self.poll_startup_home();
         self.poll_update();
         self.record_notice();
-        self.previews.poll();
         self.places_cache.poll();
         let read_places = self.read_places;
         if let Some(places) = self.places_cache.request((), move |()| Some(read_places())) {
@@ -1653,109 +1664,6 @@ fn child(ui: &mut Ui, id: Id, rect: Rect, layout: Layout) -> Ui {
     let mut child = ui.new_child(UiBuilder::new().id_salt(id).max_rect(rect).layout(layout));
     child.set_clip_rect(clip);
     child
-}
-
-#[derive(Clone, PartialEq, Eq, Hash)]
-enum PreviewRevision {
-    Local(Option<SystemTime>),
-    Archive(u64),
-}
-type PreviewKey = (PathBuf, PreviewRevision, u32);
-enum CachedPreview {
-    Image(TextureHandle, egui::Vec2),
-    Text(String),
-    None,
-}
-
-struct Previews {
-    ctx: egui::Context,
-    requests: mpsc::SyncSender<PreviewRequest>,
-    results: mpsc::Receiver<(PreviewKey, engine::Preview)>,
-    pending: HashSet<PreviewKey>,
-    cached: HashMap<PreviewKey, CachedPreview>,
-    order: std::collections::VecDeque<PreviewKey>,
-}
-
-type PreviewRequest = (
-    PreviewKey,
-    engine::Kind,
-    Option<std::sync::Arc<engine::ArchiveSource>>,
-);
-
-impl Previews {
-    fn new(ctx: egui::Context) -> Self {
-        let (requests, receive) = mpsc::sync_channel::<PreviewRequest>(32);
-        let (send, results) = mpsc::channel();
-        let wake = ctx.clone();
-        std::thread::spawn(move || {
-            while let Ok((key, kind, archive)) = receive.recv() {
-                let preview = if let Some(archive) = archive {
-                    match key.0.strip_prefix(&archive.file) {
-                        Ok(member) => archive.preview(member, kind, key.2),
-                        Err(_) => engine::Preview::Unavailable,
-                    }
-                } else {
-                    engine::preview(&key.0, kind, key.2)
-                };
-                if send.send((key, preview)).is_err() {
-                    break;
-                }
-                wake.request_repaint();
-            }
-        });
-        Self {
-            ctx,
-            requests,
-            results,
-            pending: HashSet::new(),
-            cached: HashMap::new(),
-            order: Default::default(),
-        }
-    }
-    fn get(&mut self, entry: &Entry, size: u32) -> Option<&CachedPreview> {
-        let revision = entry
-            .archive
-            .as_ref()
-            .map_or(PreviewRevision::Local(entry.modified), |archive| {
-                PreviewRevision::Archive(archive.revision)
-            });
-        let key = (entry.path.clone(), revision, size);
-        if !self.cached.contains_key(&key)
-            && !self.pending.contains(&key)
-            && self
-                .requests
-                .try_send((key.clone(), entry.kind, entry.archive.clone()))
-                .is_ok()
-        {
-            self.pending.insert(key.clone());
-        }
-        self.cached.get(&key)
-    }
-    fn poll(&mut self) {
-        while let Ok((key, preview)) = self.results.try_recv() {
-            self.pending.remove(&key);
-            let cached = match preview {
-                engine::Preview::Image { size, rgba } => {
-                    let image = ColorImage::from_rgba_unmultiplied(size, &rgba);
-                    let texture = self.ctx.load_texture(
-                        key.0.display().to_string(),
-                        image,
-                        egui::TextureOptions::LINEAR,
-                    );
-                    CachedPreview::Image(texture, vec2(size[0] as f32, size[1] as f32))
-                }
-                engine::Preview::Text(text) => CachedPreview::Text(text),
-                engine::Preview::Unavailable => CachedPreview::None,
-            };
-            self.cached.insert(key.clone(), cached);
-            self.order.push_back(key);
-            while self.order.len() > 150 {
-                if let Some(old) = self.order.pop_front() {
-                    self.cached.remove(&old);
-                }
-            }
-        }
-    }
 }
 
 #[cfg(all(test, feature = "perf"))]
