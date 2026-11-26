@@ -111,3 +111,79 @@ fn trimming_enforces_byte_and_entry_budgets_and_keeps_recent_thumbnails() {
     assert!(newest.is_file());
     assert!(other.is_file());
 }
+
+#[test]
+fn cache_key_changes_after_same_size_rewrite_with_restored_mtime() {
+    let fixture = tempfile::tempdir().unwrap();
+    let path = fixture.path().canonicalize().unwrap().join("source.png");
+    fs::write(&path, b"first").unwrap();
+    let time = filetime::FileTime::from_unix_time(1_000_000_000, 0);
+    filetime::set_file_mtime(&path, time).unwrap();
+    let Ok(before) = source_key(&path, 720) else {
+        // Some volumes cannot provide a reliable change stamp.
+        return;
+    };
+
+    std::thread::sleep(Duration::from_millis(20));
+    fs::write(&path, b"other").unwrap();
+    filetime::set_file_mtime(&path, time).unwrap();
+    assert_ne!(source_key(&path, 720).unwrap(), before);
+}
+
+#[test]
+fn background_preview_returns_before_the_cache_write() {
+    let fixture = tempfile::tempdir().unwrap();
+    let root = fixture.path().canonicalize().unwrap();
+    let source = root.join("source.png");
+    image::RgbaImage::from_pixel(2, 1, image::Rgba([10, 20, 30, 255]))
+        .save(&source)
+        .unwrap();
+    let cache = PreviewDiskCache::new(root);
+    let key = source_key(&source, 720).unwrap();
+    let target = cache_path(&cache.directory, key);
+    let guard = cache_lock(&cache.directory).unwrap();
+    let (send, result) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = send.send(cache.preview(&source, 720, &Cancellation::default()));
+    });
+    let preview = result.recv_timeout(Duration::from_secs(5));
+    assert!(!target.exists());
+    drop(guard);
+    assert!(matches!(preview, Ok(Preview::Image { .. })));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !target.is_file() {
+        assert!(
+            Instant::now() < deadline,
+            "deferred thumbnail was not written"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+#[test]
+fn startup_reclaims_staging_files_after_live_writer_releases_lock() {
+    let fixture = tempfile::tempdir().unwrap();
+    let root = fixture.path().canonicalize().unwrap();
+    let directory = root.join("previews-v1");
+    let guard = cache_lock(&directory).unwrap();
+    let abandoned = directory.join(format!("{STAGING_PREFIX}abandoned"));
+    let active = directory.join(format!("{STAGING_PREFIX}active"));
+    let unrelated = directory.join("keep-me");
+    for path in [&abandoned, &active, &unrelated] {
+        fs::write(path, b"file").unwrap();
+    }
+    let cache = PreviewDiskCache::new(root);
+    assert!(active.is_file());
+    fs::remove_file(&active).unwrap();
+    drop(guard);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while abandoned.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "abandoned staging file was not removed"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert!(unrelated.is_file());
+    drop(cache);
+}

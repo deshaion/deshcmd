@@ -54,8 +54,7 @@ pub(crate) enum CachedPreview {
     None,
 }
 
-type Decode =
-    dyn Fn(&Key, Kind, Option<&ArchiveSource>, &Cancellation, bool) -> Preview + Send + Sync;
+type Decode = dyn Fn(&Key, Kind, Option<&ArchiveSource>, &Cancellation) -> Preview + Send + Sync;
 type Pool = ReadPool<u64, Option<Preview>>;
 
 pub(crate) struct Previews {
@@ -92,7 +91,7 @@ impl Previews {
         let disk_enabled = disk.is_some();
         let mut previews = Self::with_decoder(
             ctx,
-            Arc::new(move |key, kind, archive, cancel, background| {
+            Arc::new(move |key, kind, archive, cancel| {
                 if let Some(archive) = archive {
                     return key
                         .path
@@ -105,7 +104,7 @@ impl Previews {
                     && key.pixels == QUICK_PIXELS
                     && let Some(disk) = &disk
                 {
-                    return disk.preview(&key.path, key.pixels, cancel, background);
+                    return disk.preview(&key.path, key.pixels, cancel);
                 }
                 engine::preview_cancellable(&key.path, kind, key.pixels, cancel)
             }),
@@ -371,9 +370,12 @@ impl Previews {
         let kind = entry.kind;
         let archive = entry.archive.clone();
         pool.submit(id, move |cancel| {
-            let preview = decoder(&key, kind, archive.as_deref(), cancel, speculative);
+            let preview = decoder(&key, kind, archive.as_deref(), cancel);
             // Enforce the budget before a result enters the pool’s ready slot.
-            if speculative && payload_bytes(&preview) > SPECULATIVE_BYTES {
+            if speculative
+                && (matches!(preview, Preview::Unavailable)
+                    || payload_bytes(&preview) > SPECULATIVE_BYTES)
+            {
                 return None;
             }
             Some(preview)

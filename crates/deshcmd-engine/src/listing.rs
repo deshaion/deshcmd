@@ -789,8 +789,27 @@ pub fn preview_cancellable(
 ) -> Preview {
     let result = (|| -> io::Result<Preview> {
         cancel.check()?;
+        if !path.metadata()?.is_file() {
+            return Ok(Preview::Unavailable);
+        }
+        let mut options = File::options();
+        options.read(true);
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            // The path could become a FIFO between the metadata check and open.
+            options.custom_flags(libc::O_NONBLOCK);
+        }
+        let file = options.open(path)?;
+        if !file.metadata()?.is_file() {
+            return Ok(Preview::Unavailable);
+        }
         if kind == Kind::Image {
-            let mut reader = image::ImageReader::open(path)?.with_guessed_format()?;
+            let mut reader = image::ImageReader::new(io::BufReader::new(file));
+            if let Ok(format) = image::ImageFormat::from_path(path) {
+                reader.set_format(format);
+            }
+            let mut reader = reader.with_guessed_format()?;
             let mut limits = image::Limits::default();
             limits.max_image_width = Some(12_000);
             limits.max_image_height = Some(12_000);
@@ -809,10 +828,7 @@ pub fn preview_cancellable(
             });
         }
 
-        if !path.metadata()?.is_file() {
-            return Ok(Preview::Unavailable);
-        }
-        let mut file = File::open(path)?.take(TEXT_PREVIEW_BYTES);
+        let mut file = file.take(TEXT_PREVIEW_BYTES);
         let mut bytes = Vec::new();
         let mut block = [0; 8192];
         loop {

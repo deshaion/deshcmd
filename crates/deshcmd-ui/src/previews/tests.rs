@@ -33,7 +33,7 @@ fn gated_previews() -> (Previews, mpsc::Receiver<DecodeJob>) {
     let (send, jobs) = mpsc::channel();
     let mut previews = Previews::with_decoder(
         egui::Context::default(),
-        Arc::new(move |key, _, _, cancel, _| {
+        Arc::new(move |key, _, _, cancel| {
             let (finish, result) = mpsc::channel();
             if send
                 .send(DecodeJob {
@@ -322,4 +322,32 @@ fn completes_the_page_without_filling_the_in_memory_neighbor_cache() {
     assert_eq!(previews.warm_cache.len(), 1);
     assert!(previews.warm_pending.is_empty());
     assert!(jobs.try_recv().is_err());
+}
+
+#[test]
+fn focused_preview_retries_a_speculative_failure() {
+    let (mut previews, jobs) = gated_previews();
+    let file = image("source.png");
+    previews.update_quick(Some(&file), &[], false, &[]);
+    let speculative = jobs.recv_timeout(TIMEOUT).unwrap();
+    speculative.finish.send(Preview::Unavailable).unwrap();
+    wait_for(|| {
+        previews.update_quick(Some(&file), &[], false, &[]);
+        !previews
+            .warm_pending
+            .contains_key(&Key::new(&file, QUICK_PIXELS))
+    });
+
+    previews.update_quick(Some(&file), &[], true, &[]);
+    assert!(previews.get(&file, QUICK_PIXELS).is_none());
+    let focused = jobs.recv_timeout(TIMEOUT).unwrap();
+    assert_eq!(focused.path, file.path);
+    focused.finish.send(pixel()).unwrap();
+    wait_for(|| {
+        previews.update_quick(Some(&file), &[], true, &[]);
+        matches!(
+            previews.get(&file, QUICK_PIXELS),
+            Some(CachedPreview::Image(..))
+        )
+    });
 }

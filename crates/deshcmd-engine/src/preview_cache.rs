@@ -14,6 +14,8 @@ const MAX_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_ENTRIES: usize = 512;
 const MAX_FILE_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_EDGE: u32 = 720;
+const WRITE_QUEUE_CAPACITY: usize = 64;
+const STAGING_PREFIX: &str = ".preview-";
 
 pub struct PreviewDiskCache {
     directory: PathBuf,
@@ -30,9 +32,14 @@ impl PreviewDiskCache {
     pub fn new(cache_root: PathBuf) -> Self {
         // Bump the directory version when the key or thumbnail representation changes.
         let directory = cache_root.join("previews-v1");
-        let (writes, pending) = mpsc::sync_channel::<Thumbnail>(2);
+        let (writes, pending) = mpsc::sync_channel::<Thumbnail>(WRITE_QUEUE_CAPACITY);
         let target = directory.clone();
         std::thread::spawn(move || {
+            if target.is_dir()
+                && let Ok(_lock) = cache_lock(&target)
+            {
+                trim(&target, MAX_BYTES, MAX_ENTRIES);
+            }
             while let Ok(thumbnail) = pending.recv() {
                 save(&target, thumbnail);
             }
@@ -40,13 +47,7 @@ impl PreviewDiskCache {
         Self { directory, writes }
     }
 
-    pub fn preview(
-        &self,
-        source: &Path,
-        pixels: u32,
-        cancel: &Cancellation,
-        background: bool,
-    ) -> Preview {
+    pub fn preview(&self, source: &Path, pixels: u32, cancel: &Cancellation) -> Preview {
         let (key, preview) = self.get_or_decode(source, pixels, cancel, || {
             preview_cancellable(source, Kind::Image, pixels, cancel)
         });
@@ -56,11 +57,8 @@ impl PreviewDiskCache {
                 size: *size,
                 rgba: rgba.clone(),
             };
-            if background {
-                save(&self.directory, thumbnail);
-            } else {
-                let _ = self.writes.try_send(thumbnail);
-            }
+            // A slow cache volume never holds up delivery of a decoded preview.
+            let _ = self.writes.try_send(thumbnail);
         }
         preview
     }
@@ -96,7 +94,9 @@ impl PreviewDiskCache {
 }
 
 fn save(directory: &Path, thumbnail: Thumbnail) {
-    if store(directory, thumbnail).is_ok() {
+    if let Ok(_lock) = cache_lock(directory)
+        && store(directory, thumbnail).is_ok()
+    {
         trim(directory, MAX_BYTES, MAX_ENTRIES);
     }
 }
@@ -105,6 +105,12 @@ fn source_key(path: &Path, pixels: u32) -> io::Result<blake3::Hash> {
     if !path.is_absolute() {
         return Err(io::Error::other("Preview cache requires an absolute path"));
     }
+    // Use the same handle for both metadata queries on Windows.
+    #[cfg(windows)]
+    let file = File::open(path)?;
+    #[cfg(windows)]
+    let metadata = file.metadata()?;
+    #[cfg(not(windows))]
     let metadata = path.metadata()?;
     if !metadata.is_file() {
         return Err(io::Error::other("Preview cache requires a regular file"));
@@ -130,8 +136,29 @@ fn source_key(path: &Path, pixels: u32) -> io::Result<blake3::Hash> {
     }
     #[cfg(windows)]
     {
-        use std::os::windows::fs::MetadataExt as _;
-        key.update(&metadata.creation_time().to_le_bytes());
+        use std::os::windows::io::AsRawHandle as _;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_BASIC_INFO, FileBasicInfo, GetFileInformationByHandleEx,
+        };
+
+        let mut info = FILE_BASIC_INFO::default();
+        // SAFETY: The handle remains open and the output buffer has the required layout and size.
+        let success = unsafe {
+            GetFileInformationByHandleEx(
+                file.as_raw_handle(),
+                FileBasicInfo,
+                (&mut info as *mut FILE_BASIC_INFO).cast(),
+                std::mem::size_of::<FILE_BASIC_INFO>() as u32,
+            )
+        };
+        if success == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if info.ChangeTime <= 0 {
+            return Err(io::Error::other("File system did not report a change time"));
+        }
+        key.update(&info.CreationTime.to_le_bytes());
+        key.update(&info.ChangeTime.to_le_bytes());
     }
     Ok(key.finalize())
 }
@@ -161,9 +188,22 @@ fn load(path: &Path, pixels: u32) -> io::Result<Preview> {
     })
 }
 
-fn store(directory: &Path, thumbnail: Thumbnail) -> io::Result<()> {
+fn cache_lock(directory: &Path) -> io::Result<File> {
     fs::create_dir_all(directory)?;
-    let mut file = tempfile::NamedTempFile::new_in(directory)?;
+    let file = File::options()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(directory.join(".write-lock"))?;
+    fs2::FileExt::lock_exclusive(&file)?;
+    Ok(file)
+}
+
+fn store(directory: &Path, thumbnail: Thumbnail) -> io::Result<()> {
+    let mut file = tempfile::Builder::new()
+        .prefix(STAGING_PREFIX)
+        .tempfile_in(directory)?;
     PngEncoder::new_with_quality(
         file.as_file_mut(),
         CompressionType::Fast,
@@ -191,7 +231,17 @@ fn trim(directory: &Path, max_bytes: u64, max_entries: usize) {
     let mut entries = Vec::new();
     for entry in files.flatten() {
         let name = entry.file_name();
-        let Some(hash) = name.to_str().and_then(|name| name.strip_suffix(".png")) else {
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if name.starts_with(STAGING_PREFIX) {
+            // The caller holds the directory lock, so no writer can own this stage.
+            if entry.file_type().is_ok_and(|kind| kind.is_file()) {
+                let _ = fs::remove_file(entry.path());
+            }
+            continue;
+        }
+        let Some(hash) = name.strip_suffix(".png") else {
             continue;
         };
         if hash.len() != 64 || !hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {

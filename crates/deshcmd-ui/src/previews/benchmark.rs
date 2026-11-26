@@ -51,7 +51,7 @@ fn quick_view_prefetch_latency() {
                 let (finish, finishes) = mpsc::channel();
                 app.previews = Previews::with_decoder(
                     ctx.clone(),
-                    Arc::new(move |key, kind, _, cancel, _| {
+                    Arc::new(move |key, kind, _, cancel| {
                         let _ = send.send(key.path.clone());
                         let preview =
                             engine::preview_cancellable(&key.path, kind, key.pixels, cancel);
