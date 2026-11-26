@@ -2,6 +2,8 @@
 
 DeshCmd is a native dual-pane file manager for local files and mounted volumes. The desktop uses Rust, egui 0.37, and wgpu. The headless engine owns workspace state and runs file operations on a background queue.
 
+![DeshCmd showing photo thumbnails in Gallery view on the left and an alpine lake in Quick View on the right](docs/screenshots/gallery-quick-view.webp)
+
 ## Build and run
 
 Install Rust 1.95 or later and a C toolchain for the native dependencies. On Linux, run under Wayland or X11 with a wgpu-compatible graphics driver. For example, Debian and Ubuntu systems can use `build-essential`, `pkg-config`, `libvulkan1`, and the Vulkan driver for their GPU. Native file pickers use the desktop's XDG portal or a desktop dialog fallback. The Linux unmount action uses `gio`, provided by `libglib2.0-bin` on Debian-based systems.
