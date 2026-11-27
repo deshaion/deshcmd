@@ -107,13 +107,7 @@ impl App {
         }
         if let Some(pool) = &find.pool {
             for (_, result) in pool.drain() {
-                find.running = false;
-                find.history.push(result);
-                if find.history.len() > 12 {
-                    find.history.remove(0);
-                }
-                find.current = find.history.len() - 1;
-                find.selected = None;
+                find.accept_result(result);
             }
         }
         let viewport = ctx.content_rect();
@@ -221,12 +215,8 @@ impl App {
             }
             Some(Action::Preview(hit)) => {
                 self.find_files.open = false;
-                self.interface.quick = Some(side);
-                self.engine.dispatch(Command::Reveal {
-                    side,
-                    hit,
-                    background: false,
-                });
+                self.interface.quick = None;
+                self.engine.dispatch(Command::RevealPreview(side, hit));
             }
             Some(Action::Replace(files, options)) => {
                 self.find_files.open = false;
@@ -310,13 +300,15 @@ impl App {
                 "All files".into()
             }
         );
+        let archives = self.engine.search_archives();
         let pool = find.pool.get_or_insert_with(|| {
             let ctx = ctx.clone();
             ReadPool::new(1, 1, Arc::new(move || ctx.request_repaint()))
         });
         pool.submit((), move |cancel| SearchRun {
             title,
-            result: search::run(&locations, &options, cancel).map_err(|error| error.to_string()),
+            result: search::run_with_archives(&locations, &options, &archives, cancel)
+                .map_err(|error| error.to_string()),
             options,
         });
         find.running = true;
@@ -328,6 +320,17 @@ impl App {
 }
 
 impl FindFiles {
+    fn accept_result(&mut self, result: SearchRun) {
+        self.running = false;
+        self.history.push(result);
+        if self.history.len() > 12 {
+            self.history.remove(0);
+        }
+        self.current = self.history.len() - 1;
+        self.selected = None;
+        self.confirm_replace = false;
+    }
+
     pub fn new(storage: Option<&dyn eframe::Storage>) -> Self {
         Self {
             templates: storage
@@ -770,4 +773,28 @@ fn combo<T: Copy + PartialEq>(ui: &mut Ui, id: &str, value: &mut T, choices: &[(
                 ui.selectable_value(value, candidate, name);
             }
         });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn completed_search_invalidates_previous_replace_confirmation() {
+        let run = |title: &str| SearchRun {
+            title: title.into(),
+            result: Ok(Results::default()),
+            options: Options {
+                replacement: Some(title.into()),
+                ..Default::default()
+            },
+        };
+        let mut find = FindFiles::default();
+        find.accept_result(run("First"));
+        find.running = true;
+        find.confirm_replace = true;
+        find.accept_result(run("Second"));
+        assert_eq!(find.history[find.current].title, "Second");
+        assert!(!find.confirm_replace);
+    }
 }

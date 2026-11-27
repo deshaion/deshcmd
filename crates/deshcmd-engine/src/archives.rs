@@ -2039,17 +2039,25 @@ pub(crate) struct SearchArchive {
     reader: Reader,
     inventory: Arc<Inventory>,
     control: Control,
+    password: Arc<str>,
 }
 
 impl SearchArchive {
-    pub(crate) fn open(file: &Path, cancel: &crate::read_pool::Cancellation) -> io::Result<Self> {
+    pub(crate) fn open(
+        file: &Path,
+        password: Arc<str>,
+        cancel: &crate::read_pool::Cancellation,
+    ) -> io::Result<Self> {
+        cancel.check()?;
         let control = Control::for_read(cancel);
-        let reader = Reader::open(file, "", &control)?;
-        let inventory = Arc::new(reader.list("", &control)?);
+        crate::listing::open_regular_file(file)?;
+        let reader = Reader::open(file, &password, &control)?;
+        let inventory = Arc::new(reader.list(&password, &control)?);
         Ok(Self {
             reader,
             inventory,
             control,
+            password,
         })
     }
 
@@ -2081,8 +2089,13 @@ impl SearchArchive {
             ));
         }
         let output = NamedTempFile::new()?;
-        self.reader
-            .extract(member, output.as_file(), "", &self.control, Some(limit))?;
+        self.reader.extract(
+            member,
+            output.as_file(),
+            &self.password,
+            &self.control,
+            Some(limit),
+        )?;
         fs::read(output.path())
     }
 }

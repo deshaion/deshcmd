@@ -1698,6 +1698,9 @@ fn operation_progress(done: u64, total: u64, width: f32) -> egui::ProgressBar {
 impl eframe::App for App {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.engine.poll();
+        if let Some(side) = self.engine.take_revealed_preview() {
+            self.interface.quick = Some(side);
+        }
         if let Some(delay) = self.engine.listing_wake_after() {
             ctx.request_repaint_after(delay);
         }

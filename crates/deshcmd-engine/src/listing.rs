@@ -59,7 +59,7 @@ impl Entry {
         self.kind == Kind::Folder
     }
 
-    fn from_path(
+    pub(crate) fn from_path(
         path: PathBuf,
         comments: &HashMap<String, String>,
         cancel: &Cancellation,
@@ -781,6 +781,26 @@ pub fn preview(path: &Path, kind: Kind, pixels: u32) -> Preview {
     preview_cancellable(path, kind, pixels, &Default::default())
 }
 
+pub(crate) fn open_regular_file(path: &Path) -> io::Result<File> {
+    let not_regular = || io::Error::other("Expected a regular file");
+    if !path.metadata()?.is_file() {
+        return Err(not_regular());
+    }
+    let mut options = File::options();
+    options.read(true);
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        // The path could become a FIFO between the metadata check and open.
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let file = options.open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(not_regular());
+    }
+    Ok(file)
+}
+
 pub fn preview_cancellable(
     path: &Path,
     kind: Kind,
@@ -789,21 +809,7 @@ pub fn preview_cancellable(
 ) -> Preview {
     let result = (|| -> io::Result<Preview> {
         cancel.check()?;
-        if !path.metadata()?.is_file() {
-            return Ok(Preview::Unavailable);
-        }
-        let mut options = File::options();
-        options.read(true);
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        {
-            use std::os::unix::fs::OpenOptionsExt as _;
-            // The path could become a FIFO between the metadata check and open.
-            options.custom_flags(libc::O_NONBLOCK);
-        }
-        let file = options.open(path)?;
-        if !file.metadata()?.is_file() {
-            return Ok(Preview::Unavailable);
-        }
+        let file = open_regular_file(path)?;
         if kind == Kind::Image {
             let mut reader = image::ImageReader::new(io::BufReader::new(file));
             if let Ok(format) = image::ImageFormat::from_path(path) {

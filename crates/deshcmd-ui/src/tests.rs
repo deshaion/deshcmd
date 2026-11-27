@@ -825,7 +825,7 @@ fn app_storage_restores_workspace_and_independent_display_preferences() {
     assert!(!fresh.interface.show_places);
 }
 
-fn frame_contains(shapes: &[egui::epaint::ClippedShape], expected: &str) -> bool {
+pub(crate) fn frame_contains(shapes: &[egui::epaint::ClippedShape], expected: &str) -> bool {
     fn matches(shape: &egui::Shape, expected: &str) -> bool {
         match shape {
             egui::Shape::Text(text) => text.galley.text().contains(expected),

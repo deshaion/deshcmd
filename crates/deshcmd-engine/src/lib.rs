@@ -182,6 +182,7 @@ pub struct Tab {
     cursor: Option<PathBuf>,
     cursor_position: Option<usize>,
     pending_cursor: Option<PathBuf>,
+    pending_reveal: Option<(PathBuf, bool)>,
     cursor_restored: bool,
     anchor: Option<PathBuf>,
     anchor_position: Option<usize>,
@@ -231,6 +232,7 @@ impl Tab {
             cursor: None,
             cursor_position: None,
             pending_cursor: None,
+            pending_reveal: None,
             cursor_restored: false,
             anchor: None,
             anchor_position: None,
@@ -306,6 +308,7 @@ impl Tab {
     }
     fn cancel_navigation(&mut self) {
         self.nav_revision += 1;
+        self.pending_reveal = None;
         self.pending_navigation = None;
         self.cached_history = None;
     }
@@ -660,6 +663,7 @@ impl Tab {
         }
     }
     fn choose_provisional_cursor(&mut self) {
+        self.pending_reveal = None;
         if self.provisional() {
             self.provisional_focus = true;
             self.pending_cursor = None;
@@ -762,6 +766,7 @@ pub enum Command {
         hit: search::Hit,
         background: bool,
     },
+    RevealPreview(Side, search::Hit),
     History(Side, usize),
     CancelNavigation(Side),
     Back(Side),
@@ -920,6 +925,7 @@ pub struct Engine {
     watches: watch::Watches,
     running: Option<u64>,
     archive_cache: Arc<archives::ArchiveCache>,
+    revealed_preview: Option<Side>,
     scans: read_pool::ReadPool<ScanKey, ScanResult>,
     navigation: navigation::Navigation,
     views: read_pool::ReadPool<views::ViewKey, io::Result<views::Prepared>>,
@@ -975,6 +981,7 @@ impl Engine {
             watches: watch::Watches::new(wake.clone()),
             running: None,
             archive_cache: Arc::default(),
+            revealed_preview: None,
         };
         engine.start_scans();
         engine
@@ -1005,6 +1012,12 @@ impl Engine {
     }
     pub fn tab(&self, side: Side) -> &Tab {
         self.pane(side).tab()
+    }
+    pub fn take_revealed_preview(&mut self) -> Option<Side> {
+        self.revealed_preview.take()
+    }
+    pub fn search_archives(&self) -> search::Archives {
+        search::Archives(self.archive_cache.clone())
     }
     pub fn archive_password(&self, file: &Path) -> Option<Arc<str>> {
         self.archive_cache.password(file)
@@ -1119,7 +1132,8 @@ impl Engine {
                 side,
                 hit,
                 background,
-            } => self.reveal(side, hit, background)?,
+            } => self.reveal(side, hit, background, false)?,
+            Command::RevealPreview(side, hit) => self.reveal(side, hit, false, true)?,
             Command::CancelNavigation(side) => self.tab_mut(side).cancel_navigation(),
             Command::History(side, index) => self.request_history(side, Some(index), false)?,
             Command::Back(side) => self.request_history(side, None, true)?,
@@ -2468,6 +2482,7 @@ impl Engine {
         }
         self.start_scans();
         self.start_views();
+        self.finish_reveals();
         self.start_job();
     }
 }

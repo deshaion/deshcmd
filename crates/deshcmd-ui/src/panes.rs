@@ -73,6 +73,11 @@ impl PanelUi {
         self.request_filter = true;
     }
 
+    pub fn reset_filter_visibility(&mut self) {
+        self.filter_visibility = None;
+        self.request_filter = false;
+    }
+
     pub fn close_filter(&mut self) {
         self.filter.clear();
         self.filter_visibility = Some(false);

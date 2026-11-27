@@ -828,7 +828,7 @@ fn remove_file_or_link(path: &Path) -> io::Result<()> {
     fs::remove_file(path)
 }
 
-pub(crate) fn commit(temporary: NamedTempFile, target: &Path, replace: bool) -> io::Result<()> {
+fn commit(temporary: NamedTempFile, target: &Path, replace: bool) -> io::Result<()> {
     temporary.as_file().sync_all()?;
     if replace {
         temporary.persist(target).map_err(|e| e.error)?;

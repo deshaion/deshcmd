@@ -23,7 +23,12 @@ impl Navigation {
 enum Destination {
     Path(Location),
     History(usize),
-    Reveal(Location, PathBuf),
+    Reveal {
+        location: Location,
+        path: PathBuf,
+        hidden: bool,
+        preview: bool,
+    },
 }
 
 struct Intent {
@@ -150,6 +155,7 @@ impl Engine {
         side: Side,
         hit: search::Hit,
         background: bool,
+        preview: bool,
     ) -> io::Result<()> {
         let target = hit.display_path();
         let parent = target
@@ -175,7 +181,17 @@ impl Engine {
                 .file_name()
                 .ok_or_else(|| io::Error::other("No result filename"))?;
             let selection = location.display_path().join(name);
-            Ok(Some(Destination::Reveal(location, selection)))
+            let hidden = if hit.member.is_some() {
+                name.to_string_lossy().starts_with('.')
+            } else {
+                listing::Entry::from_path(selection.clone(), &HashMap::new(), cancel)?.hidden
+            };
+            Ok(Some(Destination::Reveal {
+                location,
+                path: selection,
+                hidden,
+                preview,
+            }))
         })
     }
 
@@ -396,6 +412,38 @@ impl Engine {
         }
     }
 
+    pub(super) fn finish_reveals(&mut self) {
+        for side in Side::ALL {
+            let tab = self.tab_mut(side);
+            let Some((path, _)) = tab.pending_reveal.as_ref() else {
+                continue;
+            };
+            let visible = tab.visible_position(path).is_some();
+            if !visible
+                && (tab.busy()
+                    || tab.dirty
+                    || (tab.installed_view.is_none() && tab.error.is_none()))
+            {
+                continue;
+            }
+            let (path, preview) = tab.pending_reveal.take().unwrap();
+            if visible {
+                tab.select(&path, Select::Cursor, false);
+                tab.cursor_restored = true;
+                if preview && self.settings.active == side {
+                    self.revealed_preview = Some(side);
+                }
+            } else {
+                tab.cursor = None;
+                tab.cursor_position = None;
+                self.notice = Some(format!(
+                    "Search result is unavailable or excluded: {}",
+                    path.display()
+                ));
+            }
+        }
+    }
+
     fn commit_navigation(&mut self, side: Side, intent: Intent, destination: Destination) {
         if intent.startup {
             if let Destination::Path(location) = destination {
@@ -406,32 +454,51 @@ impl Engine {
         let tab = self.tab(side);
         let previous = tab.base().to_owned();
         let before = tab.location();
-        let (location, history, selection) = match destination {
+        let (location, history, reveal) = match destination {
             Destination::Path(location) => (location, None, None),
             Destination::History(index) => (tab.history[index].location.clone(), Some(index), None),
-            Destination::Reveal(location, path) => (location, None, Some(path)),
+            Destination::Reveal {
+                location,
+                path,
+                hidden,
+                preview,
+            } => {
+                let options = view_options(&self.settings, &self.ignore, tab);
+                if !options.shown_name(&display_name(&path), hidden) {
+                    self.notice = Some(format!(
+                        "Search result is excluded by panel visibility settings: {}",
+                        path.display()
+                    ));
+                    return;
+                }
+                (location, None, Some((path, preview)))
+            }
         };
         let changed = &location != before;
-        let parent_focus = selection.or_else(|| match &location {
-            Location::Directory(path) if history.is_some() => {
-                tab.entry_in_parent(path).map(Path::to_owned)
-            }
-            Location::Directory(path) => tab
-                .entry_in_parent(&intent.path)
-                .or_else(|| tab.entry_in_parent(path))
-                .and_then(Path::file_name)
-                .map(|name| path.join(name)),
-            Location::Archive { file, folder } => match before {
-                Location::Archive {
-                    file: previous_file,
-                    folder: previous_folder,
-                } if previous_file == file && previous_folder.parent() == Some(folder) => {
-                    Some(file.join(previous_folder))
-                }
-                _ => None,
-            },
-            _ => None,
-        });
+        let parent_focus =
+            reveal
+                .as_ref()
+                .map(|(path, _)| path.clone())
+                .or_else(|| match &location {
+                    Location::Directory(path) if history.is_some() => {
+                        tab.entry_in_parent(path).map(Path::to_owned)
+                    }
+                    Location::Directory(path) => tab
+                        .entry_in_parent(&intent.path)
+                        .or_else(|| tab.entry_in_parent(path))
+                        .and_then(Path::file_name)
+                        .map(|name| path.join(name)),
+                    Location::Archive { file, folder } => match before {
+                        Location::Archive {
+                            file: previous_file,
+                            folder: previous_folder,
+                        } if previous_file == file && previous_folder.parent() == Some(folder) => {
+                            Some(file.join(previous_folder))
+                        }
+                        _ => None,
+                    },
+                    _ => None,
+                });
         let locked = matches!(intent.lock, TabLock::Locked | TabLock::NewTab);
         let opens_tab = intent.open_tab
             || (locked
@@ -498,6 +565,7 @@ impl Engine {
             tab.set_location(location, history.is_none());
             tab
         };
+        tab.pending_reveal = reveal;
         if !intent.background || opens_tab {
             if let Some((path, position)) = parent_focus
                 .as_ref()

@@ -364,6 +364,9 @@ impl App {
             .clone_from(&draft.alternate_columns);
         self.interface.tree = preferences.directory_tree;
         self.interface.show_inline_filter = preferences.show_inline_filter;
+        for pane in &mut self.interface.panes {
+            pane.reset_filter_visibility();
+        }
         self.interface.show_places = preferences.show_places;
         self.interface.show_bottom_bar = preferences.show_bottom_bar;
         self.interface.alternate_columns = preferences.alternate_columns;
