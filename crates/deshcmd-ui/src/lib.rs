@@ -493,7 +493,7 @@ impl App {
                     &title,
                     &queue_label,
                     true,
-                    self.interface.queue,
+                    self.interface.queue || pending > 0,
                 )
                 .clicked()
                 {

@@ -1548,6 +1548,16 @@ fn operation_status(
     jobs: &[&engine::Job],
     actions: &mut Vec<Action>,
 ) {
+    root.painter().rect_filled(
+        rect,
+        egui::CornerRadius {
+            nw: 0,
+            ne: 0,
+            sw: 9,
+            se: 9,
+        },
+        OPERATION_SURFACE,
+    );
     root.painter()
         .hline(rect.x_range(), rect.top(), Stroke::new(1., LINE));
     let mut ui = child(

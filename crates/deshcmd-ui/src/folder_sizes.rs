@@ -73,57 +73,30 @@ impl FolderSizes {
         if let Some(cache) = &mut self.cache {
             cache.poll();
         }
-        let current = tab.current().filter(|entry| entry.is_dir());
-        let current_size =
-            current.map(|entry| self.request(ctx, &Key::from(entry), &entry.archive));
-        self.footer = if tab.marked_count() == 0 {
-            current_size.map(|size| match size {
-                Some(Some(bytes)) => metric(bytes),
-                Some(None) => "Size unavailable".into(),
-                None => "Calculating size…".into(),
-            })
-        } else {
+        self.footer = (tab.marked_count() != 0).then(|| {
             let mut bytes = tab.selected_bytes();
             let mut pending = false;
             let mut unavailable = false;
             for (key, archive) in &self.folders {
-                // Prioritize the current folder when it is also marked.
-                let size = if current.is_some_and(|entry| entry.path == key.path) {
-                    current_size.flatten()
-                } else {
-                    request(
-                        self.cache.get_or_insert_with(|| folder_cache(ctx)),
-                        key,
-                        archive,
-                    )
-                };
+                let size = request(
+                    self.cache.get_or_insert_with(|| folder_cache(ctx)),
+                    key,
+                    archive,
+                );
                 match size {
                     Some(Some(size)) => bytes = bytes.saturating_add(size),
                     Some(None) => unavailable = true,
                     None => pending = true,
                 }
             }
-            Some(if pending {
+            if pending {
                 "Calculating size…".into()
             } else if unavailable {
                 format!("{} · size incomplete", metric(bytes))
             } else {
                 metric(bytes)
-            })
-        };
-    }
-
-    fn request(
-        &mut self,
-        ctx: &egui::Context,
-        key: &Key,
-        archive: &Option<Arc<ArchiveSource>>,
-    ) -> Option<Option<u64>> {
-        request(
-            self.cache.get_or_insert_with(|| folder_cache(ctx)),
-            key,
-            archive,
-        )
+            }
+        });
     }
 
     pub fn column(&self, tab: &Tab, entry: &Entry) -> String {
@@ -134,11 +107,7 @@ impl FolderSizes {
         {
             return size.map_or_else(|| "—".into(), metric);
         }
-        if tab.is_marked(&entry.path)
-            || tab
-                .current()
-                .is_some_and(|current| current.path == entry.path)
-        {
+        if tab.is_marked(&entry.path) {
             "…".into()
         } else {
             "—".into()

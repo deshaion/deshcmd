@@ -9,6 +9,7 @@ use egui::{
 pub const BASE: C = C::from_rgb(12, 15, 19);
 pub const RAIL: C = C::from_rgb(16, 20, 25);
 pub const SURFACE: C = C::from_rgb(19, 24, 30);
+pub const OPERATION_SURFACE: C = C::from_rgb(28, 45, 59);
 pub const RAISED: C = C::from_rgb(26, 32, 40);
 pub const HOVER: C = C::from_rgb(35, 43, 52);
 pub const LINE: C = C::from_rgb(45, 54, 64);

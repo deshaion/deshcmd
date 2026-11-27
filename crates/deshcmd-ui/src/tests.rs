@@ -389,10 +389,15 @@ fn panel_navigation_and_preview_shortcuts() {
     assert!(app.engine.tab(side).is_marked(&file));
 
     app.engine.dispatch(Command::UnmarkAll(side));
+    let shapes = draw(&mut app, &mut frame, vec![]);
+    assert!(!frame_contains(&shapes, "Calculating size…"));
+    assert!(!frame_contains(&shapes, "2.0 KB"));
+    press(&mut app, &mut frame, Key::Space, plain);
+    assert!(app.engine.tab(side).is_marked(&folder));
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         let shapes = draw(&mut app, &mut frame, vec![]);
-        if frame_contains(&shapes, "items · 2.0 KB") {
+        if frame_contains(&shapes, "1 selected · 2.0 KB") {
             assert!(shapes.iter().any(|shape| matches!(&shape.shape,
                 egui::Shape::Text(text) if text.galley.text() == "2.0 KB")));
             break;
@@ -400,6 +405,16 @@ fn panel_navigation_and_preview_shortcuts() {
         assert!(Instant::now() < deadline, "folder size did not appear");
         std::thread::sleep(Duration::from_millis(2));
     }
+    app.engine.dispatch(Command::UnmarkAll(side));
+    press(&mut app, &mut frame, Key::ArrowDown, egui::Modifiers::SHIFT);
+    assert!(app.engine.tab(side).is_marked(&folder));
+    assert!(app.engine.tab(side).is_marked(&file));
+    assert!(frame_contains(
+        &draw(&mut app, &mut frame, vec![]),
+        "2 selected · 2.0 KB"
+    ));
+
+    app.engine.dispatch(Command::UnmarkAll(side));
     time.set(time.get() + 1.);
     click(&mut app, &mut frame, row.center(), ctrl);
     assert!(app.engine.tab(side).is_marked(&folder));
@@ -891,7 +906,20 @@ fn workspace_renders_tree_gallery_help_and_a_transfer_conflict() {
         .dispatch(Command::View(Side::Left, engine::View::Gallery));
     app.engine
         .dispatch(Command::View(Side::Right, engine::View::Compact));
+    let queue_highlighted = |shapes: &[egui::epaint::ClippedShape], title: &str| {
+        let text = shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) if text.galley.text() == title => Some(text.pos),
+                _ => None,
+            })
+            .expect("expected the Queue toolbar button");
+        shapes.iter().any(|shape| matches!(
+            &shape.shape, egui::Shape::Rect(rect) if rect.fill == ACCENT && rect.rect.contains(text)
+        ))
+    };
     let shapes = draw(&mut app);
+    assert!(!queue_highlighted(&shapes, "Queue"));
     assert!(frame_contains(&shapes, "Fixture place"));
     assert!(frame_contains(&shapes, "Fixture drive"));
     assert!(frame_contains(&shapes, "directory"));
@@ -912,8 +940,13 @@ fn workspace_renders_tree_gallery_help_and_a_transfer_conflict() {
     app.engine.jobs[0].progress.item_total = Some(4);
     app.engine.jobs[0].progress.items = 1;
     let shapes = draw(&mut app);
+    assert!(!app.interface.queue);
+    assert!(queue_highlighted(&shapes, "Queue  1"));
     assert!(frame_contains(&shapes, "Calculate size · On hold"));
     assert!(frame_contains(&shapes, "25%"));
+    assert!(shapes.iter().any(|shape| matches!(
+        &shape.shape, egui::Shape::Rect(rect) if rect.fill == OPERATION_SURFACE
+    )));
     app.apply(
         Action::Command(Command::QueueFor(
             Side::Right,
@@ -973,8 +1006,10 @@ fn workspace_renders_tree_gallery_help_and_a_transfer_conflict() {
         b"existing"
     );
     assert!(!app.interface.queue);
+    assert!(!queue_highlighted(&draw(&mut app), "Queue"));
     app.interface.queue = true;
     let shapes = draw(&mut app);
+    assert!(queue_highlighted(&shapes, "Queue"));
     assert!(frame_contains(&shapes, "1 skipped"));
     assert!(frame_contains(
         &shapes,
