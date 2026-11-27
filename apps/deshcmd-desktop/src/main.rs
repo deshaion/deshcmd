@@ -29,6 +29,10 @@ impl NativeDesktop {
 }
 
 impl Desktop for NativeDesktop {
+    fn preview_cache_directory(&self) -> Option<PathBuf> {
+        dirs::cache_dir().map(|path| path.join("deshcmd"))
+    }
+
     #[cfg(feature = "standalone-updater")]
     fn supports_updates(&self) -> bool {
         updater::available()

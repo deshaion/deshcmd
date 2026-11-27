@@ -1,3 +1,4 @@
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 
 use deshcmd_engine::{
@@ -9,8 +10,9 @@ use egui::{
 };
 
 use crate::dialogs::{self, Tool};
+use crate::previews::{CachedPreview, GALLERY_PIXELS, Previews, QUICK_PIXELS};
 use crate::text_preview::LargeTextView;
-use crate::{Action, CachedPreview, Previews, child, theme::*};
+use crate::{Action, child, theme::*};
 
 // Tabs, navigation, and room for the details header and one row.
 pub(crate) const MIN_HEIGHT: f32 = 142.;
@@ -25,6 +27,7 @@ pub(crate) struct PanelUi {
     request_path: bool,
     active_tab_in_strip: Option<(usize, u64, String, f32)>,
     large_text: Option<LargeTextView>,
+    preview_page: Option<(u64, u64, Range<usize>)>,
 }
 pub(crate) struct PaneScreen<'a> {
     pub pane: &'a Pane,
@@ -61,6 +64,13 @@ impl PanelUi {
         }
         self.editing_path = true;
         self.request_path = true;
+    }
+
+    pub(crate) fn preview_page(&self, tab: &Tab) -> Option<Range<usize>> {
+        self.preview_page
+            .as_ref()
+            .filter(|(id, generation, _)| *id == tab.id && *generation == tab.listing_generation())
+            .map(|(_, _, rows)| rows.clone())
     }
 
     pub fn show(
@@ -195,7 +205,7 @@ impl PanelUi {
             }
             contents.separator();
         }
-        match tab.saved.view {
+        let page = match tab.saved.view {
             View::Gallery => gallery(&mut contents, tab, side, reveal_cursor, previews, actions),
             View::Compact => rows(
                 &mut contents,
@@ -215,6 +225,11 @@ impl PanelUi {
                 reveal_cursor,
                 actions,
             ),
+        };
+        let page = (tab.id, tab.listing_generation(), page);
+        if self.preview_page.as_ref() != Some(&page) {
+            self.preview_page = Some(page);
+            root.ctx().request_repaint();
         }
         if let Some(payload) = drop_area.dnd_release_payload::<Drag>() {
             let moving = root.input(|input| input.modifiers.shift);
@@ -856,7 +871,7 @@ fn rows(
     show_modified_time: bool,
     reveal: bool,
     actions: &mut Vec<Action>,
-) {
+) -> Range<usize> {
     let width = ui.available_width();
     let details = columns.is_some();
     let (columns, show_modified_time) = column_widths(
@@ -921,7 +936,7 @@ fn rows(
     }
     if tab.visible_count() == 0 {
         empty(ui, tab, side, actions);
-        return;
+        return 0..0;
     }
     let h = if details { 36. } else { 29. };
     let target = if reveal { tab.cursor_position() } else { None };
@@ -930,7 +945,7 @@ fn rows(
         h,
         tab.visible_count(),
         |ui, range| {
-            for index in range {
+            for index in range.clone() {
                 let entry = tab.visible_entry(index).unwrap();
                 let (rect, response) = file_row(ui, vec2(width, h), side, tab, entry);
                 row_interaction(ui, &response, entry, tab, side, actions);
@@ -1010,6 +1025,7 @@ fn rows(
                 }
                 folder_drop(ui, &response, entry, side, actions);
             }
+            range
         },
     );
     remember_provisional_scroll(
@@ -1020,6 +1036,7 @@ fn rows(
         h + ui.spacing().item_spacing.y,
         1,
     );
+    output.inner
 }
 
 fn row_interaction(
@@ -1116,10 +1133,10 @@ fn gallery(
     reveal: bool,
     previews: &mut Previews,
     actions: &mut Vec<Action>,
-) {
+) -> Range<usize> {
     if tab.visible_count() == 0 {
         empty(ui, tab, side, actions);
-        return;
+        return 0..0;
     }
     let outer_width = ui.available_width();
     let columns = ((outer_width - 10.) / 123.).floor().max(1.) as usize;
@@ -1135,7 +1152,7 @@ fn gallery(
         height,
         tab.visible_count().div_ceil(columns),
         |ui, range| {
-            for row in range {
+            for row in range.clone() {
                 ui.horizontal(|ui| {
                     ui.add_space(5.);
                     for index in row * columns..(row * columns + columns).min(tab.visible_count()) {
@@ -1168,7 +1185,7 @@ fn gallery(
                         );
                         if entry.kind == engine::Kind::Image
                             && let Some(CachedPreview::Image(texture, size)) =
-                                previews.get(entry, 176)
+                                previews.get(entry, GALLERY_PIXELS)
                         {
                             ui.painter().image(
                                 texture.id(),
@@ -1195,6 +1212,7 @@ fn gallery(
                     }
                 });
             }
+            range
         },
     );
     remember_provisional_scroll(
@@ -1205,6 +1223,7 @@ fn gallery(
         height + ui.spacing().item_spacing.y,
         columns,
     );
+    output.inner.start * columns..(output.inner.end * columns).min(tab.visible_count())
 }
 
 fn empty(ui: &mut Ui, tab: &Tab, side: Side, actions: &mut Vec<Action>) {
@@ -1504,7 +1523,7 @@ fn show_preview(
             actions.push(Action::Tool(source, Tool::Statistics));
         }
     } else {
-        match previews.get(entry, 720) {
+        match previews.get(entry, QUICK_PIXELS) {
             Some(CachedPreview::Image(texture, size)) => {
                 let bounds = ui.available_size() - vec2(4., 10.);
                 let target = contained_size(*size, bounds);

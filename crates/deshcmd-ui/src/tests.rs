@@ -17,10 +17,14 @@ pub(super) struct DesktopState {
 #[derive(Default)]
 pub(super) struct TestDesktop {
     opened: Option<mpsc::Sender<PathBuf>>,
+    preview_cache: Option<PathBuf>,
     pub(super) state: Rc<RefCell<DesktopState>>,
 }
 
 impl Desktop for TestDesktop {
+    fn preview_cache_directory(&self) -> Option<PathBuf> {
+        self.preview_cache.clone()
+    }
     fn supports_updates(&self) -> bool {
         self.state.borrow().supports_updates
     }
@@ -818,6 +822,70 @@ fn workspace_renders_tree_gallery_help_and_a_transfer_conflict() {
     assert!(frame_contains(&draw(&mut app), "1 skipped"));
 }
 
+// A one-pixel RGBA PNG, independent of the system image libraries.
+const PREVIEW_TEST_PNG: &[u8] = &[
+    137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1, 0, 0, 0, 1, 8, 6, 0,
+    0, 0, 31, 21, 196, 137, 0, 0, 0, 13, 73, 68, 65, 84, 120, 156, 99, 184, 147, 34, 249, 31, 0, 5,
+    210, 2, 89, 77, 189, 91, 80, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66, 96, 130,
+];
+
+#[test]
+fn opening_a_folder_fills_its_disk_preview_page_without_moving_the_cursor() {
+    let fixture = tempfile::tempdir().unwrap();
+    let root = fixture.path().canonicalize().unwrap();
+    let photos = root.join("photos");
+    let cache = root.join("cache");
+    let thumbnails = cache.join("previews-v1");
+    std::fs::create_dir_all(photos.join("12800x7200")).unwrap();
+    for index in 0..25 {
+        std::fs::write(photos.join(format!("{index:02}.png")), PREVIEW_TEST_PNG).unwrap();
+    }
+
+    let ctx = egui::Context::default();
+    let creation = eframe::CreationContext::_new_kittest(ctx.clone());
+    let mut app = App::new(
+        &creation,
+        Box::new(TestDesktop {
+            preview_cache: Some(cache),
+            ..Default::default()
+        }),
+        root.clone(),
+        [root.clone(), root],
+        true,
+    );
+    app.open_initial_directories(&ctx, [Some(photos.clone()), None]);
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut frame = eframe::Frame::_new_kittest();
+    loop {
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, vec2(1220., 540.))),
+                ..Default::default()
+            },
+            |ui| {
+                app.logic(&ctx, &mut frame);
+                app.ui(ui, &mut frame);
+            },
+        );
+        output.textures_delta.clear();
+        let count = std::fs::read_dir(&thumbnails).map_or(0, |entries| {
+            entries
+                .flatten()
+                .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "png"))
+                .count()
+        });
+        if count == 25 {
+            break;
+        }
+        assert!(Instant::now() < deadline, "wrote {count} of 25 thumbnails");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let tab = app.engine.tab(Side::Left);
+    assert_eq!(tab.base(), photos);
+    assert_eq!(tab.current().unwrap().path, photos.join("12800x7200"));
+    assert!(app.interface.quick.is_none());
+}
+
 #[test]
 fn quick_view_changes_between_a_large_log_image_and_unavailable_file() {
     let fixture = tempfile::tempdir().unwrap();
@@ -827,13 +895,7 @@ fn quick_view_changes_between_a_large_log_image_and_unavailable_file() {
     let binary = root.join("binary.bin");
     std::fs::write(&log, "Live log text\n".repeat(4_000)).unwrap();
     std::fs::write(&binary, b"\0\xff").unwrap();
-    // A one-pixel RGBA PNG, independent of the system image libraries.
-    const PIXEL: &[u8] = &[
-        137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1, 0, 0, 0, 1, 8, 6,
-        0, 0, 0, 31, 21, 196, 137, 0, 0, 0, 13, 73, 68, 65, 84, 120, 156, 99, 184, 147, 34, 249,
-        31, 0, 5, 210, 2, 89, 77, 189, 91, 80, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66, 96, 130,
-    ];
-    std::fs::write(&image, PIXEL).unwrap();
+    std::fs::write(&image, PREVIEW_TEST_PNG).unwrap();
 
     let ctx = egui::Context::default();
     let creation = eframe::CreationContext::_new_kittest(ctx.clone());
@@ -890,7 +952,7 @@ fn quick_view_changes_between_a_large_log_image_and_unavailable_file() {
                 .previews
                 .cached
                 .values()
-                .any(|item| matches!(item, CachedPreview::Image(_, size) if size.x == size.y && size.x > 0.))
+                .any(|item| matches!(item, previews::CachedPreview::Image(_, size) if size.x == size.y && size.x > 0.))
     });
     await_preview(&mut app, &binary, &|_, shapes| {
         frame_contains(shapes, "Preview unavailable for this file.")

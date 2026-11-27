@@ -1107,13 +1107,35 @@ impl ArchiveSource {
     }
 
     pub fn preview(&self, path: &Path, kind: Kind, pixels: u32) -> Preview {
-        self.preview_result(path, kind, pixels)
+        self.preview_cancellable(path, kind, pixels, &Default::default())
+    }
+
+    pub fn preview_cancellable(
+        &self,
+        path: &Path,
+        kind: Kind,
+        pixels: u32,
+        cancel: &crate::read_pool::Cancellation,
+    ) -> Preview {
+        self.preview_result_with_cancel(path, kind, pixels, cancel)
             .unwrap_or(Preview::Unavailable)
     }
 
+    #[cfg(test)]
     fn preview_result(&self, path: &Path, kind: Kind, pixels: u32) -> io::Result<Preview> {
+        self.preview_result_with_cancel(path, kind, pixels, &Default::default())
+    }
+
+    fn preview_result_with_cancel(
+        &self,
+        path: &Path,
+        kind: Kind,
+        pixels: u32,
+        cancel: &crate::read_pool::Cancellation,
+    ) -> io::Result<Preview> {
         const MAX_PREVIEW: u64 = 16 * 1024 * 1024;
-        let control = Control::default();
+        cancel.check()?;
+        let control = Control::for_read(cancel);
         let inventory = self.inventory(&control)?;
         let mut matching = inventory
             .members
@@ -1140,7 +1162,13 @@ impl ArchiveSource {
                 "The archive changed while it was being previewed",
             ));
         }
-        Ok(listing::preview(output.path(), kind, pixels))
+        cancel.check()?;
+        Ok(listing::preview_cancellable(
+            output.path(),
+            kind,
+            pixels,
+            cancel,
+        ))
     }
 }
 

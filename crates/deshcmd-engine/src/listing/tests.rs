@@ -478,3 +478,22 @@ fn bounded_sort_runs_merge_to_the_frozen_global_order() {
             .all(|(actual, expected)| actual.path == expected.path)
     );
 }
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn image_preview_rejects_a_named_pipe_without_waiting_for_a_writer() {
+    use std::os::unix::ffi::OsStrExt as _;
+    let fixture = tempfile::tempdir().unwrap();
+    let pipe = fixture.path().join("input.png");
+    let name = std::ffi::CString::new(pipe.as_os_str().as_bytes()).unwrap();
+    // SAFETY: The C string is valid for the duration of the call.
+    assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+    let (send, result) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = send.send(preview(&pipe, Kind::Image, 720));
+    });
+    assert!(matches!(
+        result.recv_timeout(std::time::Duration::from_secs(2)),
+        Ok(Preview::Unavailable)
+    ));
+}
