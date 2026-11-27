@@ -23,6 +23,7 @@ impl Navigation {
 enum Destination {
     Path(Location),
     History(usize),
+    Reveal(Location, PathBuf),
 }
 
 struct Intent {
@@ -142,6 +143,40 @@ impl Engine {
         let peer = (self.settings.linked && linked && !background && !new_tab)
             .then(|| self.capture_peer(side, None));
         self.request_path(side, path, new_tab, background, peer, true, false)
+    }
+
+    pub(super) fn reveal(
+        &mut self,
+        side: Side,
+        hit: search::Hit,
+        background: bool,
+    ) -> io::Result<()> {
+        let target = hit.display_path();
+        let parent = target
+            .parent()
+            .ok_or_else(|| io::Error::other("No containing directory"))?
+            .to_owned();
+        if !background {
+            self.focus_revision += 1;
+        }
+        let intent = Intent {
+            lock: self.tab(side).saved.lock,
+            focus: (!background).then_some(self.focus_revision),
+            open_tab: background,
+            background,
+            path: parent.clone(),
+            peer: None,
+            quiet: false,
+            startup: false,
+        };
+        self.submit_navigation(side, intent, move |_, cancel| {
+            let location = validate_path(&parent, cancel)?;
+            let name = target
+                .file_name()
+                .ok_or_else(|| io::Error::other("No result filename"))?;
+            let selection = location.display_path().join(name);
+            Ok(Some(Destination::Reveal(location, selection)))
+        })
     }
 
     pub(super) fn navigate_without_focus(&mut self, side: Side, path: &Path) -> io::Result<()> {
@@ -371,12 +406,13 @@ impl Engine {
         let tab = self.tab(side);
         let previous = tab.base().to_owned();
         let before = tab.location();
-        let (location, history) = match destination {
-            Destination::Path(location) => (location, None),
-            Destination::History(index) => (tab.history[index].location.clone(), Some(index)),
+        let (location, history, selection) = match destination {
+            Destination::Path(location) => (location, None, None),
+            Destination::History(index) => (tab.history[index].location.clone(), Some(index), None),
+            Destination::Reveal(location, path) => (location, None, Some(path)),
         };
         let changed = &location != before;
-        let parent_focus = match &location {
+        let parent_focus = selection.or_else(|| match &location {
             Location::Directory(path) if history.is_some() => {
                 tab.entry_in_parent(path).map(Path::to_owned)
             }
@@ -395,7 +431,7 @@ impl Engine {
                 _ => None,
             },
             _ => None,
-        };
+        });
         let locked = matches!(intent.lock, TabLock::Locked | TabLock::NewTab);
         let opens_tab = intent.open_tab
             || (locked
@@ -462,7 +498,15 @@ impl Engine {
             tab.set_location(location, history.is_none());
             tab
         };
-        if !intent.background {
+        if !intent.background || opens_tab {
+            if let Some((path, position)) = parent_focus
+                .as_ref()
+                .and_then(|path| tab.visible_position(path).map(|position| (path, position)))
+            {
+                tab.cursor = Some(path.clone());
+                tab.cursor_position = Some(position);
+                tab.cursor_restored = true;
+            }
             tab.pending_cursor = parent_focus;
         }
         if opens_tab || history.is_none() && changed {

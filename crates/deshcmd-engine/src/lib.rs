@@ -7,6 +7,7 @@ mod operations;
 mod perf;
 mod preview_cache;
 pub mod read_pool;
+pub mod search;
 mod snapshots;
 #[cfg(test)]
 mod tests;
@@ -741,6 +742,11 @@ pub enum Command {
         new_tab: bool,
         background: bool,
     },
+    Reveal {
+        side: Side,
+        hit: search::Hit,
+        background: bool,
+    },
     History(Side, usize),
     CancelNavigation(Side),
     Back(Side),
@@ -780,6 +786,7 @@ pub enum Command {
     RestoreMarks(Side),
     LoadMarks(Side, String),
     LoadList(Side, String),
+    LoadPaths(Side, Vec<PathBuf>),
     AddBookmark(Bookmark),
     EditBookmark(usize, Bookmark),
     ImportBookmarks(Vec<Bookmark>),
@@ -790,6 +797,7 @@ pub enum Command {
     LoadFavorite(usize, bool),
     RemoveFavorite(usize),
     Queue(Operation, bool),
+    QueueFor(Side, Operation, bool),
     CreateFile {
         side: Side,
         path: PathBuf,
@@ -835,9 +843,11 @@ impl JobState {
 pub struct Job {
     pub id: u64,
     pub title: &'static str,
+    pub target: Side,
     pub state: JobState,
     pub progress: Progress,
     pub started: Option<Instant>,
+    pub finished_at: Option<Instant>,
     pub message: String,
     pub warnings: Vec<String>,
     pub conflict: Option<Conflict>,
@@ -1089,6 +1099,11 @@ impl Engine {
                 new_tab,
                 background,
             } => self.navigate(side, &path, new_tab, background, true)?,
+            Command::Reveal {
+                side,
+                hit,
+                background,
+            } => self.reveal(side, hit, background)?,
             Command::CancelNavigation(side) => self.tab_mut(side).cancel_navigation(),
             Command::History(side, index) => self.request_history(side, Some(index), false)?,
             Command::Back(side) => self.request_history(side, None, true)?,
@@ -1379,6 +1394,11 @@ impl Engine {
             Command::LoadList(side, text) => {
                 let base = self.tab(side).base().to_path_buf();
                 let paths = lines(&text).map(|line| base.join(line)).collect();
+                self.tab_mut(side)
+                    .set_location(Location::List { base, paths }, true);
+            }
+            Command::LoadPaths(side, paths) => {
+                let base = self.tab(side).base().to_owned();
                 let tab = self.tab_mut(side);
                 tab.set_location(Location::List { base, paths }, true);
             }
@@ -1442,10 +1462,13 @@ impl Engine {
                     self.settings.favorites.remove(index);
                 }
             }
-            Command::Queue(operation, hold) => self.queue_job(operation, hold, None),
+            Command::Queue(operation, hold) => {
+                self.queue_job(self.settings.active, operation, hold, None)
+            }
+            Command::QueueFor(side, operation, hold) => self.queue_job(side, operation, hold, None),
             Command::CreateFile { side, path, hold } => {
                 let focus = (self.tab(side).id, path.clone());
-                self.queue_job(Operation::Create(path), hold, Some(focus));
+                self.queue_job(side, Operation::Create(path), hold, Some(focus));
             }
             Command::PauseJob(id) => {
                 if let Some(job) = self.jobs.iter_mut().find(|job| job.id == id) {
@@ -2083,6 +2106,7 @@ impl Engine {
     }
     fn queue_job(
         &mut self,
+        target: Side,
         operation: Operation,
         hold: bool,
         focus_on_success: Option<(u64, PathBuf)>,
@@ -2091,6 +2115,7 @@ impl Engine {
         self.jobs.push(Job {
             id: self.ids,
             title: operation.label(),
+            target,
             state: if hold {
                 JobState::Held
             } else {
@@ -2098,6 +2123,7 @@ impl Engine {
             },
             progress: Progress::default(),
             started: None,
+            finished_at: None,
             message: String::new(),
             warnings: Vec::new(),
             conflict: None,
@@ -2345,6 +2371,7 @@ impl Engine {
                             created_focus = focus;
                         }
                         job.conflict = None;
+                        job.finished_at = Some(Instant::now());
                         job.warnings = warnings;
                         match result {
                             Ok(message) => {

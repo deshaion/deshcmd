@@ -259,6 +259,47 @@ fn panel_navigation_and_preview_shortcuts() {
     let ctrl = egui::Modifiers::CTRL;
     let alt = egui::Modifiers::ALT;
 
+    app.interface.show_inline_filter = false;
+    press(&mut app, &mut frame, Key::F, ctrl);
+    draw(&mut app, &mut frame, Vec::new());
+    assert!(app.dialog.is_none());
+    assert!(ctx.memory(|memory| memory.has_focus(panes::filter_id(side))));
+    draw(
+        &mut app,
+        &mut frame,
+        vec![egui::Event::Text("preview".into())],
+    );
+    assert_eq!(app.engine.tab(side).filter().text, "preview");
+    press(&mut app, &mut frame, Key::Escape, plain);
+    assert!(!ctx.memory(|memory| memory.has_focus(panes::filter_id(side))));
+    press(&mut app, &mut frame, Key::F, ctrl | egui::Modifiers::SHIFT);
+    assert!(app.find_files.open);
+    assert!(frame_contains(
+        &draw(&mut app, &mut frame, Vec::new()),
+        "Find Files"
+    ));
+    draw(
+        &mut app,
+        &mut frame,
+        vec![egui::Event::Text("preview".into())],
+    );
+    press(&mut app, &mut frame, Key::Enter, ctrl);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let shapes = draw(&mut app, &mut frame, Vec::new());
+        if frame_contains(&shapes, "1 match") {
+            assert!(frame_contains(&shapes, "preview.txt"));
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "Find Files did not display the result"
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    press(&mut app, &mut frame, Key::Escape, plain);
+    assert!(!app.find_files.open);
+
     app.engine
         .dispatch(Command::Select(side, folder.clone(), engine::Select::Focus));
     press(&mut app, &mut frame, Key::ArrowRight, plain);
@@ -785,6 +826,44 @@ fn workspace_renders_tree_gallery_help_and_a_transfer_conflict() {
     draw(&mut app);
     assert!(frame_contains(&draw(&mut app), "Keyboard shortcuts"));
     app.interface.show_help = false;
+
+    app.apply(
+        Action::Command(Command::QueueFor(
+            Side::Right,
+            engine::Operation::Statistics(vec![right.clone()]),
+            true,
+        )),
+        &ctx,
+    );
+    app.engine.jobs[0].progress.item_total = Some(4);
+    app.engine.jobs[0].progress.items = 1;
+    let shapes = draw(&mut app);
+    assert!(frame_contains(&shapes, "Calculate size · On hold"));
+    assert!(frame_contains(&shapes, "25%"));
+    app.apply(
+        Action::Command(Command::QueueFor(
+            Side::Right,
+            engine::Operation::Benchmark,
+            true,
+        )),
+        &ctx,
+    );
+    let shapes = draw(&mut app);
+    assert!(frame_contains(&shapes, "Calculate size · On hold"));
+    assert!(frame_contains(&shapes, "Hash benchmark · On hold"));
+    assert!(!frame_contains(&shapes, "25%"));
+    app.apply(Action::ShowQueue, &ctx);
+    let shapes = draw(&mut app);
+    assert!(frame_contains(&shapes, "Operations"));
+    assert!(frame_contains(&shapes, "25%"));
+    assert!(!frame_contains(&shapes, "Calculate size · On hold"));
+    app.interface.queue = false;
+    for id in app.engine.jobs.iter().map(|job| job.id).collect::<Vec<_>>() {
+        app.engine.dispatch(Command::CancelJob(id));
+    }
+    app.engine.dispatch(Command::ClearJobs);
+    assert!(app.engine.jobs.is_empty());
+    assert_eq!(clock(3661), "01:01:01");
 
     let operation = engine::Operation::Transfer {
         paths: vec![source],

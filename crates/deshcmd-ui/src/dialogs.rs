@@ -57,6 +57,7 @@ pub(crate) enum Tool {
     ListFile,
     ListClipboard,
     Find,
+    FindFiles,
     FilterOptions,
     MarkMask,
     UnmarkMask,
@@ -119,6 +120,7 @@ pub(crate) struct Dialog {
     extract: ExtractOptions,
     archives: Vec<ArchiveSelection>,
     archive_target: Option<(PathBuf, PathBuf)>,
+    target_hint: Option<Side>,
     focus: bool,
     focus_footer: bool,
     error: Option<String>,
@@ -147,6 +149,7 @@ impl Dialog {
             extract: ExtractOptions::default(),
             archives: Vec::new(),
             archive_target: None,
+            target_hint: None,
             focus: kind != Kind::Unpack,
             focus_footer: matches!(
                 kind,
@@ -169,6 +172,11 @@ impl Dialog {
         dialog.description = summarize(&dialog.paths);
         dialog
     }
+    pub fn with_target(mut self, target: Side) -> Self {
+        self.target_hint = Some(target);
+        self
+    }
+
     pub fn pack(side: Side, paths: Vec<PathBuf>, archive: &Path, folder: &Path) -> Self {
         let mut dialog = Self::new(Kind::Pack, Tool::Pack, side, "Add to archive", paths);
         dialog.primary = archive.display().to_string();
@@ -342,7 +350,14 @@ pub(crate) fn selection_menu(ui: &mut Ui, side: Side, actions: &mut Vec<Action>)
     });
     ui.separator();
     menu_item(ui, side, "Quick Search…", Tool::Find, actions);
-    menu_item(ui, side, "Filter… · Ctrl+F", Tool::FilterOptions, actions);
+    menu_item(
+        ui,
+        side,
+        "Find Files… · Ctrl+Shift+F",
+        Tool::FindFiles,
+        actions,
+    );
+    menu_item(ui, side, "Filter Options…", Tool::FilterOptions, actions);
 }
 pub(crate) fn tools_menu(ui: &mut Ui, side: Side, actions: &mut Vec<Action>) {
     menu_item(ui, side, "Settings…", Tool::Settings, actions);
@@ -479,6 +494,10 @@ fn details_text(
 impl App {
     pub(crate) fn invoke(&mut self, side: Side, tool: Tool, ctx: &egui::Context) {
         self.cancel_dialog_read();
+        if matches!(tool, Tool::FindFiles) {
+            self.open_find_files(side);
+            return;
+        }
         if matches!(tool, Tool::Settings) {
             self.open_settings(ctx);
             return;
@@ -534,6 +553,7 @@ impl App {
             return;
         }
         let mut result = match tool {
+            Tool::FindFiles => unreachable!(),
             Tool::UnlockArchive => {
                 if let Some(archive) = archive.as_ref() {
                     let mut dialog = Dialog::new(
@@ -713,8 +733,8 @@ impl App {
                 self.notice(message);
                 None
             }
-            Tool::Copy | Tool::CopyHere | Tool::Move if tab.has_operands() => {
-                Some(Dialog::transfer(
+            Tool::Copy | Tool::CopyHere | Tool::Move if tab.has_operands() => Some(
+                Dialog::transfer(
                     side,
                     tab.operands(),
                     if matches!(tool, Tool::CopyHere) {
@@ -723,8 +743,13 @@ impl App {
                         other
                     },
                     matches!(tool, Tool::Move),
-                ))
-            }
+                )
+                .with_target(if matches!(tool, Tool::CopyHere) {
+                    side
+                } else {
+                    side.other()
+                }),
+            ),
             Tool::Copy | Tool::CopyHere | Tool::Move => {
                 self.notice(empty());
                 None
@@ -897,7 +922,11 @@ impl App {
             }
             Tool::Statistics if tab.has_operands() => {
                 self.apply(
-                    Action::Command(Command::Queue(Operation::Statistics(tab.operands()), false)),
+                    Action::Command(Command::QueueFor(
+                        side,
+                        Operation::Statistics(tab.operands()),
+                        false,
+                    )),
                     ctx,
                 );
                 None
@@ -974,7 +1003,7 @@ impl App {
             }
             Tool::Benchmark => {
                 self.apply(
-                    Action::Command(Command::Queue(Operation::Benchmark, false)),
+                    Action::Command(Command::QueueFor(side, Operation::Benchmark, false)),
                     ctx,
                 );
                 None
@@ -1026,7 +1055,7 @@ impl App {
                     self.notice("Clipboard does not contain files");
                     None
                 } else {
-                    Some(Dialog::transfer(side, paths, base, moving))
+                    Some(Dialog::transfer(side, paths, base, moving).with_target(side))
                 }
             }
             Tool::CopyNames
@@ -1075,7 +1104,8 @@ impl App {
                     };
                     if let Some(output) = self.desktop.save_file(&base, name, "Export file list") {
                         self.apply(
-                            Action::Command(Command::Queue(
+                            Action::Command(Command::QueueFor(
+                                side,
                                 Operation::Export {
                                     output,
                                     contents: text,
@@ -1205,7 +1235,8 @@ impl App {
                 if let Some(output) = self.desktop.save_file(&base, name, "Export workspace data") {
                     match json {
                         Ok(contents) => self.apply(
-                            Action::Command(Command::Queue(
+                            Action::Command(Command::QueueFor(
+                                side,
                                 Operation::Export { output, contents },
                                 false,
                             )),
@@ -1604,7 +1635,29 @@ impl App {
                 .cloned()
                 .ok_or_else(|| "Choose an item first".to_string())
         };
-        let queue = |operation| Action::Command(Command::Queue(operation, held));
+        let queue = |operation| {
+            let destination = match &operation {
+                Operation::Transfer { destination, .. }
+                | Operation::Archive(ArchiveOperation::Extract { destination, .. }) => {
+                    Some(destination.as_path())
+                }
+                Operation::Archive(ArchiveOperation::Pack { output, .. }) => Some(output.as_path()),
+                Operation::Split { destination, .. } => Some(destination.as_path()),
+                Operation::Combine { output, .. } | Operation::Hash { output, .. } => {
+                    Some(output.as_path())
+                }
+                _ => None,
+            };
+            let preferred = dialog.target_hint.unwrap_or_else(|| {
+                if matches!(tool, Tool::Copy | Tool::Move) {
+                    side.other()
+                } else {
+                    side
+                }
+            });
+            let target = destination.map_or(side, |path| self.operation_target(path, preferred));
+            Action::Command(Command::QueueFor(target, operation, held))
+        };
         let action = match kind {
             Kind::UnlockArchive => Action::Command(Command::UnlockArchive {
                 side,
@@ -2324,7 +2377,7 @@ fn summarize(paths: &[PathBuf]) -> String {
         names
     }
 }
-fn absolute_input(base: &Path, home: &Path, input: &str) -> Result<PathBuf, String> {
+pub(crate) fn absolute_input(base: &Path, home: &Path, input: &str) -> Result<PathBuf, String> {
     let input = input.trim();
     if input.is_empty() {
         return Err("Enter a path".into());

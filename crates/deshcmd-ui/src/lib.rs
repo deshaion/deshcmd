@@ -1,5 +1,6 @@
 mod about;
 mod dialogs;
+mod find_files;
 mod panes;
 mod previews;
 mod probes;
@@ -81,6 +82,7 @@ enum Action {
     },
     Path(Side, PathBuf),
     ToggleQuick(Side),
+    ShowQueue,
     ClipboardText(String),
     Eject(PathBuf),
     CheckForUpdates,
@@ -124,6 +126,7 @@ pub struct App {
     desktop: Box<dyn Desktop>,
     interface: Interface,
     dialog: Option<Dialog>,
+    find_files: find_files::FindFiles,
     preferences: Option<settings::Preferences>,
     places: std::sync::Arc<Vec<Place>>,
     read_places: fn() -> Vec<Place>,
@@ -202,6 +205,7 @@ impl App {
                 ..Default::default()
             },
             dialog: None,
+            find_files: find_files::FindFiles::new(context.storage),
             preferences: None,
             places_cache: probes::ReadCache::new(&context.egui_ctx, 1, Duration::from_secs(10), 1),
             spaces: probes::ReadCache::new(&context.egui_ctx, 2, Duration::from_secs(10), 32),
@@ -348,7 +352,8 @@ impl App {
                         self.dialog = Some(Dialog::pack(side, paths, archive, folder));
                     }
                 } else {
-                    self.dialog = Some(Dialog::transfer(side, paths, destination, moving));
+                    self.dialog =
+                        Some(Dialog::transfer(side, paths, destination, moving).with_target(side));
                 }
             }
             Action::Path(side, path) => self.engine.dispatch(Command::Navigate {
@@ -357,6 +362,7 @@ impl App {
                 new_tab: false,
                 background: false,
             }),
+            Action::ShowQueue => self.interface.queue = true,
             Action::ToggleQuick(side) => {
                 self.interface.quick = if self.interface.quick == Some(side) {
                     None
@@ -823,6 +829,28 @@ impl App {
         });
     }
 
+    fn operation_target(&self, path: &Path, preferred: Side) -> Side {
+        [preferred, preferred.other()]
+            .into_iter()
+            .filter_map(|side| {
+                let location = self.engine.tab(side).location();
+                let location = match location {
+                    engine::Location::Archive { file, .. } if path == file => file.clone(),
+                    _ => location.display_path(),
+                };
+                path.starts_with(&location)
+                    .then(|| (side, location.components().count()))
+            })
+            .reduce(|best, candidate| {
+                if candidate.1 > best.1 {
+                    candidate
+                } else {
+                    best
+                }
+            })
+            .map_or(preferred, |(side, _)| side)
+    }
+
     fn queue(&mut self, ui: &mut Ui, rect: Rect, actions: &mut Vec<Action>) {
         card(ui, rect, SURFACE);
         let compact = rect.height() < 80.;
@@ -868,28 +896,37 @@ impl App {
                             _ => SUB,
                         };
                         ui.label(label(job.state.label(), 12., ink));
-                        if let Some(total) = job.progress.total.filter(|total| *total > 0) {
-                            ui.add(
-                                egui::ProgressBar::new(
-                                    (job.progress.bytes as f32 / total as f32).min(1.),
-                                )
-                                .desired_width(85.),
-                            );
-                            if !job.state.finished()
-                                && let Some(start) = job.started
+                        if let Some((done, total)) = job.progress.overall() {
+                            let shown = if job.state == JobState::Done {
+                                total
+                            } else {
+                                done
+                            };
+                            ui.add(operation_progress(shown, total, 85.))
+                                .on_hover_text("Overall operation progress");
+                        }
+                        if let Some(start) = job.started {
+                            let elapsed = job
+                                .finished_at
+                                .unwrap_or_else(Instant::now)
+                                .saturating_duration_since(start);
+                            ui.label(mono(clock(elapsed.as_secs()), 10., MUTED))
+                                .on_hover_text("Elapsed time");
+                            if job.state == JobState::Running
+                                && let Some((done, total)) = job.progress.overall()
+                                && done > 0
                             {
-                                let rate = job.progress.bytes as f64
-                                    / start.elapsed().as_secs_f64().max(0.1);
-                                if rate > 0. {
-                                    let eta = (total.saturating_sub(job.progress.bytes) as f64
-                                        / rate)
-                                        as u64;
+                                let rate = done as f64 / elapsed.as_secs_f64().max(0.1);
+                                if job.progress.total.is_some_and(|bytes| bytes > 0) {
                                     ui.label(mono(
-                                        format!("{}/s · {eta}s", metric(rate as u64)),
+                                        format!("{}/s", metric(rate as u64)),
                                         10.,
                                         MUTED,
                                     ));
                                 }
+                                let eta = ((total - done) as f64 / rate).ceil() as u64;
+                                ui.label(mono(clock(eta), 10., MUTED))
+                                    .on_hover_text("Estimated time remaining");
                             }
                         }
                         if job.progress.file_total > 0 && !job.state.finished() {
@@ -981,6 +1018,7 @@ impl App {
         }
         let text_context = self.text_field_focused(ctx)
             || self.dialog.is_some()
+            || self.find_files.open
             || self.update.is_some()
             || self.preferences.is_some()
             || self.interface.show_help
@@ -1033,6 +1071,7 @@ impl App {
 
     fn keyboard(&mut self, ctx: &egui::Context, actions: &mut Vec<Action>) {
         if self.dialog.is_some()
+            || self.find_files.open
             || self.update.is_some()
             || self.preferences.is_some()
             || self.interface.show_help
@@ -1093,8 +1132,26 @@ impl App {
             self.interface.panes[side.index()].start_path();
             return;
         }
-        if command(Key::F) {
-            actions.push(Action::Tool(side, Tool::FilterOptions));
+        if exact(egui::Modifiers::CTRL | egui::Modifiers::SHIFT, Key::F)
+            || exact(egui::Modifiers::COMMAND | egui::Modifiers::SHIFT, Key::F)
+        {
+            actions.push(Action::Tool(side, Tool::FindFiles));
+            return;
+        }
+        if exact(egui::Modifiers::CTRL, Key::F) || exact(egui::Modifiers::COMMAND, Key::F) {
+            if self.interface.quick == Some(side.other()) {
+                self.interface.quick = None;
+            }
+            self.interface.panes[side.index()].focus_filter();
+            return;
+        }
+        if ctx.memory(|memory| memory.has_focus(panes::filter_id(side))) && just(Key::Escape) {
+            self.interface.panes[side.index()].close_filter();
+            ctx.memory_mut(|memory| memory.surrender_focus(panes::filter_id(side)));
+            actions.push(Action::Command(Command::Filter(
+                side,
+                engine::MatchOptions::filename(""),
+            )));
             return;
         }
         if editing {
@@ -1321,7 +1378,9 @@ impl App {
                             ("Up / Down · Space", "Move focus · toggle mark"),
                             ("Shift + Up / Down", "Extend selection"),
                             ("Ctrl + A / I", "Mark all or invert marks"),
-                            ("Ctrl + F / R", "Open filter options or refresh"),
+                            ("Ctrl + F", "Filter the active panel"),
+                            ("Ctrl + Shift + F", "Find files"),
+                            ("Ctrl + R", "Refresh the active panel"),
                             ("Ctrl + .", "Toggle hidden files"),
                             ("F2", "Rename"),
                             ("Ctrl + Q / F3", "Toggle Quick View"),
@@ -1494,6 +1553,15 @@ impl App {
             } else {
                 &self.engine.settings.columns
             };
+            let pending_jobs = if self.interface.queue && queue_height > queue_gap {
+                Vec::new()
+            } else {
+                self.engine
+                    .jobs
+                    .iter()
+                    .filter(|job| job.target == side && !job.state.finished())
+                    .collect::<Vec<_>>()
+            };
             let settings = panes::PaneScreen {
                 pane,
                 side,
@@ -1505,6 +1573,7 @@ impl App {
                 show_inline_filter: self.interface.show_inline_filter,
                 reveal_cursor: self.interface.focus_scroll == Some(side) || cursor_restored,
                 history_preview: self.engine.history_preview(side),
+                pending_jobs: &pending_jobs,
                 preview: quick.map(|source| (source, self.engine.tab(source).current())),
             };
             self.interface.panes[side.index()].show(
@@ -1546,6 +1615,21 @@ impl App {
         #[cfg(not(target_os = "macos"))]
         window::resize_edges(ui, root);
     }
+}
+
+fn clock(seconds: u64) -> String {
+    format!(
+        "{:02}:{:02}:{:02}",
+        seconds / 3600,
+        seconds / 60 % 60,
+        seconds % 60
+    )
+}
+
+fn operation_progress(done: u64, total: u64, width: f32) -> egui::ProgressBar {
+    egui::ProgressBar::new(done as f32 / total as f32)
+        .desired_width(width)
+        .show_percentage()
 }
 
 impl eframe::App for App {
@@ -1608,6 +1692,7 @@ impl eframe::App for App {
         if self.preferences.is_some() {
             self.show_settings(&ctx);
         } else {
+            self.show_find_files(&ctx);
             self.dialogs(&ctx);
         }
         if self.interface.show_help {
@@ -1638,6 +1723,7 @@ impl eframe::App for App {
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
         eframe::set_value(storage, "workspace", &self.engine.snapshot());
+        eframe::set_value(storage, "find_templates", &self.find_files.templates);
         eframe::set_value(
             storage,
             "show_inline_filter",

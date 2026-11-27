@@ -23,6 +23,9 @@ pub(crate) struct PanelUi {
     base: PathBuf,
     path_draft: String,
     filter: String,
+    last_filter: String,
+    filter_visibility: Option<bool>,
+    request_filter: bool,
     editing_path: bool,
     request_path: bool,
     active_tab_in_strip: Option<(usize, u64, String, f32)>,
@@ -39,6 +42,7 @@ pub(crate) struct PaneScreen<'a> {
     pub show_modified_time: bool,
     pub show_inline_filter: bool,
     pub reveal_cursor: bool,
+    pub pending_jobs: &'a [&'a engine::Job],
     pub preview: Option<(Side, Option<&'a Entry>)>,
     pub history_preview: Option<engine::HistoryPreview<'a>>,
 }
@@ -56,6 +60,19 @@ pub(crate) fn path_id(side: Side) -> Id {
 impl PanelUi {
     pub fn set_filter_text(&mut self, text: &str) {
         self.filter = text.to_owned();
+    }
+
+    pub fn focus_filter(&mut self) {
+        self.editing_path = false;
+        self.request_path = false;
+        self.filter_visibility = Some(true);
+        self.request_filter = true;
+    }
+
+    pub fn close_filter(&mut self) {
+        self.filter.clear();
+        self.filter_visibility = Some(false);
+        self.request_filter = false;
     }
 
     pub fn start_path(&mut self) {
@@ -93,6 +110,7 @@ impl PanelUi {
             reveal_cursor,
             preview,
             history_preview,
+            pending_jobs,
         } = screen;
         let tab = pane.tab();
         root.painter().rect(
@@ -109,6 +127,22 @@ impl PanelUi {
             ),
             egui::StrokeKind::Inside,
         );
+        let rect = if pending_jobs.is_empty() {
+            rect
+        } else {
+            let body = Rect::from_min_max(rect.min, rect.max - vec2(0., 27.));
+            operation_status(
+                root,
+                Rect::from_min_max(
+                    pos2(rect.left() + 1., body.bottom()),
+                    rect.max - vec2(1., 1.),
+                ),
+                side,
+                pending_jobs,
+                actions,
+            );
+            body
+        };
         if let Some(selection) = preview {
             show_preview(
                 root,
@@ -129,6 +163,10 @@ impl PanelUi {
             self.base = display_path;
             self.filter.clone_from(&tab.filter().text);
         }
+        if self.last_filter != tab.filter().text {
+            self.last_filter.clone_from(&tab.filter().text);
+            self.filter.clone_from(&self.last_filter);
+        }
         let short = rect.height() < 225.;
         let tabs = Rect::from_min_max(
             rect.min + vec2(9., 5.),
@@ -142,7 +180,10 @@ impl PanelUi {
         );
         self.navigation(root, nav, tab, side, home, actions);
         let mut body_top = nav.bottom() + 4.;
-        if show_inline_filter && !short {
+        if self
+            .filter_visibility
+            .unwrap_or(show_inline_filter && !short)
+        {
             let tools = Rect::from_min_max(
                 pos2(rect.left() + 12., body_top),
                 pos2(rect.right() - 11., body_top + 33.),
@@ -675,7 +716,7 @@ impl PanelUi {
             rect,
             Layout::left_to_right(Align::Center),
         );
-        let width = (rect.width() - 107.).clamp(60., 450.);
+        let width = (rect.width() - 137.).clamp(60., 450.);
         let (filter_rect, _) = ui.allocate_exact_size(vec2(width, 28.), Sense::hover());
         ui.painter().rect(
             filter_rect,
@@ -709,6 +750,9 @@ impl PanelUi {
                 .align(Align2::LEFT_CENTER)
                 .frame(egui::Frame::NONE),
         );
+        if std::mem::take(&mut self.request_filter) {
+            edit.request_focus();
+        }
         if edit.changed() {
             let mut criteria = tab.filter().clone();
             criteria.text.clone_from(&self.filter);
@@ -736,6 +780,15 @@ impl PanelUi {
         }
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             ui.spacing_mut().item_spacing.x = 1.;
+            if icon_button(ui, Icon::Close, "Close inline filter (Esc)", true).clicked() {
+                self.close_filter();
+                ui.memory_mut(|memory| memory.surrender_focus(filter_id(side)));
+                ui.ctx().request_repaint();
+                actions.push(Action::Command(Command::Filter(
+                    side,
+                    engine::MatchOptions::filename(""),
+                )));
+            }
             for (icon, title, view) in [
                 (Icon::Grid, "Gallery", View::Gallery),
                 (Icon::List, "Compact list", View::Compact),
@@ -1407,6 +1460,61 @@ pub(crate) fn value(entry: &Entry, column: Column, show_modified_time: bool) -> 
     }
 }
 
+fn operation_status(
+    root: &mut Ui,
+    rect: Rect,
+    side: Side,
+    jobs: &[&engine::Job],
+    actions: &mut Vec<Action>,
+) {
+    root.painter()
+        .hline(rect.x_range(), rect.top(), Stroke::new(1., LINE));
+    let mut ui = child(
+        root,
+        Id::unique(("operation-status", side.index())),
+        rect.shrink2(vec2(10., 1.)),
+        Layout::left_to_right(Align::Center),
+    );
+    let summary = |job: &engine::Job| format!("{} · {}", job.title, job.state.label());
+    let more = jobs.len().saturating_sub(2);
+    let details = jobs
+        .iter()
+        .map(|job| summary(job))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let text = if more > 0 {
+        format!("{}  |  {}  +{more}", summary(jobs[0]), summary(jobs[1]))
+    } else {
+        jobs.iter()
+            .map(|job| summary(job))
+            .collect::<Vec<_>>()
+            .join("  |  ")
+    };
+    let progress = if jobs.len() == 1 {
+        jobs[0].progress.overall()
+    } else {
+        None
+    };
+    let reserved = if progress.is_some() { 158. } else { 68. };
+    ui.add_sized(
+        vec2((ui.available_width() - reserved).max(0.), 20.),
+        egui::Label::new(label(text, 11., SUB)).truncate(),
+    )
+    .on_hover_text(details);
+    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+        if ui
+            .small_button("Queue")
+            .on_hover_text("Show operation queue")
+            .clicked()
+        {
+            actions.push(Action::ShowQueue);
+        }
+        if let Some((done, total)) = progress {
+            ui.add(crate::operation_progress(done, total, 80.));
+        }
+    });
+}
+
 fn panel_status(root: &mut Ui, rect: Rect, side: Side, tab: &Tab, space: Option<(u64, u64)>) {
     root.painter()
         .hline(rect.x_range(), rect.top(), Stroke::new(1., LINE));
@@ -1453,7 +1561,7 @@ fn panel_status(root: &mut Ui, rect: Rect, side: Side, tab: &Tab, space: Option<
     }
     if tab.filter().is_active() {
         ui.label(label("Filtered", 11., ACCENT))
-            .on_hover_text("Ctrl+F to open filter options");
+            .on_hover_text("Ctrl+F to edit the inline filter");
     }
     if tab.skipped > 0 {
         ui.label(label(format!("{} unavailable", tab.skipped), 11., AMBER));

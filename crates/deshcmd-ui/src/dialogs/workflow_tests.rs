@@ -195,6 +195,7 @@ fn transfer_split_and_checksum_forms_queue_expected_work() {
     assert!(session.app.engine.jobs.is_empty());
     copy.primary = "~/right".into();
     session.submit(&copy);
+    assert_eq!(session.app.engine.jobs.last().unwrap().target, Side::Right);
     assert_eq!(
         std::fs::read(session.right.join("original.txt")).unwrap(),
         b"abcdef"

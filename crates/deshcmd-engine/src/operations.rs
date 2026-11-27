@@ -249,6 +249,10 @@ pub enum Operation {
         algorithm: Algorithm,
     },
     Benchmark,
+    ReplaceContent {
+        files: Vec<crate::search::Replacement>,
+        options: Box<crate::search::Options>,
+    },
     Export {
         output: PathBuf,
         contents: String,
@@ -276,6 +280,7 @@ impl Operation {
             Self::Hash { .. } => "Calculate checksums",
             Self::Verify { .. } => "Verify checksums",
             Self::Benchmark => "Hash benchmark",
+            Self::ReplaceContent { .. } => "Replace text",
             Self::Export { .. } => "Export list",
         }
     }
@@ -289,6 +294,19 @@ pub struct Progress {
     pub file_bytes: u64,
     pub file_total: u64,
     pub items: usize,
+    pub item_total: Option<usize>,
+}
+
+impl Progress {
+    pub fn overall(&self) -> Option<(u64, u64)> {
+        if let Some(total) = self.total.filter(|total| *total > 0) {
+            Some((self.bytes.min(total), total))
+        } else {
+            self.item_total
+                .filter(|total| *total > 0)
+                .map(|total| (self.items.min(total) as u64, total as u64))
+        }
+    }
 }
 
 #[derive(Default)]
@@ -471,6 +489,7 @@ impl Worker<'_> {
                 format!("Created {}", name(&path))
             }
             Operation::Delete { paths, trash } => {
+                self.progress.item_total = Some(paths.len());
                 for path in paths {
                     self.control.check()?;
                     self.update(&path, 0);
@@ -489,6 +508,7 @@ impl Worker<'_> {
                 if passes == 0 {
                     return Err(io::Error::other("Choose at least one overwrite pass"));
                 }
+                self.progress.item_total = Some(paths.len());
                 for path in paths {
                     self.control.check()?;
                     let result = nonroot(&path).and_then(|()| self.wipe(&path, passes));
@@ -520,6 +540,9 @@ impl Worker<'_> {
                 modified,
                 recursive,
             } => {
+                if !recursive {
+                    self.progress.item_total = Some(paths.len());
+                }
                 for path in paths {
                     if recursive && path.symlink_metadata()?.is_dir() {
                         for entry in walkdir::WalkDir::new(&path).contents_first(true) {
@@ -582,6 +605,17 @@ impl Worker<'_> {
                 algorithm,
             } => self.verify(&source, expected.as_deref(), algorithm)?,
             Operation::Benchmark => self.benchmark()?,
+            Operation::ReplaceContent { files, options } => {
+                let replacement = crate::search::ReplaceContent::compile(&options)?;
+                self.progress.item_total = Some(files.len());
+                for file in &files {
+                    self.control.check()?;
+                    self.update(&file.path, 0);
+                    let result = replacement.apply(file, &self.control);
+                    self.attempt(&file.path, result)?;
+                }
+                format!("Processed {} files", files.len())
+            }
             Operation::Export { output, contents } => {
                 let mut temporary = NamedTempFile::new_in(parent(&output)?)?;
                 temporary.write_all(contents.as_bytes())?;
@@ -675,7 +709,7 @@ fn remove_file_or_link(path: &Path) -> io::Result<()> {
     fs::remove_file(path)
 }
 
-fn commit(temporary: NamedTempFile, target: &Path, replace: bool) -> io::Result<()> {
+pub(crate) fn commit(temporary: NamedTempFile, target: &Path, replace: bool) -> io::Result<()> {
     temporary.as_file().sync_all()?;
     if replace {
         temporary.persist(target).map_err(|e| e.error)?;
@@ -1972,6 +2006,7 @@ impl Worker<'_> {
         algorithm: Algorithm,
     ) -> io::Result<String> {
         if let Some(expected) = expected {
+            self.progress.total = Some(source.metadata()?.len());
             let digest = self.digest(source, algorithm)?;
             if !digest.eq_ignore_ascii_case(expected.trim()) {
                 return Err(io::Error::other(format!(

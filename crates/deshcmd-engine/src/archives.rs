@@ -315,6 +315,7 @@ struct Member {
     size: Option<u64>,
     folder: bool,
     mode: Option<u32>,
+    modified: Option<SystemTime>,
     crc: Option<u32>,
     encrypted: bool,
 }
@@ -433,6 +434,9 @@ fn read_listing(text: &str) -> io::Result<Inventory> {
                 size,
                 folder,
                 mode: mode.and_then(access_mode),
+                modified: record
+                    .get("Modified")
+                    .and_then(|value| member_modified(value)),
                 crc: record
                     .get("CRC")
                     .and_then(|value| u32::from_str_radix(value, 16).ok()),
@@ -588,12 +592,21 @@ fn explain_extract_error(error: io::Error, file: &Path, password: &str) -> io::E
     }
 }
 
+fn member_modified(value: &str) -> Option<SystemTime> {
+    let local = chrono::NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S%.f").ok()?;
+    local
+        .and_local_timezone(chrono::Local)
+        .earliest()
+        .map(SystemTime::from)
+}
+
 fn read_rar_listing(text: &str) -> io::Result<Inventory> {
     let mut inventory = Inventory::default();
     let mut name = None;
     let mut kind = None;
     let mut size = None;
     let mut mode = None;
+    let mut modified = None;
     let mut crc = None;
     for line in text.lines().chain(std::iter::once("")) {
         if let Some(value) = line.strip_prefix("        Name: ") {
@@ -604,6 +617,8 @@ fn read_rar_listing(text: &str) -> io::Result<Inventory> {
             kind = Some(value);
         } else if let Some(value) = line.strip_prefix("        Size: ") {
             size = value.parse().ok();
+        } else if let Some(value) = line.trim_start().strip_prefix("mtime: ") {
+            modified = member_modified(value);
         } else if let Some(value) = line.trim_start().strip_prefix("Attributes: ") {
             mode = access_mode(value);
         } else if let Some(value) = line.trim_start().strip_prefix("CRC32: ") {
@@ -621,6 +636,7 @@ fn read_rar_listing(text: &str) -> io::Result<Inventory> {
                     size,
                     folder: kind == Some("Directory"),
                     mode,
+                    modified,
                     crc,
                     encrypted: false,
                 });
@@ -629,6 +645,7 @@ fn read_rar_listing(text: &str) -> io::Result<Inventory> {
             }
             size = None;
             mode = None;
+            modified = None;
             crc = None;
         }
     }
@@ -760,6 +777,10 @@ impl Reader {
                     folder: false,
                     mode: None,
                     crc: None,
+                    modified: file
+                        .metadata()
+                        .and_then(|metadata| metadata.modified())
+                        .ok(),
                     encrypted: false,
                 },
                 file: inner,
@@ -957,7 +978,7 @@ fn copy_stream(
 }
 
 #[derive(PartialEq, Eq)]
-struct FileRevision {
+pub(crate) struct FileRevision {
     len: u64,
     modified: Option<SystemTime>,
     #[cfg(unix)]
@@ -965,7 +986,7 @@ struct FileRevision {
 }
 
 impl FileRevision {
-    fn new(metadata: &fs::Metadata) -> Self {
+    pub(crate) fn new(metadata: &fs::Metadata) -> Self {
         #[cfg(unix)]
         use std::os::unix::fs::MetadataExt;
         Self {
@@ -1303,6 +1324,7 @@ impl Worker<'_> {
             } => self.unpack(sources, &destination, &options),
             ArchiveOperation::Delete(source) => self.delete_members(source),
             ArchiveOperation::Test { paths, password } => {
+                self.progress.item_total = Some(paths.len());
                 for path in &paths {
                     self.update(path, 0);
                     let output = tempfile::tempfile()?;
@@ -1407,7 +1429,7 @@ impl Worker<'_> {
                 self.control.check()?;
                 fs::create_dir_all(path.parent().unwrap())?;
                 let mut output = File::options().write(true).create_new(true).open(&path)?;
-                self.update(&member.path, member.size.unwrap_or(0));
+                self.update(&member.path, 0);
                 if let Some(stream) = &mut batch {
                     copy_batch_member(stream, &mut output, member, &self.control)?;
                 } else {
@@ -1897,6 +1919,7 @@ fn read_json_listing(text: &str) -> io::Result<Inventory> {
                 size: entry.size,
                 folder: entry.folder,
                 mode: entry.mode.map(|mode| mode & 0o777),
+                modified: None,
                 crc: None,
                 encrypted: entry.encrypted,
             });
@@ -1969,3 +1992,62 @@ impl ExternalArchiver {
 
 #[cfg(test)]
 mod tests;
+
+pub(crate) struct SearchMember<'a> {
+    pub path: &'a Path,
+    pub size: Option<u64>,
+    pub mode: Option<u32>,
+    pub modified: Option<SystemTime>,
+}
+
+pub(crate) struct SearchArchive {
+    reader: Reader,
+    inventory: Arc<Inventory>,
+    control: Control,
+}
+
+impl SearchArchive {
+    pub(crate) fn open(file: &Path, cancel: &crate::read_pool::Cancellation) -> io::Result<Self> {
+        let control = Control::for_read(cancel);
+        let reader = Reader::open(file, "", &control)?;
+        let inventory = Arc::new(reader.list("", &control)?);
+        Ok(Self {
+            reader,
+            inventory,
+            control,
+        })
+    }
+
+    pub(crate) fn files(&self) -> impl Iterator<Item = SearchMember<'_>> {
+        self.inventory
+            .members
+            .iter()
+            .filter(|member| !member.folder)
+            .map(|member| SearchMember {
+                path: &member.path,
+                size: member.size,
+                mode: member.mode,
+                modified: member.modified,
+            })
+    }
+
+    pub(crate) fn read(&self, path: &Path, limit: u64) -> io::Result<Vec<u8>> {
+        let mut matching = self
+            .inventory
+            .members
+            .iter()
+            .filter(|member| !member.folder && member.path == path);
+        let member = matching
+            .next()
+            .ok_or_else(|| io::Error::other("Missing archive member"))?;
+        if matching.next().is_some() || member.size.is_some_and(|size| size > limit) {
+            return Err(io::Error::other(
+                "Archive member is ambiguous or exceeds the search limit",
+            ));
+        }
+        let output = NamedTempFile::new()?;
+        self.reader
+            .extract(member, output.as_file(), "", &self.control, Some(limit))?;
+        fs::read(output.path())
+    }
+}
