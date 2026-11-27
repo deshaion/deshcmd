@@ -583,20 +583,7 @@ pub fn card(ui: &Ui, rect: Rect, fill: C) {
         .rect(rect, 10., fill, Stroke::new(1., LINE), StrokeKind::Inside);
 }
 pub fn metric(bytes: u64) -> String {
-    let mut value = bytes as f64;
-    let mut unit = "B";
-    for next in ["KB", "MB", "GB", "TB", "PB"] {
-        if value < 1024. {
-            break;
-        }
-        value /= 1024.;
-        unit = next;
-    }
-    if unit == "B" {
-        format!("{bytes} B")
-    } else {
-        format!("{value:.1} {unit}")
-    }
+    deshcmd_engine::format_size(bytes, false)
 }
 pub fn contained_size(size: Vec2, bounds: Vec2) -> Vec2 {
     if size.x <= 0. || size.y <= 0. {

@@ -543,6 +543,7 @@ impl App {
                     | Tool::CopyDetails
                     | Tool::ExportDetails
                     | Tool::OpenTerminal
+                    | Tool::JobDetails(_)
             )
         {
             self.notice("This action requires a local file or folder");
@@ -1274,10 +1275,29 @@ impl App {
                     return;
                 };
                 let mut dialog = Dialog::new(Kind::HelpDetail, tool, side, job.title, Vec::new());
-                dialog.description = std::iter::once(job.message.as_str())
-                    .chain(job.warnings.iter().map(String::as_str))
-                    .collect::<Vec<_>>()
-                    .join("\n");
+                let mut sections = Vec::new();
+                if !job.paths.items.is_empty() {
+                    let mut items = String::from(if job.paths.destination.is_some() {
+                        "Sources"
+                    } else {
+                        "Items"
+                    });
+                    for path in &job.paths.items {
+                        items.push('\n');
+                        items.push_str(&path.to_string_lossy());
+                    }
+                    sections.push(items);
+                }
+                if let Some(destination) = &job.paths.destination {
+                    sections.push(format!("Destination\n{}", destination.display()));
+                }
+                if !job.message.is_empty() {
+                    sections.push(job.message.clone());
+                }
+                if !job.warnings.is_empty() {
+                    sections.push(job.warnings.join("\n"));
+                }
+                dialog.description = sections.join("\n\n");
                 Some(dialog)
             }
         };

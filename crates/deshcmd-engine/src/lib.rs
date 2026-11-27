@@ -32,7 +32,7 @@ pub use listing::{
     preview_cancellable,
 };
 pub use operations::{
-    Algorithm, Collision, Conflict, ManifestMode, Operation, Progress, TransferOptions,
+    Algorithm, Collision, Conflict, JobPaths, ManifestMode, Operation, Progress, TransferOptions,
 };
 use operations::{Control, Worker};
 pub use preview_cache::PreviewDiskCache;
@@ -117,6 +117,7 @@ pub struct Settings {
     pub natural_sort: bool,
     pub directories_first: bool,
     pub auto_refresh: bool,
+    pub double_click_new_tab: bool,
     pub confirm_trash: bool,
     pub confirm_delete: bool,
     pub columns: Vec<Column>,
@@ -139,6 +140,7 @@ impl Default for Settings {
             natural_sort: true,
             directories_first: true,
             auto_refresh: true,
+            double_click_new_tab: true,
             confirm_trash: true,
             confirm_delete: true,
             columns: vec![Column::Name, Column::Size, Column::Modified],
@@ -369,6 +371,14 @@ impl Tab {
             self.selected.len()
         }
     }
+    pub fn mark_snapshot(&self) -> &Arc<HashSet<Arc<Path>>> {
+        &self.selected
+    }
+
+    pub fn visible_revision(&self) -> Option<(u64, u64)> {
+        self.installed_view.map(|key| (key.raw, key.revision))
+    }
+
     pub fn marked_entries(&self) -> impl Iterator<Item = &Entry> {
         (self.marked_count() != 0)
             .then(|| {
@@ -670,6 +680,10 @@ impl Tab {
                 self.anchor = Some(path.clone());
                 self.anchor_position = Some(position);
             }
+            Select::Cursor => {
+                self.anchor = Some(path.clone());
+                self.anchor_position = Some(position);
+            }
             Select::Toggle => {
                 let entry = &self.view.raw.entries[index];
                 let mark = !self.selected.contains(entry.path.as_path());
@@ -718,6 +732,7 @@ pub enum Select {
     Toggle,
     Extend,
     Focus,
+    Cursor,
 }
 #[derive(Clone, Copy, Debug)]
 pub enum Step {
@@ -843,6 +858,7 @@ impl JobState {
 pub struct Job {
     pub id: u64,
     pub title: &'static str,
+    pub paths: JobPaths,
     pub target: Side,
     pub state: JobState,
     pub progress: Progress,
@@ -1310,8 +1326,11 @@ impl Engine {
             }
             Command::Select(side, path, mode) => {
                 self.settings.active = side;
-                self.tab_mut(side)
-                    .select(&path, mode, !matches!(mode, Select::Focus));
+                self.tab_mut(side).select(
+                    &path,
+                    mode,
+                    !matches!(mode, Select::Focus | Select::Cursor),
+                );
             }
             Command::Step(side, step, extend) => {
                 let tab = self.tab_mut(side);
@@ -2115,6 +2134,7 @@ impl Engine {
         self.jobs.push(Job {
             id: self.ids,
             title: operation.label(),
+            paths: operation.job_paths(),
             target,
             state: if hold {
                 JobState::Held
@@ -2536,6 +2556,42 @@ pub fn read_list(path: &Path) -> io::Result<String> {
     }
     Ok(output)
 }
+pub fn format_size(bytes: u64, minimum_kilobytes: bool) -> String {
+    let mut value = bytes as f64;
+    let mut unit = "B";
+    for next in ["KB", "MB", "GB", "TB", "PB"] {
+        if value < 1024. && !(unit == "B" && minimum_kilobytes) {
+            break;
+        }
+        value /= 1024.;
+        unit = next;
+    }
+    if unit == "B" {
+        format!("{bytes} B")
+    } else if bytes == 0 {
+        format!("0 {unit}")
+    } else if value < 1. {
+        format!("{value:.3} {unit}")
+    } else {
+        format!("{value:.1} {unit}")
+    }
+}
+
+pub fn folder_size(path: &Path, cancel: &read_pool::Cancellation) -> io::Result<u64> {
+    let mut error = None;
+    let stats = operations::occupied_size(
+        path,
+        || cancel.check(),
+        |issue| {
+            error.get_or_insert(issue);
+        },
+    )?;
+    match error {
+        Some(error) => Err(error),
+        None => Ok(stats.bytes),
+    }
+}
+
 pub fn space(path: &Path) -> Option<(u64, u64)> {
     Some((
         fs2::available_space(path).ok()?,

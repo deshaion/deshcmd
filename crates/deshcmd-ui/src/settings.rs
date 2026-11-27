@@ -168,6 +168,10 @@ impl Preferences {
                     &mut self.workspace.auto_refresh,
                     "Refresh active folders automatically",
                 );
+                ui.checkbox(
+                    &mut self.workspace.double_click_new_tab,
+                    "Double-click empty tab bar space to open a new tab",
+                );
             }
             Page::Confirmations => {
                 ui.checkbox(
@@ -350,6 +354,7 @@ impl App {
         settings.split = draft.split;
         settings.linked = draft.linked;
         settings.auto_refresh = draft.auto_refresh;
+        settings.double_click_new_tab = draft.double_click_new_tab;
         settings.confirm_trash = draft.confirm_trash;
         settings.confirm_delete = draft.confirm_delete;
         settings.show_modified_time = draft.show_modified_time;

@@ -56,6 +56,21 @@ pub struct ArchiveSelection {
     pub members: Vec<PathBuf>,
 }
 
+impl ArchiveSelection {
+    pub(crate) fn display_paths(&self) -> impl Iterator<Item = PathBuf> + '_ {
+        self.members
+            .iter()
+            .chain(self.members.is_empty().then_some(&self.folder))
+            .map(|path| {
+                if path.as_os_str().is_empty() {
+                    self.file.clone()
+                } else {
+                    self.file.join(path)
+                }
+            })
+    }
+}
+
 #[derive(Clone, Debug)]
 pub enum ArchiveOperation {
     Pack {
@@ -1125,6 +1140,26 @@ impl ArchiveSource {
         }
         *cached = Some(inventory.clone());
         Ok(inventory)
+    }
+
+    pub fn folder_size(
+        &self,
+        path: &Path,
+        cancel: &crate::read_pool::Cancellation,
+    ) -> io::Result<u64> {
+        let folder = path.strip_prefix(&self.file).map_err(io::Error::other)?;
+        let inventory = self.inventory(&Control::for_read(cancel))?;
+        let mut bytes = 0_u64;
+        for member in &inventory.members {
+            cancel.check()?;
+            if !member.folder && member.path.starts_with(folder) {
+                let size = member
+                    .size
+                    .ok_or_else(|| io::Error::other("Archive member size is unavailable"))?;
+                bytes = bytes.saturating_add(size);
+            }
+        }
+        Ok(bytes)
     }
 
     pub fn preview(&self, path: &Path, kind: Kind, pixels: u32) -> Preview {

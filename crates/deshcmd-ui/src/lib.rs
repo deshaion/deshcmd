@@ -1,6 +1,7 @@
 mod about;
 mod dialogs;
 mod find_files;
+mod folder_sizes;
 mod panes;
 mod previews;
 mod probes;
@@ -109,6 +110,7 @@ struct Interface {
     clipboard: Option<FileClipboard>,
     notice: Option<(String, Instant)>,
     focus_scroll: Option<Side>,
+    hide_file_tooltips: bool,
     closing: bool,
     show_help: bool,
     about: Option<about::About>,
@@ -886,6 +888,8 @@ impl App {
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(&mut frame, |ui| {
+                ui.spacing_mut().item_spacing.y = 3.;
+                ui.spacing_mut().interact_size.y = 18.;
                 for job in &self.engine.jobs {
                     ui.horizontal(|ui| {
                         ui.label(label(job.title, 13., TEXT).strong());
@@ -940,23 +944,32 @@ impl App {
                             )
                             .on_hover_text(&job.progress.current);
                         }
-                        if !job.message.is_empty() || !job.warnings.is_empty() {
-                            let mut detail = job.message.clone();
-                            for warning in &job.warnings {
-                                detail.push('\n');
-                                detail.push_str(warning);
-                            }
-                            if ui.small_button("Details").on_hover_text(detail).clicked() {
+                        if !job.paths.items.is_empty()
+                            || job.paths.destination.is_some()
+                            || !job.message.is_empty()
+                            || !job.warnings.is_empty()
+                        {
+                            let details = ui.small_button("Details").on_hover_ui(|ui| {
+                                if job.message.is_empty() && job.warnings.is_empty() {
+                                    ui.label("Show operation details");
+                                }
+                                if !job.message.is_empty() {
+                                    ui.label(&job.message);
+                                }
+                                for warning in &job.warnings {
+                                    ui.label(warning);
+                                }
+                            });
+                            if details.clicked() {
                                 actions.push(Action::Tool(
                                     self.engine.settings.active,
                                     Tool::JobDetails(job.id),
                                 ));
                             }
-                            ui.label(label(
-                                job.message.lines().next().unwrap_or_default(),
-                                12.,
-                                SUB,
-                            ));
+                        }
+                        if let Some(result) = job.message.lines().next() {
+                            ui.add(egui::Label::new(label(result, 12., SUB)).truncate())
+                                .on_hover_text(result);
                         }
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                             if !job.state.finished() && ui.small_button("Cancel").clicked() {
@@ -979,6 +992,7 @@ impl App {
                             }
                         });
                     });
+                    queue_paths(ui, &job.paths);
                 }
             });
     }
@@ -1571,6 +1585,8 @@ impl App {
                 columns: column_set,
                 show_modified_time: self.engine.settings.show_modified_time,
                 show_inline_filter: self.interface.show_inline_filter,
+                double_click_new_tab: self.engine.settings.double_click_new_tab,
+                show_file_tooltips: !self.interface.hide_file_tooltips,
                 reveal_cursor: self.interface.focus_scroll == Some(side) || cursor_restored,
                 history_preview: self.engine.history_preview(side),
                 pending_jobs: &pending_jobs,
@@ -1615,6 +1631,53 @@ impl App {
         #[cfg(not(target_os = "macos"))]
         window::resize_edges(ui, root);
     }
+}
+
+fn queue_paths(ui: &mut Ui, paths: &engine::JobPaths) {
+    let item = paths.items.first();
+    let destination = paths.destination.as_deref();
+    if item.is_none() && destination.is_none() {
+        return;
+    }
+    ui.horizontal(|ui| {
+        let path_label = |ui: &mut Ui, path: &Path, more: usize, width: f32| {
+            let mut summary = engine::display_name(path);
+            if more > 0 {
+                summary.push_str(&format!(" +{more}"));
+            }
+            if let Some(parent) = path
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+            {
+                summary.push_str(&format!(" · {}", parent.display()));
+            }
+            let width = width.max(0.);
+            ui.allocate_ui_with_layout(
+                vec2(width, 17.),
+                Layout::left_to_right(Align::Center),
+                |ui| {
+                    ui.set_min_width(width);
+                    ui.add(egui::Label::new(label(summary, 12., SUB)).truncate())
+                        .on_hover_text(path.display().to_string());
+                },
+            );
+        };
+        if let Some(item) = item {
+            let width = ui.available_width();
+            let width = if destination.is_some() {
+                (width - 28.) * 0.5
+            } else {
+                width
+            };
+            path_label(ui, item, paths.items.len() - 1, width);
+        }
+        if let Some(destination) = destination {
+            if item.is_some() {
+                ui.label(label("To", 12., MUTED));
+            }
+            path_label(ui, destination, 0, ui.available_width());
+        }
+    });
 }
 
 fn clock(seconds: u64) -> String {
@@ -1680,6 +1743,33 @@ impl eframe::App for App {
         if self.preferences.is_none() {
             settings::zoom_shortcuts(&ctx);
         }
+        ctx.input(|input| {
+            if input.pointer.delta() != egui::Vec2::ZERO || input.pointer.any_pressed() {
+                self.interface.hide_file_tooltips = false;
+            }
+            if input.events.iter().any(|event| {
+                matches!(
+                    event,
+                    egui::Event::Key {
+                        key: Key::ArrowDown
+                            | Key::ArrowUp
+                            | Key::ArrowLeft
+                            | Key::ArrowRight
+                            | Key::PageUp
+                            | Key::PageDown
+                            | Key::Home
+                            | Key::End
+                            | Key::Tab
+                            | Key::Enter
+                            | Key::Backspace,
+                        pressed: true,
+                        ..
+                    }
+                )
+            }) {
+                self.interface.hide_file_tooltips = true;
+            }
+        });
         self.clipboard_shortcuts(&ctx, &mut actions);
         self.keyboard(&ctx, &mut actions);
         for action in actions.drain(..) {

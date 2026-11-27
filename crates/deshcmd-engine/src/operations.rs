@@ -259,6 +259,12 @@ pub enum Operation {
     },
 }
 
+#[derive(Debug, Default)]
+pub struct JobPaths {
+    pub items: Vec<PathBuf>,
+    pub destination: Option<PathBuf>,
+}
+
 impl Operation {
     pub fn label(&self) -> &'static str {
         match self {
@@ -282,6 +288,88 @@ impl Operation {
             Self::Benchmark => "Hash benchmark",
             Self::ReplaceContent { .. } => "Replace text",
             Self::Export { .. } => "Export list",
+        }
+    }
+
+    pub(crate) fn job_paths(&self) -> JobPaths {
+        use crate::ArchiveOperation;
+
+        let (items, destination): (&[PathBuf], Option<&Path>) = match self {
+            Self::Transfer {
+                paths, destination, ..
+            } => (paths, Some(destination)),
+            Self::Rename { source, target } | Self::Link { source, target, .. } => {
+                (std::slice::from_ref(source), Some(target))
+            }
+            Self::Split {
+                source,
+                destination,
+                ..
+            } => (std::slice::from_ref(source), Some(destination)),
+            Self::Mkdir(path) | Self::Create(path) | Self::Export { output: path, .. } => {
+                (&[], Some(path))
+            }
+            Self::Comment { path, .. } | Self::Verify { source: path, .. } => {
+                (std::slice::from_ref(path), None)
+            }
+            Self::Delete { paths, .. }
+            | Self::Wipe { paths, .. }
+            | Self::Properties { paths, .. }
+            | Self::Statistics(paths)
+            | Self::Archive(ArchiveOperation::Test { paths, .. }) => (paths, None),
+            Self::Combine { paths, output }
+            | Self::Hash {
+                paths,
+                output,
+                mode: ManifestMode::Single,
+                ..
+            } => (paths, Some(output)),
+            Self::Hash { paths, .. } => (paths, None),
+            Self::Archive(ArchiveOperation::Pack {
+                paths,
+                output,
+                folder,
+                ..
+            }) => {
+                return JobPaths {
+                    items: paths.clone(),
+                    destination: Some(if folder.as_os_str().is_empty() {
+                        output.clone()
+                    } else {
+                        output.join(folder)
+                    }),
+                };
+            }
+            Self::Archive(ArchiveOperation::Extract {
+                sources,
+                destination,
+                ..
+            }) => {
+                return JobPaths {
+                    items: sources
+                        .iter()
+                        .flat_map(crate::ArchiveSelection::display_paths)
+                        .collect(),
+                    destination: Some(destination.clone()),
+                };
+            }
+            Self::Archive(ArchiveOperation::Delete(source)) => {
+                return JobPaths {
+                    items: source.display_paths().collect(),
+                    destination: None,
+                };
+            }
+            Self::ReplaceContent { files, .. } => {
+                return JobPaths {
+                    items: files.iter().map(|file| file.path.clone()).collect(),
+                    destination: None,
+                };
+            }
+            Self::Benchmark => (&[], None),
+        };
+        JobPaths {
+            items: items.to_vec(),
+            destination: destination.map(Path::to_owned),
         }
     }
 }
@@ -386,6 +474,33 @@ pub(crate) struct Worker<'a> {
     pub conflict: &'a dyn Fn(Conflict),
     pub last_report: std::time::Instant,
     pub warnings: Vec<String>,
+}
+
+#[derive(Default)]
+pub(crate) struct OccupiedSize {
+    files: u64,
+    dirs: u64,
+    pub bytes: u64,
+}
+
+pub(crate) fn occupied_size(
+    path: &Path,
+    check: impl Fn() -> io::Result<()>,
+    mut warn: impl FnMut(io::Error),
+) -> io::Result<OccupiedSize> {
+    let mut stats = OccupiedSize::default();
+    for entry in walkdir::WalkDir::new(path) {
+        check()?;
+        match entry.and_then(|entry| entry.metadata()) {
+            Ok(metadata) if metadata.is_dir() => stats.dirs += 1,
+            Ok(metadata) => {
+                stats.files += 1;
+                stats.bytes = stats.bytes.saturating_add(metadata.len());
+            }
+            Err(error) => warn(error.into()),
+        }
+    }
+    Ok(stats)
 }
 
 impl Worker<'_> {
@@ -567,24 +682,28 @@ impl Worker<'_> {
                 "Saved file comment".into()
             }
             Operation::Statistics(paths) => {
-                let (mut files, mut dirs, mut bytes) = (0_u64, 0_u64, 0_u64);
+                let (mut files, mut dirs, mut bytes) = (0, 0, 0_u64);
+                self.progress.item_total = Some(paths.len());
                 for path in paths {
-                    for entry in walkdir::WalkDir::new(&path) {
-                        self.control.check()?;
-                        match entry {
-                            Ok(entry) => match entry.metadata() {
-                                Ok(meta) if meta.is_dir() => dirs += 1,
-                                Ok(meta) => {
-                                    files += 1;
-                                    bytes = bytes.saturating_add(meta.len());
-                                }
-                                Err(error) => self.warnings.push(error.to_string()),
-                            },
-                            Err(error) => self.warnings.push(error.to_string()),
-                        }
-                    }
+                    self.update(&path, 0);
+                    let stats = occupied_size(
+                        &path,
+                        || self.control.check(),
+                        |error| {
+                            self.warnings.push(format!("{}: {error}", path.display()));
+                        },
+                    )?;
+                    files += stats.files;
+                    dirs += stats.dirs;
+                    bytes = bytes.saturating_add(stats.bytes);
+                    self.finish_item();
                 }
-                format!("{files} files, {dirs} folders · {bytes} bytes")
+                let file_label = if files == 1 { "file" } else { "files" };
+                let folder_label = if dirs == 1 { "folder" } else { "folders" };
+                format!(
+                    "{files} {file_label}, {dirs} {folder_label} · {}",
+                    crate::format_size(bytes, true)
+                )
             }
             Operation::Split {
                 source,
