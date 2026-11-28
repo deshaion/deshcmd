@@ -1,5 +1,7 @@
 mod about;
 mod dialogs;
+mod find_files;
+mod folder_sizes;
 mod panes;
 mod previews;
 mod probes;
@@ -81,6 +83,7 @@ enum Action {
     },
     Path(Side, PathBuf),
     ToggleQuick(Side),
+    ShowQueue,
     ClipboardText(String),
     Eject(PathBuf),
     CheckForUpdates,
@@ -107,6 +110,7 @@ struct Interface {
     clipboard: Option<FileClipboard>,
     notice: Option<(String, Instant)>,
     focus_scroll: Option<Side>,
+    hide_file_tooltips: bool,
     closing: bool,
     show_help: bool,
     about: Option<about::About>,
@@ -124,6 +128,7 @@ pub struct App {
     desktop: Box<dyn Desktop>,
     interface: Interface,
     dialog: Option<Dialog>,
+    find_files: find_files::FindFiles,
     preferences: Option<settings::Preferences>,
     places: std::sync::Arc<Vec<Place>>,
     read_places: fn() -> Vec<Place>,
@@ -202,6 +207,7 @@ impl App {
                 ..Default::default()
             },
             dialog: None,
+            find_files: find_files::FindFiles::new(context.storage),
             preferences: None,
             places_cache: probes::ReadCache::new(&context.egui_ctx, 1, Duration::from_secs(10), 1),
             spaces: probes::ReadCache::new(&context.egui_ctx, 2, Duration::from_secs(10), 32),
@@ -348,7 +354,8 @@ impl App {
                         self.dialog = Some(Dialog::pack(side, paths, archive, folder));
                     }
                 } else {
-                    self.dialog = Some(Dialog::transfer(side, paths, destination, moving));
+                    self.dialog =
+                        Some(Dialog::transfer(side, paths, destination, moving).with_target(side));
                 }
             }
             Action::Path(side, path) => self.engine.dispatch(Command::Navigate {
@@ -357,6 +364,7 @@ impl App {
                 new_tab: false,
                 background: false,
             }),
+            Action::ShowQueue => self.interface.queue = true,
             Action::ToggleQuick(side) => {
                 self.interface.quick = if self.interface.quick == Some(side) {
                     None
@@ -485,7 +493,7 @@ impl App {
                     &title,
                     &queue_label,
                     true,
-                    self.interface.queue,
+                    self.interface.queue || pending > 0,
                 )
                 .clicked()
                 {
@@ -823,6 +831,28 @@ impl App {
         });
     }
 
+    fn operation_target(&self, path: &Path, preferred: Side) -> Side {
+        [preferred, preferred.other()]
+            .into_iter()
+            .filter_map(|side| {
+                let location = self.engine.tab(side).location();
+                let location = match location {
+                    engine::Location::Archive { file, .. } if path == file => file.clone(),
+                    _ => location.display_path(),
+                };
+                path.starts_with(&location)
+                    .then(|| (side, location.components().count()))
+            })
+            .reduce(|best, candidate| {
+                if candidate.1 > best.1 {
+                    candidate
+                } else {
+                    best
+                }
+            })
+            .map_or(preferred, |(side, _)| side)
+    }
+
     fn queue(&mut self, ui: &mut Ui, rect: Rect, actions: &mut Vec<Action>) {
         card(ui, rect, SURFACE);
         let compact = rect.height() < 80.;
@@ -858,6 +888,8 @@ impl App {
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(&mut frame, |ui| {
+                ui.spacing_mut().item_spacing.y = 3.;
+                ui.spacing_mut().interact_size.y = 18.;
                 for job in &self.engine.jobs {
                     ui.horizontal(|ui| {
                         ui.label(label(job.title, 13., TEXT).strong());
@@ -868,28 +900,37 @@ impl App {
                             _ => SUB,
                         };
                         ui.label(label(job.state.label(), 12., ink));
-                        if let Some(total) = job.progress.total.filter(|total| *total > 0) {
-                            ui.add(
-                                egui::ProgressBar::new(
-                                    (job.progress.bytes as f32 / total as f32).min(1.),
-                                )
-                                .desired_width(85.),
-                            );
-                            if !job.state.finished()
-                                && let Some(start) = job.started
+                        if let Some((done, total)) = job.progress.overall() {
+                            let shown = if job.state == JobState::Done {
+                                total
+                            } else {
+                                done
+                            };
+                            ui.add(operation_progress(shown, total, 85.))
+                                .on_hover_text("Overall operation progress");
+                        }
+                        if let Some(start) = job.started {
+                            let elapsed = job
+                                .finished_at
+                                .unwrap_or_else(Instant::now)
+                                .saturating_duration_since(start);
+                            ui.label(mono(clock(elapsed.as_secs()), 10., MUTED))
+                                .on_hover_text("Elapsed time");
+                            if job.state == JobState::Running
+                                && let Some((done, total)) = job.progress.overall()
+                                && done > 0
                             {
-                                let rate = job.progress.bytes as f64
-                                    / start.elapsed().as_secs_f64().max(0.1);
-                                if rate > 0. {
-                                    let eta = (total.saturating_sub(job.progress.bytes) as f64
-                                        / rate)
-                                        as u64;
+                                let rate = done as f64 / elapsed.as_secs_f64().max(0.1);
+                                if job.progress.total.is_some_and(|bytes| bytes > 0) {
                                     ui.label(mono(
-                                        format!("{}/s · {eta}s", metric(rate as u64)),
+                                        format!("{}/s", metric(rate as u64)),
                                         10.,
                                         MUTED,
                                     ));
                                 }
+                                let eta = ((total - done) as f64 / rate).ceil() as u64;
+                                ui.label(mono(clock(eta), 10., MUTED))
+                                    .on_hover_text("Estimated time remaining");
                             }
                         }
                         if job.progress.file_total > 0 && !job.state.finished() {
@@ -903,23 +944,32 @@ impl App {
                             )
                             .on_hover_text(&job.progress.current);
                         }
-                        if !job.message.is_empty() || !job.warnings.is_empty() {
-                            let mut detail = job.message.clone();
-                            for warning in &job.warnings {
-                                detail.push('\n');
-                                detail.push_str(warning);
-                            }
-                            if ui.small_button("Details").on_hover_text(detail).clicked() {
+                        if !job.paths.items.is_empty()
+                            || job.paths.destination.is_some()
+                            || !job.message.is_empty()
+                            || !job.warnings.is_empty()
+                        {
+                            let details = ui.small_button("Details").on_hover_ui(|ui| {
+                                if job.message.is_empty() && job.warnings.is_empty() {
+                                    ui.label("Show operation details");
+                                }
+                                if !job.message.is_empty() {
+                                    ui.label(&job.message);
+                                }
+                                for warning in &job.warnings {
+                                    ui.label(warning);
+                                }
+                            });
+                            if details.clicked() {
                                 actions.push(Action::Tool(
                                     self.engine.settings.active,
                                     Tool::JobDetails(job.id),
                                 ));
                             }
-                            ui.label(label(
-                                job.message.lines().next().unwrap_or_default(),
-                                12.,
-                                SUB,
-                            ));
+                        }
+                        if let Some(result) = job.message.lines().next() {
+                            ui.add(egui::Label::new(label(result, 12., SUB)).truncate())
+                                .on_hover_text(result);
                         }
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                             if !job.state.finished() && ui.small_button("Cancel").clicked() {
@@ -942,6 +992,7 @@ impl App {
                             }
                         });
                     });
+                    queue_paths(ui, &job.paths);
                 }
             });
     }
@@ -981,6 +1032,7 @@ impl App {
         }
         let text_context = self.text_field_focused(ctx)
             || self.dialog.is_some()
+            || self.find_files.open
             || self.update.is_some()
             || self.preferences.is_some()
             || self.interface.show_help
@@ -1033,6 +1085,7 @@ impl App {
 
     fn keyboard(&mut self, ctx: &egui::Context, actions: &mut Vec<Action>) {
         if self.dialog.is_some()
+            || self.find_files.open
             || self.update.is_some()
             || self.preferences.is_some()
             || self.interface.show_help
@@ -1093,8 +1146,26 @@ impl App {
             self.interface.panes[side.index()].start_path();
             return;
         }
-        if command(Key::F) {
-            actions.push(Action::Tool(side, Tool::FilterOptions));
+        if exact(egui::Modifiers::CTRL | egui::Modifiers::SHIFT, Key::F)
+            || exact(egui::Modifiers::COMMAND | egui::Modifiers::SHIFT, Key::F)
+        {
+            actions.push(Action::Tool(side, Tool::FindFiles));
+            return;
+        }
+        if exact(egui::Modifiers::CTRL, Key::F) || exact(egui::Modifiers::COMMAND, Key::F) {
+            if self.interface.quick == Some(side.other()) {
+                self.interface.quick = None;
+            }
+            self.interface.panes[side.index()].focus_filter();
+            return;
+        }
+        if ctx.memory(|memory| memory.has_focus(panes::filter_id(side))) && just(Key::Escape) {
+            self.interface.panes[side.index()].close_filter();
+            ctx.memory_mut(|memory| memory.surrender_focus(panes::filter_id(side)));
+            actions.push(Action::Command(Command::Filter(
+                side,
+                engine::MatchOptions::filename(""),
+            )));
             return;
         }
         if editing {
@@ -1321,7 +1392,9 @@ impl App {
                             ("Up / Down · Space", "Move focus · toggle mark"),
                             ("Shift + Up / Down", "Extend selection"),
                             ("Ctrl + A / I", "Mark all or invert marks"),
-                            ("Ctrl + F / R", "Open filter options or refresh"),
+                            ("Ctrl + F", "Filter the active panel"),
+                            ("Ctrl + Shift + F", "Find files"),
+                            ("Ctrl + R", "Refresh the active panel"),
                             ("Ctrl + .", "Toggle hidden files"),
                             ("F2", "Rename"),
                             ("Ctrl + Q / F3", "Toggle Quick View"),
@@ -1494,6 +1567,15 @@ impl App {
             } else {
                 &self.engine.settings.columns
             };
+            let pending_jobs = if self.interface.queue && queue_height > queue_gap {
+                Vec::new()
+            } else {
+                self.engine
+                    .jobs
+                    .iter()
+                    .filter(|job| job.target == side && !job.state.finished())
+                    .collect::<Vec<_>>()
+            };
             let settings = panes::PaneScreen {
                 pane,
                 side,
@@ -1503,8 +1585,11 @@ impl App {
                 columns: column_set,
                 show_modified_time: self.engine.settings.show_modified_time,
                 show_inline_filter: self.interface.show_inline_filter,
+                double_click_new_tab: self.engine.settings.double_click_new_tab,
+                show_file_tooltips: !self.interface.hide_file_tooltips,
                 reveal_cursor: self.interface.focus_scroll == Some(side) || cursor_restored,
                 history_preview: self.engine.history_preview(side),
+                pending_jobs: &pending_jobs,
                 preview: quick.map(|source| (source, self.engine.tab(source).current())),
             };
             self.interface.panes[side.index()].show(
@@ -1548,9 +1633,74 @@ impl App {
     }
 }
 
+fn queue_paths(ui: &mut Ui, paths: &engine::JobPaths) {
+    let item = paths.items.first();
+    let destination = paths.destination.as_deref();
+    if item.is_none() && destination.is_none() {
+        return;
+    }
+    ui.horizontal(|ui| {
+        let path_label = |ui: &mut Ui, path: &Path, more: usize, width: f32| {
+            let mut summary = engine::display_name(path);
+            if more > 0 {
+                summary.push_str(&format!(" +{more}"));
+            }
+            if let Some(parent) = path
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+            {
+                summary.push_str(&format!(" · {}", parent.display()));
+            }
+            let width = width.max(0.);
+            ui.allocate_ui_with_layout(
+                vec2(width, 17.),
+                Layout::left_to_right(Align::Center),
+                |ui| {
+                    ui.set_min_width(width);
+                    ui.add(egui::Label::new(label(summary, 12., SUB)).truncate())
+                        .on_hover_text(path.display().to_string());
+                },
+            );
+        };
+        if let Some(item) = item {
+            let width = ui.available_width();
+            let width = if destination.is_some() {
+                (width - 28.) * 0.5
+            } else {
+                width
+            };
+            path_label(ui, item, paths.items.len() - 1, width);
+        }
+        if let Some(destination) = destination {
+            if item.is_some() {
+                ui.label(label("To", 12., MUTED));
+            }
+            path_label(ui, destination, 0, ui.available_width());
+        }
+    });
+}
+
+fn clock(seconds: u64) -> String {
+    format!(
+        "{:02}:{:02}:{:02}",
+        seconds / 3600,
+        seconds / 60 % 60,
+        seconds % 60
+    )
+}
+
+fn operation_progress(done: u64, total: u64, width: f32) -> egui::ProgressBar {
+    egui::ProgressBar::new(done as f32 / total as f32)
+        .desired_width(width)
+        .show_percentage()
+}
+
 impl eframe::App for App {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.engine.poll();
+        if let Some(side) = self.engine.take_revealed_preview() {
+            self.interface.quick = Some(side);
+        }
         if let Some(delay) = self.engine.listing_wake_after() {
             ctx.request_repaint_after(delay);
         }
@@ -1596,6 +1746,33 @@ impl eframe::App for App {
         if self.preferences.is_none() {
             settings::zoom_shortcuts(&ctx);
         }
+        ctx.input(|input| {
+            if input.pointer.delta() != egui::Vec2::ZERO || input.pointer.any_pressed() {
+                self.interface.hide_file_tooltips = false;
+            }
+            if input.events.iter().any(|event| {
+                matches!(
+                    event,
+                    egui::Event::Key {
+                        key: Key::ArrowDown
+                            | Key::ArrowUp
+                            | Key::ArrowLeft
+                            | Key::ArrowRight
+                            | Key::PageUp
+                            | Key::PageDown
+                            | Key::Home
+                            | Key::End
+                            | Key::Tab
+                            | Key::Enter
+                            | Key::Backspace,
+                        pressed: true,
+                        ..
+                    }
+                )
+            }) {
+                self.interface.hide_file_tooltips = true;
+            }
+        });
         self.clipboard_shortcuts(&ctx, &mut actions);
         self.keyboard(&ctx, &mut actions);
         for action in actions.drain(..) {
@@ -1608,6 +1785,7 @@ impl eframe::App for App {
         if self.preferences.is_some() {
             self.show_settings(&ctx);
         } else {
+            self.show_find_files(&ctx);
             self.dialogs(&ctx);
         }
         if self.interface.show_help {
@@ -1638,6 +1816,7 @@ impl eframe::App for App {
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
         eframe::set_value(storage, "workspace", &self.engine.snapshot());
+        eframe::set_value(storage, "find_templates", &self.find_files.templates);
         eframe::set_value(
             storage,
             "show_inline_filter",

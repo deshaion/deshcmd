@@ -199,6 +199,7 @@ fn panel_navigation_and_preview_shortcuts() {
     std::fs::create_dir_all(&folder).unwrap();
     std::fs::create_dir(&destination).unwrap();
     std::fs::write(&file, "Example preview").unwrap();
+    std::fs::write(folder.join("payload.bin"), [0; 2048]).unwrap();
     for index in 0..40 {
         std::fs::write(source.join(format!("z-{index:02}.txt")), "").unwrap();
     }
@@ -229,7 +230,7 @@ fn panel_navigation_and_preview_shortcuts() {
     wait_for_listing(&mut app);
 
     let time = Cell::new(0.);
-    let draw = |app: &mut App, frame: &mut eframe::Frame, events| {
+    let draw = |app: &mut App, frame: &mut eframe::Frame, events: Vec<egui::Event>| {
         time.set(time.get() + 1. / 60.);
         let mut output = ctx.run_ui(
             egui::RawInput {
@@ -258,6 +259,47 @@ fn panel_navigation_and_preview_shortcuts() {
     let plain = egui::Modifiers::NONE;
     let ctrl = egui::Modifiers::CTRL;
     let alt = egui::Modifiers::ALT;
+
+    app.interface.show_inline_filter = false;
+    press(&mut app, &mut frame, Key::F, ctrl);
+    draw(&mut app, &mut frame, Vec::new());
+    assert!(app.dialog.is_none());
+    assert!(ctx.memory(|memory| memory.has_focus(panes::filter_id(side))));
+    draw(
+        &mut app,
+        &mut frame,
+        vec![egui::Event::Text("preview".into())],
+    );
+    assert_eq!(app.engine.tab(side).filter().text, "preview");
+    press(&mut app, &mut frame, Key::Escape, plain);
+    assert!(!ctx.memory(|memory| memory.has_focus(panes::filter_id(side))));
+    press(&mut app, &mut frame, Key::F, ctrl | egui::Modifiers::SHIFT);
+    assert!(app.find_files.open);
+    assert!(frame_contains(
+        &draw(&mut app, &mut frame, Vec::new()),
+        "Find Files"
+    ));
+    draw(
+        &mut app,
+        &mut frame,
+        vec![egui::Event::Text("preview".into())],
+    );
+    press(&mut app, &mut frame, Key::Enter, ctrl);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let shapes = draw(&mut app, &mut frame, Vec::new());
+        if frame_contains(&shapes, "1 match") {
+            assert!(frame_contains(&shapes, "preview.txt"));
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "Find Files did not display the result"
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    press(&mut app, &mut frame, Key::Escape, plain);
+    assert!(!app.find_files.open);
 
     app.engine
         .dispatch(Command::Select(side, folder.clone(), engine::Select::Focus));
@@ -326,7 +368,7 @@ fn panel_navigation_and_preview_shortcuts() {
     app.engine
         .dispatch(Command::View(side, engine::View::Details));
     let row = focus_outline(press(&mut app, &mut frame, Key::Home, plain));
-    let click = |app: &mut App, frame: &mut eframe::Frame, pos| {
+    let click = |app: &mut App, frame: &mut eframe::Frame, pos, modifiers| {
         draw(app, frame, vec![egui::Event::PointerMoved(pos)]);
         for pressed in [true, false] {
             draw(
@@ -336,19 +378,107 @@ fn panel_navigation_and_preview_shortcuts() {
                     pos,
                     button: egui::PointerButton::Primary,
                     pressed,
-                    modifiers: plain,
+                    modifiers,
                 }],
             );
         }
     };
-    click(&mut app, &mut frame, row.center());
+    click(&mut app, &mut frame, row.center(), plain);
+    assert_eq!(app.engine.tab(side).current().unwrap().path, folder);
+    assert!(!app.engine.tab(side).is_marked(&folder));
+    assert!(app.engine.tab(side).is_marked(&file));
+
+    app.engine.dispatch(Command::UnmarkAll(side));
+    let shapes = draw(&mut app, &mut frame, vec![]);
+    assert!(!frame_contains(&shapes, "Calculating size…"));
+    assert!(!frame_contains(&shapes, "2.0 KB"));
+    press(&mut app, &mut frame, Key::Space, plain);
     assert!(app.engine.tab(side).is_marked(&folder));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let shapes = draw(&mut app, &mut frame, vec![]);
+        if frame_contains(&shapes, "1 selected · 2.0 KB") {
+            assert!(shapes.iter().any(|shape| matches!(&shape.shape,
+                egui::Shape::Text(text) if text.galley.text() == "2.0 KB")));
+            break;
+        }
+        assert!(Instant::now() < deadline, "folder size did not appear");
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    app.engine.dispatch(Command::UnmarkAll(side));
+    press(&mut app, &mut frame, Key::ArrowDown, egui::Modifiers::SHIFT);
+    assert!(app.engine.tab(side).is_marked(&folder));
+    assert!(app.engine.tab(side).is_marked(&file));
+    assert!(frame_contains(
+        &draw(&mut app, &mut frame, vec![]),
+        "2 selected · 2.0 KB"
+    ));
+
+    app.engine.dispatch(Command::UnmarkAll(side));
+    time.set(time.get() + 1.);
+    click(&mut app, &mut frame, row.center(), ctrl);
+    assert!(app.engine.tab(side).is_marked(&folder));
+    let down = focus_outline(press(&mut app, &mut frame, Key::ArrowDown, plain));
+    press(&mut app, &mut frame, Key::ArrowUp, plain);
+    click(&mut app, &mut frame, down.center(), egui::Modifiers::SHIFT);
+    assert!(app.engine.tab(side).is_marked(&folder));
+    assert!(app.engine.tab(side).is_marked(&file));
+    assert!(frame_contains(
+        &draw(&mut app, &mut frame, vec![]),
+        "2 selected · 2.0 KB"
+    ));
+
+    time.set(time.get() + 1.);
+    draw(
+        &mut app,
+        &mut frame,
+        vec![egui::Event::PointerMoved(row.center())],
+    );
+    time.set(time.get() + 1.);
+    draw(&mut app, &mut frame, vec![]);
+    let path_hint = folder.display().to_string();
+    assert!(frame_contains(
+        &draw(&mut app, &mut frame, vec![]),
+        &path_hint
+    ));
+    let shapes = press(&mut app, &mut frame, Key::ArrowUp, plain);
+    assert!(!frame_contains(&shapes, &path_hint));
+    time.set(time.get() + 1.);
+    assert!(!frame_contains(
+        &draw(&mut app, &mut frame, vec![]),
+        &path_hint
+    ));
+    draw(
+        &mut app,
+        &mut frame,
+        vec![egui::Event::PointerMoved(row.center() + vec2(4., 0.))],
+    );
+    time.set(time.get() + 1.);
+    draw(&mut app, &mut frame, vec![]);
+    assert!(frame_contains(
+        &draw(&mut app, &mut frame, vec![]),
+        &path_hint
+    ));
+
+    let empty_strip = pos2(430., 72.);
+    time.set(time.get() + 1.);
+    click(&mut app, &mut frame, empty_strip, plain);
+    assert_eq!(app.engine.pane(side).tabs.len(), 1);
+    click(&mut app, &mut frame, empty_strip, plain);
+    assert_eq!(app.engine.pane(side).tabs.len(), 2);
+    app.engine.dispatch(Command::CloseTab(side, 1));
+    app.engine.settings.double_click_new_tab = false;
+    time.set(time.get() + 1.);
+    click(&mut app, &mut frame, empty_strip, plain);
+    click(&mut app, &mut frame, empty_strip, plain);
+    assert_eq!(app.engine.pane(side).tabs.len(), 1);
+    wait_for_listing(&mut app);
     press(&mut app, &mut frame, Key::ArrowUp, plain);
     let row = focus_outline(press(&mut app, &mut frame, Key::ArrowDown, plain));
     assert_eq!(app.engine.tab(side).current().unwrap().path, file);
     time.set(time.get() + 1.);
-    click(&mut app, &mut frame, row.center());
-    click(&mut app, &mut frame, row.center());
+    click(&mut app, &mut frame, row.center(), plain);
+    click(&mut app, &mut frame, row.center(), plain);
     assert_eq!(launches.try_recv().unwrap(), file);
     assert!(launches.try_recv().is_err());
     press(&mut app, &mut frame, Key::ArrowUp, plain);
@@ -408,7 +538,7 @@ fn panel_navigation_and_preview_shortcuts() {
     let path_field = panes::path_id(side);
     assert!(ctx.memory(|memory| memory.has_focus(path_field)));
     let pos = ctx.read_response(path_field).unwrap().rect.center() + vec2(0., 60.);
-    click(&mut app, &mut frame, pos);
+    click(&mut app, &mut frame, pos, plain);
     draw(&mut app, &mut frame, vec![]);
     assert!(!ctx.memory(|memory| memory.has_focus(path_field)));
     draw(&mut app, &mut frame, vec![]);
@@ -440,7 +570,7 @@ fn panel_navigation_and_preview_shortcuts() {
             _ => None,
         })
         .expect("File menu button");
-    click(&mut app, &mut frame, menu_button);
+    click(&mut app, &mut frame, menu_button, plain);
     assert!(egui::Popup::is_any_open(&ctx));
     press(&mut app, &mut frame, Key::ArrowRight, plain);
     assert_eq!(app.engine.tab(side).base(), parent);
@@ -710,7 +840,7 @@ fn app_storage_restores_workspace_and_independent_display_preferences() {
     assert!(!fresh.interface.show_places);
 }
 
-fn frame_contains(shapes: &[egui::epaint::ClippedShape], expected: &str) -> bool {
+pub(crate) fn frame_contains(shapes: &[egui::epaint::ClippedShape], expected: &str) -> bool {
     fn matches(shape: &egui::Shape, expected: &str) -> bool {
         match shape {
             egui::Shape::Text(text) => text.galley.text().contains(expected),
@@ -776,7 +906,20 @@ fn workspace_renders_tree_gallery_help_and_a_transfer_conflict() {
         .dispatch(Command::View(Side::Left, engine::View::Gallery));
     app.engine
         .dispatch(Command::View(Side::Right, engine::View::Compact));
+    let queue_highlighted = |shapes: &[egui::epaint::ClippedShape], title: &str| {
+        let text = shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) if text.galley.text() == title => Some(text.pos),
+                _ => None,
+            })
+            .expect("expected the Queue toolbar button");
+        shapes.iter().any(|shape| matches!(
+            &shape.shape, egui::Shape::Rect(rect) if rect.fill == ACCENT && rect.rect.contains(text)
+        ))
+    };
     let shapes = draw(&mut app);
+    assert!(!queue_highlighted(&shapes, "Queue"));
     assert!(frame_contains(&shapes, "Fixture place"));
     assert!(frame_contains(&shapes, "Fixture drive"));
     assert!(frame_contains(&shapes, "directory"));
@@ -786,8 +929,53 @@ fn workspace_renders_tree_gallery_help_and_a_transfer_conflict() {
     assert!(frame_contains(&draw(&mut app), "Keyboard shortcuts"));
     app.interface.show_help = false;
 
+    app.apply(
+        Action::Command(Command::QueueFor(
+            Side::Right,
+            engine::Operation::Statistics(vec![right.clone()]),
+            true,
+        )),
+        &ctx,
+    );
+    app.engine.jobs[0].progress.item_total = Some(4);
+    app.engine.jobs[0].progress.items = 1;
+    let shapes = draw(&mut app);
+    assert!(!app.interface.queue);
+    assert!(queue_highlighted(&shapes, "Queue  1"));
+    assert!(frame_contains(&shapes, "Calculate size · On hold"));
+    assert!(frame_contains(&shapes, "25%"));
+    assert!(shapes.iter().any(|shape| matches!(
+        &shape.shape, egui::Shape::Rect(rect) if rect.fill == OPERATION_SURFACE
+    )));
+    app.apply(
+        Action::Command(Command::QueueFor(
+            Side::Right,
+            engine::Operation::Benchmark,
+            true,
+        )),
+        &ctx,
+    );
+    let shapes = draw(&mut app);
+    assert!(frame_contains(&shapes, "Calculate size · On hold"));
+    assert!(frame_contains(&shapes, "Hash benchmark · On hold"));
+    assert!(!frame_contains(&shapes, "25%"));
+    app.apply(Action::ShowQueue, &ctx);
+    let shapes = draw(&mut app);
+    assert!(frame_contains(&shapes, "Operations"));
+    assert!(frame_contains(&shapes, "25%"));
+    let right_summary = format!("right · {}", right.parent().unwrap().display());
+    assert!(frame_contains(&shapes, &right_summary));
+    assert!(!frame_contains(&shapes, "Calculate size · On hold"));
+    app.interface.queue = false;
+    for id in app.engine.jobs.iter().map(|job| job.id).collect::<Vec<_>>() {
+        app.engine.dispatch(Command::CancelJob(id));
+    }
+    app.engine.dispatch(Command::ClearJobs);
+    assert!(app.engine.jobs.is_empty());
+    assert_eq!(clock(3661), "01:01:01");
+
     let operation = engine::Operation::Transfer {
-        paths: vec![source],
+        paths: vec![source.clone()],
         destination: right.clone(),
         moving: false,
         options: engine::TransferOptions::default(),
@@ -818,8 +1006,27 @@ fn workspace_renders_tree_gallery_help_and_a_transfer_conflict() {
         b"existing"
     );
     assert!(!app.interface.queue);
+    assert!(!queue_highlighted(&draw(&mut app), "Queue"));
     app.interface.queue = true;
-    assert!(frame_contains(&draw(&mut app), "1 skipped"));
+    let shapes = draw(&mut app);
+    assert!(queue_highlighted(&shapes, "Queue"));
+    assert!(frame_contains(&shapes, "1 skipped"));
+    assert!(frame_contains(
+        &shapes,
+        &format!("shared.txt · {}", source.parent().unwrap().display())
+    ));
+    assert!(frame_contains(&shapes, &right_summary));
+    app.invoke(Side::Right, Tool::JobDetails(id), &ctx);
+    draw(&mut app);
+    let shapes = draw(&mut app);
+    assert!(frame_contains(
+        &shapes,
+        &format!("Sources\n{}", source.display())
+    ));
+    assert!(frame_contains(
+        &shapes,
+        &format!("Destination\n{}", right.display())
+    ));
 }
 
 // A one-pixel RGBA PNG, independent of the system image libraries.

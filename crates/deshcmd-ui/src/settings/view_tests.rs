@@ -61,6 +61,9 @@ fn settings_pages_render_and_saving_applies_display_and_visibility_changes() {
     draft.directory_tree = true;
     draft.show_places = true;
     draft.show_inline_filter = true;
+    for pane in &mut app.interface.panes {
+        pane.close_filter();
+    }
     draft.show_bottom_bar = false;
     draft.alternate_columns = [true, false];
     draft.ui_font = UiFont::DejaVuSansMono;
@@ -82,9 +85,23 @@ fn settings_pages_render_and_saving_applies_display_and_visibility_changes() {
         [".hidden.txt", "visible.txt"]
     );
 
-    let mut output = ctx.run_ui(egui::RawInput::default(), |_| {});
+    let mut frame = eframe::Frame::_new_kittest();
+    let mut output = ctx.run_ui(
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                vec2(1200., 900.),
+            )),
+            ..Default::default()
+        },
+        |ui| eframe::App::ui(&mut app, ui, &mut frame),
+    );
     output.textures_delta.clear();
     assert_eq!(zoom_percent(ctx.zoom_factor()), 115);
+    assert!(crate::tests::frame_contains(
+        &output.shapes,
+        "Filter by name or mask"
+    ));
 }
 
 #[test]

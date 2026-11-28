@@ -190,11 +190,15 @@ impl Options {
     }
 
     pub fn shown(&self, entry: &Entry) -> bool {
-        (self.hidden || !entry.hidden)
+        self.shown_name(&entry.name, entry.hidden)
+    }
+
+    pub fn shown_name(&self, name: &str, hidden: bool) -> bool {
+        (self.hidden || !hidden)
             && !self
                 .ignore
                 .as_ref()
-                .is_some_and(|ignore| ignore.is_match(listing::fold(&entry.name, false).as_ref()))
+                .is_some_and(|ignore| ignore.is_match(listing::fold(name, false).as_ref()))
     }
 
     pub fn prepare(

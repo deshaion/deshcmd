@@ -107,7 +107,7 @@ fn file_operations_report_results_and_refuse_to_clobber_outputs() {
     assert_eq!(fs::read(&renamed).unwrap(), b"updated");
     assert_eq!(
         succeeded(Operation::Statistics(vec![folder.clone()])),
-        "2 files, 1 folders · 14 bytes"
+        "2 files, 1 folder · 0.014 KB"
     );
     let (result, warnings) = execute(Operation::Statistics(vec![folder.join("missing")]));
     assert!(result.is_ok());
@@ -1035,4 +1035,23 @@ fn rename_existing_preserves_a_destination_changed_during_staging() {
     assert_eq!(fs::read(source).unwrap(), b"incoming");
     assert_eq!(fs::read(target).unwrap(), b"concurrent destination");
     assert_eq!(fs::read_dir(destination).unwrap().count(), 1);
+}
+
+#[test]
+fn occupied_size_uses_scaled_units_and_counts_nested_files() {
+    let root = tempfile::tempdir().unwrap();
+    let folder = root.path().join("folder");
+    fs::create_dir(&folder).unwrap();
+    fs::write(folder.join("payload"), [0; 1536]).unwrap();
+    let small = root.path().join("small");
+    fs::write(&small, [0; 8]).unwrap();
+    let (result, warnings) = execute(Operation::Statistics(vec![root.path().to_owned()]));
+    assert_eq!(result.unwrap(), "2 files, 2 folders · 1.5 KB");
+    assert!(warnings.is_empty());
+    let (result, _) = execute(Operation::Statistics(vec![small]));
+    assert_eq!(result.unwrap(), "1 file, 0 folders · 0.008 KB");
+    assert_eq!(
+        crate::folder_size(&folder, &Default::default()).unwrap(),
+        1536
+    );
 }

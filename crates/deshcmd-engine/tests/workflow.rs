@@ -1476,3 +1476,43 @@ fn flat_view_can_be_limited_to_marked_folders_and_restored() {
     });
     assert_eq!(engine.tab(side).base(), root);
 }
+
+#[test]
+fn reveal_reports_excluded_hits_and_previews_only_the_requested_entry() {
+    use deshcmd_engine::search::Hit;
+
+    let root = tempfile::tempdir().unwrap();
+    let left = root.path().join("left");
+    let right = root.path().join("right");
+    fs::create_dir_all(&left).unwrap();
+    fs::create_dir_all(&right).unwrap();
+    let original = left.join("original.txt");
+    let hidden = right.join(".hidden.txt");
+    let ignored = right.join("ignored.bak");
+    let visible = right.join("visible.txt");
+    for file in [&original, &hidden, &ignored, &visible] {
+        fs::write(file, "fixture").unwrap();
+    }
+    let mut engine = open(&left, &right);
+    engine.set_ignore("*.bak".into()).unwrap();
+    for file in [&hidden, &ignored] {
+        engine.notice = None;
+        engine.dispatch(Command::RevealPreview(Side::Left, Hit::local(file.clone())));
+        pump(&mut engine, |engine| engine.notice.is_some());
+        assert!(engine.notice.as_ref().unwrap().contains("excluded"));
+        assert_eq!(engine.tab(Side::Left).current().unwrap().path, original);
+        assert!(engine.take_revealed_preview().is_none());
+    }
+    engine.dispatch(Command::RevealPreview(
+        Side::Left,
+        Hit::local(visible.clone()),
+    ));
+    pump(&mut engine, |engine| {
+        !engine.tab(Side::Left).busy()
+            && engine
+                .tab(Side::Left)
+                .current()
+                .is_some_and(|entry| entry.path == visible)
+    });
+    assert_eq!(engine.take_revealed_preview(), Some(Side::Left));
+}

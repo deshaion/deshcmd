@@ -9,6 +9,7 @@ use egui::{
 pub const BASE: C = C::from_rgb(12, 15, 19);
 pub const RAIL: C = C::from_rgb(16, 20, 25);
 pub const SURFACE: C = C::from_rgb(19, 24, 30);
+pub const OPERATION_SURFACE: C = C::from_rgb(28, 45, 59);
 pub const RAISED: C = C::from_rgb(26, 32, 40);
 pub const HOVER: C = C::from_rgb(35, 43, 52);
 pub const LINE: C = C::from_rgb(45, 54, 64);
@@ -583,20 +584,7 @@ pub fn card(ui: &Ui, rect: Rect, fill: C) {
         .rect(rect, 10., fill, Stroke::new(1., LINE), StrokeKind::Inside);
 }
 pub fn metric(bytes: u64) -> String {
-    let mut value = bytes as f64;
-    let mut unit = "B";
-    for next in ["KB", "MB", "GB", "TB", "PB"] {
-        if value < 1024. {
-            break;
-        }
-        value /= 1024.;
-        unit = next;
-    }
-    if unit == "B" {
-        format!("{bytes} B")
-    } else {
-        format!("{value:.1} {unit}")
-    }
+    deshcmd_engine::format_size(bytes, false)
 }
 pub fn contained_size(size: Vec2, bounds: Vec2) -> Vec2 {
     if size.x <= 0. || size.y <= 0. {

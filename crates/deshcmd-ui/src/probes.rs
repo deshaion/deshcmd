@@ -49,6 +49,23 @@ impl<K: Clone + Eq + Hash + Send + 'static, V: Send + 'static> ReadCache<K, V> {
         key: K,
         read: impl FnOnce(&K) -> Option<V> + Send + 'static,
     ) -> Option<Arc<V>> {
+        self.request_cancellable(key, move |key, _| read(key))
+    }
+
+    pub(crate) fn get(&self, key: &K) -> Option<&V> {
+        self.entries.get(key)?.value.as_deref()
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.pool.retain(|_| false);
+        self.entries.clear();
+    }
+
+    pub(crate) fn request_cancellable(
+        &mut self,
+        key: K,
+        read: impl FnOnce(&K, &deshcmd_engine::read_pool::Cancellation) -> Option<V> + Send + 'static,
+    ) -> Option<Arc<V>> {
         let now = Instant::now();
         if self.entries.len() == self.limit && !self.entries.contains_key(&key) {
             let victim = self
@@ -73,8 +90,8 @@ impl<K: Clone + Eq + Hash + Send + 'static, V: Send + 'static> ReadCache<K, V> {
         entry.touched_pass = self.render_pass;
         if !entry.pending && now >= entry.retry {
             self.sequence += 1;
-            entry.pending = self.pool.submit(self.sequence, move |_| {
-                let value = read(&key);
+            entry.pending = self.pool.submit(self.sequence, move |cancel| {
+                let value = read(&key, cancel);
                 (key, value)
             });
             if !entry.pending {

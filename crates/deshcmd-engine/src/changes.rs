@@ -160,6 +160,11 @@ impl Effects {
                     }
                 }
             }
+            Operation::ReplaceContent { files, .. } => {
+                for file in files {
+                    add(&file.path, Item);
+                }
+            }
             Operation::Archive(ArchiveOperation::Test { .. })
             | Operation::Statistics(_)
             | Operation::Verify { .. }

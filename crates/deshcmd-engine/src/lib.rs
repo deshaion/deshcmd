@@ -7,6 +7,7 @@ mod operations;
 mod perf;
 mod preview_cache;
 pub mod read_pool;
+pub mod search;
 mod snapshots;
 #[cfg(test)]
 mod tests;
@@ -31,7 +32,7 @@ pub use listing::{
     preview_cancellable,
 };
 pub use operations::{
-    Algorithm, Collision, Conflict, ManifestMode, Operation, Progress, TransferOptions,
+    Algorithm, Collision, Conflict, JobPaths, ManifestMode, Operation, Progress, TransferOptions,
 };
 use operations::{Control, Worker};
 pub use preview_cache::PreviewDiskCache;
@@ -116,6 +117,7 @@ pub struct Settings {
     pub natural_sort: bool,
     pub directories_first: bool,
     pub auto_refresh: bool,
+    pub double_click_new_tab: bool,
     pub confirm_trash: bool,
     pub confirm_delete: bool,
     pub columns: Vec<Column>,
@@ -138,6 +140,7 @@ impl Default for Settings {
             natural_sort: true,
             directories_first: true,
             auto_refresh: true,
+            double_click_new_tab: true,
             confirm_trash: true,
             confirm_delete: true,
             columns: vec![Column::Name, Column::Size, Column::Modified],
@@ -179,6 +182,7 @@ pub struct Tab {
     cursor: Option<PathBuf>,
     cursor_position: Option<usize>,
     pending_cursor: Option<PathBuf>,
+    pending_reveal: Option<(PathBuf, bool)>,
     cursor_restored: bool,
     anchor: Option<PathBuf>,
     anchor_position: Option<usize>,
@@ -228,6 +232,7 @@ impl Tab {
             cursor: None,
             cursor_position: None,
             pending_cursor: None,
+            pending_reveal: None,
             cursor_restored: false,
             anchor: None,
             anchor_position: None,
@@ -303,6 +308,7 @@ impl Tab {
     }
     fn cancel_navigation(&mut self) {
         self.nav_revision += 1;
+        self.pending_reveal = None;
         self.pending_navigation = None;
         self.cached_history = None;
     }
@@ -368,6 +374,14 @@ impl Tab {
             self.selected.len()
         }
     }
+    pub fn mark_snapshot(&self) -> &Arc<HashSet<Arc<Path>>> {
+        &self.selected
+    }
+
+    pub fn visible_revision(&self) -> Option<(u64, u64)> {
+        self.installed_view.map(|key| (key.raw, key.revision))
+    }
+
     pub fn marked_entries(&self) -> impl Iterator<Item = &Entry> {
         (self.marked_count() != 0)
             .then(|| {
@@ -649,6 +663,7 @@ impl Tab {
         }
     }
     fn choose_provisional_cursor(&mut self) {
+        self.pending_reveal = None;
         if self.provisional() {
             self.provisional_focus = true;
             self.pending_cursor = None;
@@ -666,6 +681,10 @@ impl Tab {
                     Arc::make_mut(&mut self.selected).insert(Arc::from(path.as_path()));
                     self.selected_bytes = Self::mark_size(entry);
                 }
+                self.anchor = Some(path.clone());
+                self.anchor_position = Some(position);
+            }
+            Select::Cursor => {
                 self.anchor = Some(path.clone());
                 self.anchor_position = Some(position);
             }
@@ -717,6 +736,7 @@ pub enum Select {
     Toggle,
     Extend,
     Focus,
+    Cursor,
 }
 #[derive(Clone, Copy, Debug)]
 pub enum Step {
@@ -741,6 +761,12 @@ pub enum Command {
         new_tab: bool,
         background: bool,
     },
+    Reveal {
+        side: Side,
+        hit: search::Hit,
+        background: bool,
+    },
+    RevealPreview(Side, search::Hit),
     History(Side, usize),
     CancelNavigation(Side),
     Back(Side),
@@ -780,6 +806,7 @@ pub enum Command {
     RestoreMarks(Side),
     LoadMarks(Side, String),
     LoadList(Side, String),
+    LoadPaths(Side, Vec<PathBuf>),
     AddBookmark(Bookmark),
     EditBookmark(usize, Bookmark),
     ImportBookmarks(Vec<Bookmark>),
@@ -790,6 +817,7 @@ pub enum Command {
     LoadFavorite(usize, bool),
     RemoveFavorite(usize),
     Queue(Operation, bool),
+    QueueFor(Side, Operation, bool),
     CreateFile {
         side: Side,
         path: PathBuf,
@@ -835,9 +863,12 @@ impl JobState {
 pub struct Job {
     pub id: u64,
     pub title: &'static str,
+    pub paths: JobPaths,
+    pub target: Side,
     pub state: JobState,
     pub progress: Progress,
     pub started: Option<Instant>,
+    pub finished_at: Option<Instant>,
     pub message: String,
     pub warnings: Vec<String>,
     pub conflict: Option<Conflict>,
@@ -894,6 +925,7 @@ pub struct Engine {
     watches: watch::Watches,
     running: Option<u64>,
     archive_cache: Arc<archives::ArchiveCache>,
+    revealed_preview: Option<Side>,
     scans: read_pool::ReadPool<ScanKey, ScanResult>,
     navigation: navigation::Navigation,
     views: read_pool::ReadPool<views::ViewKey, io::Result<views::Prepared>>,
@@ -949,6 +981,7 @@ impl Engine {
             watches: watch::Watches::new(wake.clone()),
             running: None,
             archive_cache: Arc::default(),
+            revealed_preview: None,
         };
         engine.start_scans();
         engine
@@ -979,6 +1012,12 @@ impl Engine {
     }
     pub fn tab(&self, side: Side) -> &Tab {
         self.pane(side).tab()
+    }
+    pub fn take_revealed_preview(&mut self) -> Option<Side> {
+        self.revealed_preview.take()
+    }
+    pub fn search_archives(&self) -> search::Archives {
+        search::Archives(self.archive_cache.clone())
     }
     pub fn archive_password(&self, file: &Path) -> Option<Arc<str>> {
         self.archive_cache.password(file)
@@ -1089,6 +1128,12 @@ impl Engine {
                 new_tab,
                 background,
             } => self.navigate(side, &path, new_tab, background, true)?,
+            Command::Reveal {
+                side,
+                hit,
+                background,
+            } => self.reveal(side, hit, background, false)?,
+            Command::RevealPreview(side, hit) => self.reveal(side, hit, false, true)?,
             Command::CancelNavigation(side) => self.tab_mut(side).cancel_navigation(),
             Command::History(side, index) => self.request_history(side, Some(index), false)?,
             Command::Back(side) => self.request_history(side, None, true)?,
@@ -1295,8 +1340,11 @@ impl Engine {
             }
             Command::Select(side, path, mode) => {
                 self.settings.active = side;
-                self.tab_mut(side)
-                    .select(&path, mode, !matches!(mode, Select::Focus));
+                self.tab_mut(side).select(
+                    &path,
+                    mode,
+                    !matches!(mode, Select::Focus | Select::Cursor),
+                );
             }
             Command::Step(side, step, extend) => {
                 let tab = self.tab_mut(side);
@@ -1379,6 +1427,11 @@ impl Engine {
             Command::LoadList(side, text) => {
                 let base = self.tab(side).base().to_path_buf();
                 let paths = lines(&text).map(|line| base.join(line)).collect();
+                self.tab_mut(side)
+                    .set_location(Location::List { base, paths }, true);
+            }
+            Command::LoadPaths(side, paths) => {
+                let base = self.tab(side).base().to_owned();
                 let tab = self.tab_mut(side);
                 tab.set_location(Location::List { base, paths }, true);
             }
@@ -1442,10 +1495,13 @@ impl Engine {
                     self.settings.favorites.remove(index);
                 }
             }
-            Command::Queue(operation, hold) => self.queue_job(operation, hold, None),
+            Command::Queue(operation, hold) => {
+                self.queue_job(self.settings.active, operation, hold, None)
+            }
+            Command::QueueFor(side, operation, hold) => self.queue_job(side, operation, hold, None),
             Command::CreateFile { side, path, hold } => {
                 let focus = (self.tab(side).id, path.clone());
-                self.queue_job(Operation::Create(path), hold, Some(focus));
+                self.queue_job(side, Operation::Create(path), hold, Some(focus));
             }
             Command::PauseJob(id) => {
                 if let Some(job) = self.jobs.iter_mut().find(|job| job.id == id) {
@@ -2083,6 +2139,7 @@ impl Engine {
     }
     fn queue_job(
         &mut self,
+        target: Side,
         operation: Operation,
         hold: bool,
         focus_on_success: Option<(u64, PathBuf)>,
@@ -2091,6 +2148,8 @@ impl Engine {
         self.jobs.push(Job {
             id: self.ids,
             title: operation.label(),
+            paths: operation.job_paths(),
+            target,
             state: if hold {
                 JobState::Held
             } else {
@@ -2098,6 +2157,7 @@ impl Engine {
             },
             progress: Progress::default(),
             started: None,
+            finished_at: None,
             message: String::new(),
             warnings: Vec::new(),
             conflict: None,
@@ -2345,6 +2405,7 @@ impl Engine {
                             created_focus = focus;
                         }
                         job.conflict = None;
+                        job.finished_at = Some(Instant::now());
                         job.warnings = warnings;
                         match result {
                             Ok(message) => {
@@ -2421,6 +2482,7 @@ impl Engine {
         }
         self.start_scans();
         self.start_views();
+        self.finish_reveals();
         self.start_job();
     }
 }
@@ -2509,6 +2571,42 @@ pub fn read_list(path: &Path) -> io::Result<String> {
     }
     Ok(output)
 }
+pub fn format_size(bytes: u64, minimum_kilobytes: bool) -> String {
+    let mut value = bytes as f64;
+    let mut unit = "B";
+    for next in ["KB", "MB", "GB", "TB", "PB"] {
+        if value < 1024. && !(unit == "B" && minimum_kilobytes) {
+            break;
+        }
+        value /= 1024.;
+        unit = next;
+    }
+    if unit == "B" {
+        format!("{bytes} B")
+    } else if bytes == 0 {
+        format!("0 {unit}")
+    } else if value < 1. {
+        format!("{value:.3} {unit}")
+    } else {
+        format!("{value:.1} {unit}")
+    }
+}
+
+pub fn folder_size(path: &Path, cancel: &read_pool::Cancellation) -> io::Result<u64> {
+    let mut error = None;
+    let stats = operations::occupied_size(
+        path,
+        || cancel.check(),
+        |issue| {
+            error.get_or_insert(issue);
+        },
+    )?;
+    match error {
+        Some(error) => Err(error),
+        None => Ok(stats.bytes),
+    }
+}
+
 pub fn space(path: &Path) -> Option<(u64, u64)> {
     Some((
         fs2::available_space(path).ok()?,
